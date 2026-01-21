@@ -1,0 +1,48 @@
+type Message = record {
+    role: text;
+    content: text;
+};
+
+type Character = record {
+    name: text;
+    system_prompt: text;
+    bio: vec text;
+    style: vec text;
+};
+
+type LlmProvider = variant {
+    OnChain;
+    OpenAI;
+    Fallback;
+};
+
+type Config = record {
+    llm_provider: LlmProvider;
+    max_conversation_length: nat64;
+    admin: principal;
+};
+
+service : {
+    // Chat
+    chat: (text) -> (variant { Ok: text; Err: text });
+
+    // Character management
+    update_character: (Character) -> (variant { Ok; Err: text });
+    get_character: () -> (opt Character) query;
+
+    // Configuration
+    set_llm_provider: (LlmProvider) -> (variant { Ok; Err: text });
+    get_config: () -> (opt Config) query;
+
+    // Conversation management
+    get_conversation_history: () -> (vec Message) query;
+    clear_conversation: () -> ();
+    get_conversation_count: () -> (nat64) query;
+
+    // API Key management (vetKeys)
+    store_encrypted_api_key: (vec nat8) -> (variant { Ok; Err: text });
+
+    // Health
+    health: () -> (text) query;
+    version: () -> (text) query;
+}

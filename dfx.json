@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "canisters": {
+    "eliza_backend": {
+      "type": "rust",
+      "package": "eliza_backend",
+      "candid": "src/eliza_backend/eliza_backend.did"
+    },
+    "eliza_frontend": {
+      "type": "assets",
+      "source": ["src/eliza_frontend/dist"],
+      "dependencies": ["eliza_backend"]
+    },
+    "internet_identity": {
+      "type": "pull",
+      "id": "rdmx6-jaaaa-aaaaa-aaadq-cai"
+    }
+  },
+  "defaults": {
+    "build": {
+      "packtool": "",
+      "args": ""
+    }
+  },
+  "output_env_file": ".env",
+  "networks": {
+    "local": {
+      "bind": "127.0.0.1:8080",
+      "type": "ephemeral"
+    },
+    "ic": {
+      "providers": ["https://ic0.app"],
+      "type": "persistent"
+    }
+  }
+}
