@@ -148,6 +148,27 @@ header .subtitle {
   border-color: var(--error);
 }
 
+.header-buttons {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.logout-btn {
+  background: transparent;
+  color: var(--text-secondary);
+  border: 1px solid var(--border);
+  padding: 0.5rem 1rem;
+  font-size: 0.8rem;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.logout-btn:hover {
+  color: var(--text-primary);
+  border-color: var(--text-primary);
+}
+
 .messages {
   flex: 1;
   padding: 1rem;

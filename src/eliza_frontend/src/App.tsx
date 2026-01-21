@@ -151,7 +151,17 @@ function App() {
     }
   };
 
-  const handleKeyPress = (e: React.KeyboardEvent) => {
+  const logout = async () => {
+    if (!authClient) return;
+
+    await authClient.logout();
+    setIsAuthenticated(false);
+    setActor(null);
+    setMessages([]);
+    setError(null);
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       sendMessage();
@@ -182,9 +192,14 @@ function App() {
         <div className="chat-container">
           <div className="chat-header">
             <h2>Chat with Coo</h2>
-            <button onClick={clearConversation} className="clear-btn">
-              Clear Chat
-            </button>
+            <div className="header-buttons">
+              <button onClick={clearConversation} className="clear-btn">
+                Clear Chat
+              </button>
+              <button onClick={logout} className="logout-btn">
+                Logout
+              </button>
+            </div>
           </div>
 
           <div className="messages">
@@ -221,7 +236,7 @@ function App() {
             <input
               value={input}
               onChange={(e) => setInput(e.target.value)}
-              onKeyPress={handleKeyPress}
+              onKeyDown={handleKeyDown}
               placeholder="Message Coo..."
               disabled={loading}
             />

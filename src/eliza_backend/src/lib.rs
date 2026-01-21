@@ -112,6 +112,19 @@ fn post_upgrade() {
             *c.borrow_mut() = Some(default_character());
         }
     });
+
+    // Restore config if not set (preserves admin from init if this is first upgrade)
+    CONFIG.with(|cfg| {
+        if cfg.borrow().is_none() {
+            // Note: After upgrade, we can't recover the original admin
+            // Consider using stable memory for production
+            *cfg.borrow_mut() = Some(Config {
+                llm_provider: LlmProvider::Fallback,
+                max_conversation_length: 50,
+                admin: ic_cdk::caller(), // Will be the upgrade caller
+            });
+        }
+    });
 }
 
 // ========== Eliza Chat Endpoint ==========
@@ -466,8 +479,8 @@ fn clear_conversation() {
 }
 
 #[query]
-fn get_conversation_count() -> usize {
-    CONVERSATIONS.with(|c| c.borrow().len())
+fn get_conversation_count() -> u64 {
+    CONVERSATIONS.with(|c| c.borrow().len() as u64)
 }
 
 // ========== Health Check ==========
