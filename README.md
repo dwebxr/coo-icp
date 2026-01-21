@@ -1,237 +1,307 @@
-# Coo - Fully On-Chain AI Agent
+# 🚀 On-chain LLM Chat Starter
 
-A fully decentralized AI agent running on the Internet Computer blockchain, powered by the elizaOS framework and IC LLM Canister (Llama 3.1 8B).
+> **The minimal full-stack template for building AI agents on the Internet Computer.**
+>
+> Fork this repo → Customize → Deploy in 5 minutes.
 
-## Live Demo
+[![Live Demo](https://img.shields.io/badge/Demo-Live%20on%20IC-brightgreen)](https://4res3-liaaa-aaaas-qdqcq-cai.icp0.io/)
+[![IC LLM](https://img.shields.io/badge/AI-Llama%203.1%208B-blue)](https://internetcomputer.org/docs/current/developer-docs/ai/ai-on-chain)
+[![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-**Frontend:** https://4res3-liaaa-aaaas-qdqcq-cai.icp0.io/
+---
 
-**Backend Candid UI:** https://a4gq6-oaaaa-aaaab-qaa4q-cai.raw.icp0.io/?id=4wfup-gqaaa-aaaas-qdqca-cai
+## ✨ What This Is
 
-## Features
+A production-ready starter template for on-chain AI chat applications featuring:
 
-- **Fully On-Chain AI**: Uses IC LLM Canister (Llama 3.1 8B) for AI responses
-- **Decentralized**: Runs entirely on Internet Computer blockchain
-- **Censorship-Resistant**: No centralized servers or API dependencies
-- **Internet Identity Authentication**: Secure user authentication
-- **Conversation Memory**: Maintains context across conversations
-- **elizaOS Framework**: Built on the leading open-source AI agent framework
+- **🧠 Fully On-chain AI** - IC LLM Canister (Llama 3.1 8B) with zero external API dependencies
+- **🔐 Internet Identity** - Secure authentication built-in
+- **💾 Per-user Memory** - Conversation history stored by Principal
+- **🔄 Multi-Provider** - Switch between OnChain / OpenAI / Fallback modes
+- **⚡ Full-stack** - React frontend + Rust backend, ready to deploy
 
-## Architecture
+## 🎯 Live Demo
+
+**Try it now:** [https://4res3-liaaa-aaaas-qdqcq-cai.icp0.io/](https://4res3-liaaa-aaaas-qdqcq-cai.icp0.io/)
+
+---
+
+## 🏗️ Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                     Internet Computer Mainnet                    │
-│                                                                  │
-│  ┌─────────────────┐    ┌──────────────────────────────────┐   │
-│  │    Frontend     │    │        Backend Canister          │   │
-│  │    Canister     │◄──►│      (Rust + ic-llm)            │   │
-│  │    (React)      │    │                                  │   │
-│  │                 │    │  ┌────────────────────────────┐  │   │
-│  │ 4res3-liaaa-... │    │  │   IC LLM Canister          │  │   │
-│  └─────────────────┘    │  │   (Llama 3.1 8B)           │  │   │
-│                         │  │   w36hm-eqaaa-aaaal-qr76a  │  │   │
-│  ┌─────────────────┐    │  └────────────────────────────┘  │   │
-│  │    Internet     │    │                                  │   │
-│  │    Identity     │◄──►│  4wfup-gqaaa-aaaas-qdqca-cai   │   │
-│  └─────────────────┘    └──────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        Internet Computer Mainnet                            │
+│                                                                             │
+│   ┌──────────────┐      ┌──────────────────────────────────────────────┐   │
+│   │   Frontend   │      │             Backend Canister                 │   │
+│   │   (React)    │◄────►│               (Rust)                         │   │
+│   │              │      │                                              │   │
+│   │ • Chat UI    │      │  ┌─────────────────────────────────────────┐ │   │
+│   │ • II Login   │      │  │         LLM Provider Switch             │ │   │
+│   │ • History    │      │  │                                         │ │   │
+│   └──────────────┘      │  │   ┌─────────┐ ┌───────┐ ┌──────────┐   │ │   │
+│                         │  │   │OnChain  │ │OpenAI │ │ Fallback │   │ │   │
+│   ┌──────────────┐      │  │   │Llama3.1 │ │ HTTPS │ │ Pattern  │   │ │   │
+│   │   Internet   │      │  │   │  8B     │ │Outcall│ │ Match    │   │ │   │
+│   │   Identity   │◄────►│  │   └─────────┘ └───────┘ └──────────┘   │ │   │
+│   └──────────────┘      │  └─────────────────────────────────────────┘ │   │
+│                         │                                              │   │
+│                         │  • Per-user conversation memory              │   │
+│                         │  • Admin controls for character/provider     │   │
+│                         │  • vetKeys API key encryption (OpenAI mode)  │   │
+│                         └──────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-## Canister IDs
+---
 
-| Canister | Mainnet ID |
-|----------|------------|
-| Backend | `4wfup-gqaaa-aaaas-qdqca-cai` |
-| Frontend | `4res3-liaaa-aaaas-qdqcq-cai` |
+## ⚡ 5-Minute Quick Start
 
-## Prerequisites
+### Prerequisites
 
-- [dfx](https://internetcomputer.org/docs/current/developer-docs/setup/install) (IC SDK v0.12+)
-- [Rust](https://rustup.rs/) with `wasm32-unknown-unknown` target
-- [Node.js](https://nodejs.org/) (v18+)
+- [dfx](https://internetcomputer.org/docs/current/developer-docs/setup/install) (IC SDK)
+- [Rust](https://rustup.rs/) with wasm32 target
+- [Node.js](https://nodejs.org/) v18+
 
-## Quick Start
-
-### 1. Install Dependencies
+### Option 1: One-Click Deploy (Recommended)
 
 ```bash
-# Install dfx
-sh -ci "$(curl -fsSL https://internetcomputer.org/install.sh)"
+# Clone and enter
+git clone https://github.com/dwebxr/coo-icp.git && cd coo-icp
 
-# Install Rust wasm target
+# Setup & deploy locally
+make setup
+make deploy-local
+```
+
+Done! Open the URL printed in the terminal.
+
+### Option 2: Manual Setup
+
+```bash
+# Install dependencies
 rustup target add wasm32-unknown-unknown
-
-# Install frontend dependencies
 cd src/eliza_frontend && npm install && cd ../..
-```
 
-### 2. Local Development
-
-```bash
 # Start local replica
 dfx start --clean --background
 
-# Deploy all canisters
+# Deploy
+dfx deps pull && dfx deps init && dfx deps deploy
 dfx deploy
 
-# Get canister URLs
-echo "Frontend: http://$(dfx canister id eliza_frontend).localhost:8080"
+# Get your local URL
+echo "http://localhost:4943/?canisterId=$(dfx canister id eliza_frontend)"
 ```
 
-> **Note:** IC LLM Canister is only available on mainnet. Local development uses a fallback mode with simple pattern matching.
+---
 
-### 3. Test the Backend
-
-```bash
-# Health check
-dfx canister call eliza_backend health
-
-# Get version
-dfx canister call eliza_backend version
-
-# Chat with Coo
-dfx canister call eliza_backend chat '("Hello!")'
-
-# View conversation history
-dfx canister call eliza_backend get_conversation_history
-
-# Clear conversation
-dfx canister call eliza_backend clear_conversation
-
-# Check current config
-dfx canister call eliza_backend get_config
-```
-
-## Mainnet Deployment
-
-### 1. Get Cycles
+## 🌐 Deploy to IC Mainnet
 
 ```bash
-# Get your principal
-dfx identity get-principal
-
-# Get your ICP account
-dfx ledger account-id
-
-# Send ICP to this account, then convert to cycles
+# Ensure you have cycles (0.5+ ICP recommended)
 dfx cycles convert --amount 0.5 --network ic
+
+# Deploy
+make deploy-ic
+
+# Enable on-chain AI
+dfx canister call eliza_backend set_llm_provider '(variant { OnChain })' --network ic
 ```
 
-### 2. Deploy
+---
+
+## 💰 Cycles Cost Estimate
+
+| Operation | Estimated Cost |
+|-----------|----------------|
+| Initial deployment (both canisters) | ~0.5-1T cycles (~$0.50-1.00) |
+| Single chat message (OnChain LLM) | ~1-5B cycles (~$0.001-0.005) |
+| Frontend asset serving | ~0.1B cycles/request |
+| Storage (conversation history) | ~100M cycles/MB/year |
+
+> 💡 **Tip:** Start with 1T cycles. A typical development/demo session uses 0.1-0.3T cycles.
+
+---
+
+## 🔧 LLM Provider Modes
+
+| Mode | Description | Best For |
+|------|-------------|----------|
+| **OnChain** | IC LLM Canister (Llama 3.1 8B) | Production, full decentralization |
+| **OpenAI** | HTTPS Outcalls to OpenAI API | Higher quality responses |
+| **Fallback** | Pattern matching | Local development |
+
+### Switch Provider
 
 ```bash
-# Deploy to mainnet
-dfx deploy --network ic
+# Interactive selection
+make set-provider
 
-# Set LLM provider to OnChain (IC LLM)
-dfx canister call eliza_backend set_llm_provider '(variant { OnChain })' --network ic
-
-# Verify deployment
-dfx canister call eliza_backend health --network ic
-dfx canister call eliza_backend get_config --network ic
+# Or directly
+dfx canister call eliza_backend set_llm_provider '(variant { OnChain })'
 ```
 
-## Project Structure
+### Using OpenAI Mode
+
+```bash
+# Set your API key (encrypted with vetKeys)
+make set-openai-key
+
+# Switch to OpenAI
+dfx canister call eliza_backend set_llm_provider '(variant { OpenAI })'
+```
+
+**How vetKeys protects your API key:**
+```
+┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
+│   Your Key      │───►│  Encrypted in   │───►│ Decrypted only  │
+│   (plaintext)   │    │  Canister State │    │ at Runtime      │
+└─────────────────┘    └─────────────────┘    └─────────────────┘
+       Client              On-chain             HTTP Outcall
+                        (never exposed)
+```
+
+---
+
+## 🎭 Customize Your Agent
+
+### Quick Character Update
+
+```bash
+make set-character
+```
+
+### Programmatic Update
+
+```bash
+dfx canister call eliza_backend update_character '(record {
+  name = "MyAgent";
+  system_prompt = "You are a helpful assistant specialized in...";
+  bio = vec { "Your bio here" };
+  style = record { all = vec { "friendly"; "concise" }; chat = vec {}; post = vec {} }
+})'
+```
+
+See [docs/BUILD_YOUR_OWN_AGENT.md](docs/BUILD_YOUR_OWN_AGENT.md) for the full customization guide.
+
+---
+
+## 📁 Project Structure
 
 ```
-eliza-icp/
-├── dfx.json                          # IC project configuration
-├── Cargo.toml                        # Rust workspace
-├── canister_ids.json                 # Mainnet canister IDs
+coo-icp/
+├── Makefile                 # One-click commands
+├── dfx.json                 # IC project config
+├── Cargo.toml               # Rust workspace
 ├── src/
-│   ├── eliza_backend/                # Rust backend canister
-│   │   ├── Cargo.toml
-│   │   ├── src/lib.rs                # Main canister logic
-│   │   └── eliza_backend.did         # Candid interface
-│   └── eliza_frontend/               # React frontend
-│       ├── package.json
-│       ├── vite.config.ts
-│       └── src/
-│           ├── App.tsx               # Main chat component
-│           └── declarations/         # Generated types
-└── README.md
+│   ├── eliza_backend/       # 🦀 Rust backend canister
+│   │   ├── src/lib.rs       # Main logic (~500 lines)
+│   │   └── eliza_backend.did # Candid interface
+│   └── eliza_frontend/      # ⚛️ React frontend
+│       ├── src/App.tsx      # Chat UI component
+│       └── src/declarations/ # Generated types
+└── docs/
+    └── BUILD_YOUR_OWN_AGENT.md # Customization guide
 ```
 
-## API Reference
+---
 
-### Chat
+## 📡 API Reference
+
+### Core Chat
 
 ```candid
+// Send message, get AI response
 chat: (text) -> (variant { Ok: text; Err: text });
+
+// Get user's conversation history
+get_conversation_history: () -> (vec Message) query;
+
+// Clear conversation
+clear_conversation: () -> ();
 ```
 
-Send a message and receive an AI response from Coo.
-
-### Character Management
+### Admin Functions
 
 ```candid
+// Update AI personality
 update_character: (Character) -> (variant { Ok; Err: text });
-get_character: () -> (opt Character) query;
+
+// Switch LLM provider
+set_llm_provider: (LlmProvider) -> (variant { Ok; Err: text });
+
+// Store encrypted API key
+store_encrypted_api_key: (vec nat8) -> (variant { Ok; Err: text });
 ```
 
-Admin-only functions to customize Coo's personality.
-
-### Configuration
+### Health & Info
 
 ```candid
-set_llm_provider: (LlmProvider) -> (variant { Ok; Err: text });
+health: () -> (bool) query;
+version: () -> (text) query;
 get_config: () -> (opt Config) query;
 ```
 
-LLM providers:
-- `OnChain` - IC LLM Canister (Llama 3.1 8B) - **mainnet only**
-- `OpenAI` - HTTPS Outcalls to OpenAI API
-- `Fallback` - Simple pattern matching (local dev)
+---
 
-### Conversation Management
+## 🔒 Security Model
 
-```candid
-get_conversation_history: () -> (vec Message) query;
-clear_conversation: () -> ();
-get_conversation_count: () -> (nat64) query;
-```
+| Feature | Implementation |
+|---------|----------------|
+| User isolation | Conversations stored per Principal |
+| Admin access | Deployer identity required for config |
+| API key protection | vetKeys encryption (OpenAI mode) |
+| On-chain mode | Zero external dependencies |
 
-## LLM Integration Options
+---
 
-| Method | On-Chain | Model | Best For |
-|--------|----------|-------|----------|
-| IC LLM (OnChain) | 100% | Llama 3.1 8B | Decentralization |
-| OpenAI | Hybrid | GPT-4o-mini | Quality |
-| Fallback | 100% | Pattern Match | Local Dev |
+## 🛠️ Development Commands
 
-### Using OpenAI API (Optional)
-
-1. Store API key (admin only):
 ```bash
-# Convert API key to bytes
-dfx canister call eliza_backend store_encrypted_api_key '(vec { ... })' --network ic
+make help           # Show all commands
+make deploy-local   # Deploy to local replica
+make deploy-ic      # Deploy to IC mainnet
+make test           # Health check
+make logs           # View canister logs
+make info           # Show deployment info
+make clean          # Clean build artifacts
 ```
 
-2. Switch to OpenAI provider:
-```bash
-dfx canister call eliza_backend set_llm_provider '(variant { OpenAI })' --network ic
-```
+---
 
-## Tech Stack
+## 🤝 Use This Template
 
-- **Backend**: Rust + ic-cdk + ic-llm
-- **Frontend**: React + TypeScript + Vite
-- **AI Model**: Llama 3.1 8B (via IC LLM Canister)
-- **Auth**: Internet Identity
-- **Framework**: elizaOS
+This repo is designed to be forked and customized:
 
-## Security
+1. **Fork** this repository
+2. **Customize** the character in `src/eliza_backend/src/lib.rs`
+3. **Deploy** with `make deploy-ic`
+4. **Build** your unique on-chain agent!
 
-- All conversations are stored per-user (by Principal)
-- Admin functions require the deployer's identity
-- No external API calls with OnChain mode
-- API keys encrypted with vetKeys (for OpenAI mode)
+**License:** MIT - Use freely for any purpose.
 
-## About elizaOS
+---
 
-[elizaOS](https://github.com/elizaOS/eliza) is the leading open-source framework for building autonomous AI agents. Coo is built on this framework to leverage its powerful agent capabilities while running fully decentralized on the Internet Computer.
+## 📚 Resources
 
-## License
+- [IC LLM Canister Docs](https://internetcomputer.org/docs/current/developer-docs/ai/ai-on-chain)
+- [Internet Computer Developer Docs](https://internetcomputer.org/docs)
+- [Rust CDK Guide](https://internetcomputer.org/docs/current/developer-docs/backend/rust/)
+- [Internet Identity](https://internetcomputer.org/docs/current/developer-docs/identity/internet-identity/overview)
 
-MIT
+---
+
+## 🏷️ Canister IDs (Mainnet)
+
+| Canister | ID |
+|----------|-----|
+| Backend | `4wfup-gqaaa-aaaas-qdqca-cai` |
+| Frontend | `4res3-liaaa-aaaas-qdqcq-cai` |
+
+---
+
+<p align="center">
+  <b>Built with ❤️ on the Internet Computer</b><br>
+  <sub>Powered by IC LLM Canister (Llama 3.1 8B)</sub>
+</p>

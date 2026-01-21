@@ -1,0 +1,50 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# Node.js dependencies
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Frontend build output
+src/eliza_frontend/dist/
+
+# DFX artifacts
+.dfx/
+.env
+.env.local
+.env.*.local
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# macOS system files
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+
+# Test coverage
+coverage/
+
+# Generated declarations (can be regenerated with dfx generate)
+# Uncomment if you prefer to regenerate on each build:
+# src/eliza_frontend/src/declarations/
+
+# Secrets (NEVER commit these)
+*.pem
+*.key
+api_keys.txt
+.secret*
