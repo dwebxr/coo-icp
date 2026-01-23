@@ -20,5 +20,12 @@ ic-cdk-timers = "0.10"
 # IC LLM Canister
 ic-llm = "1.1"
 
+# OAuth 1.0a / Crypto
+sha2 = "0.10"
+hmac = "0.12"
+sha-1 = "0.10"
+base64 = "0.22"
+hex = "0.4"
+
 [features]
 default = []

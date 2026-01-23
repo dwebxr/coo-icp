@@ -59,6 +59,13 @@ header .subtitle {
   font-size: 0.75rem;
   margin-top: 0.25rem;
   opacity: 0.8;
+  text-decoration: none;
+  transition: all 0.2s;
+}
+
+header a.subtitle:hover {
+  color: var(--primary);
+  opacity: 1;
 }
 
 .status {

@@ -173,7 +173,7 @@ function App() {
       <header>
         <h1>Coo</h1>
         <p>Fully On-Chain AI Agent</p>
-        <span className="subtitle">Powered by elizaOS framework on Internet Computer</span>
+        <a href="https://github.com/dwebxr/coo-icp" target="_blank" rel="noopener noreferrer" className="subtitle">Powered by elizaOS framework on Internet Computer</a>
         <div className="status">
           <span className="status-dot"></span>
           Running on-chain

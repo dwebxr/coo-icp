@@ -22,6 +22,112 @@ type Config = record {
     admin: principal;
 };
 
+// Social Integration Types
+type SocialPlatform = variant {
+    Twitter;
+    Discord;
+};
+
+type TwitterCredentials = record {
+    api_key: vec nat8;
+    api_secret: vec nat8;
+    access_token: vec nat8;
+    access_token_secret: vec nat8;
+    user_id: opt text;
+};
+
+type DiscordConfig = record {
+    bot_token: vec nat8;
+    webhook_url: opt text;
+    channel_ids: vec text;
+};
+
+type PostStatus = variant {
+    Pending;
+    Processing;
+    Completed;
+    Failed: text;
+};
+
+type PostMetadata = record {
+    reply_to_id: opt text;
+    discord_channel_id: opt text;
+    result_id: opt text;
+};
+
+type ScheduledPost = record {
+    id: nat64;
+    platform: SocialPlatform;
+    content: text;
+    scheduled_time: nat64;
+    status: PostStatus;
+    retry_count: nat32;
+    created_at: nat64;
+    metadata: opt PostMetadata;
+};
+
+type IncomingMessage = record {
+    id: text;
+    platform: SocialPlatform;
+    author_id: text;
+    author_name: text;
+    content: text;
+    timestamp: nat64;
+    processed: bool;
+    replied: bool;
+    conversation_id: opt text;
+};
+
+type SocialStatus = record {
+    twitter_configured: bool;
+    discord_configured: bool;
+    enabled_platforms: vec SocialPlatform;
+    polling_active: bool;
+    last_twitter_poll: nat64;
+    last_discord_poll: nat64;
+    pending_posts: nat32;
+    unprocessed_messages: nat32;
+};
+
+type AutoPostConfig = record {
+    enabled: bool;
+    interval_seconds: nat64;
+    topics: vec text;
+    platform: SocialPlatform;
+    last_post_time: nat64;
+};
+
+// Wallet Types
+type WalletInfo = record {
+    icp_address: text;
+    principal_id: text;
+    icp_balance: nat64;
+    last_balance_update: nat64;
+};
+
+type TransactionType = variant {
+    Send;
+    Receive;
+};
+
+type TransactionStatus = variant {
+    Pending;
+    Completed;
+    Failed: text;
+};
+
+type TransactionRecord = record {
+    id: nat64;
+    tx_type: TransactionType;
+    amount: nat64;
+    to: opt text;
+    from: opt text;
+    memo: nat64;
+    timestamp: nat64;
+    status: TransactionStatus;
+    block_height: opt nat64;
+};
+
 service : {
     // Chat
     chat: (text) -> (variant { Ok: text; Err: text });
@@ -45,4 +151,53 @@ service : {
     // Health
     health: () -> (text) query;
     version: () -> (text) query;
+
+    // ========== Social Integration ==========
+
+    // Twitter Configuration
+    configure_twitter: (TwitterCredentials) -> (variant { Ok; Err: text });
+
+    // Discord Configuration
+    configure_discord: (DiscordConfig) -> (variant { Ok; Err: text });
+
+    // Platform Management
+    set_enabled_platforms: (vec SocialPlatform) -> (variant { Ok; Err: text });
+    set_auto_reply: (bool) -> (variant { Ok; Err: text });
+
+    // Polling Control
+    start_social_polling: (nat64) -> (variant { Ok; Err: text });
+    stop_social_polling: () -> (variant { Ok; Err: text });
+    trigger_poll: () -> (variant { Ok; Err: text });
+
+    // Scheduled Posts
+    schedule_post: (SocialPlatform, text, nat64, opt PostMetadata) -> (variant { Ok: nat64; Err: text });
+    cancel_scheduled_post: (nat64) -> (variant { Ok; Err: text });
+    get_scheduled_posts: () -> (vec ScheduledPost) query;
+
+    // Immediate Posting
+    post_now: (SocialPlatform, text) -> (variant { Ok: text; Err: text });
+
+    // Message Monitoring
+    get_incoming_messages: (opt nat32) -> (vec IncomingMessage) query;
+
+    // Status
+    get_social_status: () -> (SocialStatus) query;
+
+    // ========== Autonomous Posting ==========
+    start_auto_posting: (nat64, vec text) -> (variant { Ok; Err: text });
+    stop_auto_posting: () -> (variant { Ok; Err: text });
+    get_auto_post_config: () -> (opt AutoPostConfig) query;
+    trigger_auto_post: () -> (variant { Ok: text; Err: text });
+
+    // ========== Wallet ==========
+    get_wallet_address: () -> (text) query;
+    get_wallet_info: () -> (WalletInfo) query;
+    check_icp_balance: () -> (variant { Ok: nat64; Err: text });
+    send_icp: (text, nat64, opt nat64) -> (variant { Ok: nat64; Err: text });
+    get_transaction_history: (opt nat32) -> (vec TransactionRecord) query;
+    get_wallet_status: () -> (variant { Ok: WalletInfo; Err: text });
+
+    // Transform functions (internal)
+    transform_openai_response: (record { response: record { status: nat; body: vec nat8; headers: vec record { name: text; value: text } }; context: vec nat8 }) -> (record { status: nat; body: vec nat8; headers: vec record { name: text; value: text } }) query;
+    transform_social_response: (record { response: record { status: nat; body: vec nat8; headers: vec record { name: text; value: text } }; context: vec nat8 }) -> (record { status: nat; body: vec nat8; headers: vec record { name: text; value: text } }) query;
 }
