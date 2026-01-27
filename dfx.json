@@ -4,7 +4,12 @@
     "eliza_backend": {
       "type": "rust",
       "package": "eliza_backend",
-      "candid": "src/eliza_backend/eliza_backend.did"
+      "candid": "src/eliza_backend/eliza_backend.did",
+      "metadata": [
+        {
+          "name": "candid:service"
+        }
+      ]
     },
     "eliza_frontend": {
       "type": "assets",

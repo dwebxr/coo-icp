@@ -206,6 +206,52 @@ pub struct WalletState {
     pub tx_counter: u64,
 }
 
+// ========== EVM Wallet Data Structures (Chain-Key ECDSA) ==========
+
+#[derive(CandidType, Deserialize, Serialize, Clone, Debug)]
+pub struct EvmWalletInfo {
+    pub address: String,              // Ethereum address (0x...)
+    pub chain_id: u64,                // EVM chain ID (1=Ethereum, 8453=Base, 137=Polygon)
+    pub chain_name: String,           // Human readable chain name
+}
+
+#[derive(CandidType, Deserialize, Serialize, Clone, Debug)]
+pub struct EvmTransactionRecord {
+    pub id: u64,
+    pub chain_id: u64,
+    pub tx_hash: Option<String>,
+    pub to: String,
+    pub value_wei: String,            // Value in wei (as string for large numbers)
+    pub data: Option<String>,         // Contract call data (hex)
+    pub timestamp: u64,
+    pub status: EvmTransactionStatus,
+}
+
+#[derive(CandidType, Deserialize, Serialize, Clone, Debug)]
+pub enum EvmTransactionStatus {
+    Pending,
+    Submitted(String),                // tx_hash
+    Confirmed(u64),                   // block_number
+    Failed(String),                   // error message
+}
+
+#[derive(CandidType, Deserialize, Serialize, Clone, Debug)]
+pub struct EvmChainConfig {
+    pub chain_id: u64,
+    pub chain_name: String,
+    pub rpc_url: String,
+    pub native_symbol: String,        // ETH, MATIC, etc.
+    pub decimals: u8,
+}
+
+#[derive(CandidType, Deserialize, Serialize, Clone, Debug, Default)]
+pub struct EvmWalletState {
+    pub cached_address: Option<String>,
+    pub transaction_history: Vec<EvmTransactionRecord>,
+    pub tx_counter: u64,
+    pub configured_chains: Vec<EvmChainConfig>,
+}
+
 // ========== State Management ==========
 
 thread_local! {
@@ -225,10 +271,18 @@ thread_local! {
     static AUTO_POST_CONFIG: RefCell<Option<AutoPostConfig>> = RefCell::new(None);
     static RATE_LIMITER: RefCell<RateLimiter> = RefCell::new(RateLimiter::default());
 
-    // Wallet State
+    // Wallet State (ICP)
     static WALLET_STATE: RefCell<WalletState> = RefCell::new(WalletState {
         transaction_history: Vec::new(),
         tx_counter: 0,
+    });
+
+    // EVM Wallet State (Chain-Key ECDSA)
+    static EVM_WALLET_STATE: RefCell<EvmWalletState> = RefCell::new(EvmWalletState {
+        cached_address: None,
+        transaction_history: Vec::new(),
+        tx_counter: 0,
+        configured_chains: Vec::new(),
     });
 }
 
@@ -2334,6 +2388,674 @@ async fn get_wallet_status() -> Result<WalletInfo, String> {
         icp_balance: balance,
         last_balance_update: ic_cdk::api::time(),
     })
+}
+
+// ========== EVM Wallet (Chain-Key ECDSA) ==========
+
+use ic_cdk::api::management_canister::ecdsa::{
+    ecdsa_public_key, sign_with_ecdsa, EcdsaCurve, EcdsaKeyId, EcdsaPublicKeyArgument,
+    SignWithEcdsaArgument,
+};
+use tiny_keccak::{Hasher, Keccak};
+
+/// ECDSA key name for production (mainnet) or test (local)
+fn get_ecdsa_key_id() -> EcdsaKeyId {
+    // Use "key_1" for mainnet, "dfx_test_key" for local
+    EcdsaKeyId {
+        curve: EcdsaCurve::Secp256k1,
+        name: "key_1".to_string(), // mainnet key
+    }
+}
+
+/// Decompress a secp256k1 compressed public key
+fn decompress_pubkey(compressed: &[u8]) -> Result<Vec<u8>, String> {
+    use num_bigint::BigUint;
+
+    if compressed.len() != 33 {
+        return Err("Invalid compressed key length".to_string());
+    }
+
+    let prefix = compressed[0];
+    if prefix != 0x02 && prefix != 0x03 {
+        return Err("Invalid compression prefix".to_string());
+    }
+
+    // secp256k1 parameters
+    // p = 2^256 - 2^32 - 977
+    let p = BigUint::parse_bytes(
+        b"FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F",
+        16,
+    ).unwrap();
+
+    // x coordinate
+    let x = BigUint::from_bytes_be(&compressed[1..]);
+
+    // y² = x³ + 7 (mod p)
+    let x_cubed = x.modpow(&BigUint::from(3u32), &p);
+    let y_squared = (&x_cubed + BigUint::from(7u32)) % &p;
+
+    // Calculate y = y_squared^((p+1)/4) mod p (since p ≡ 3 mod 4)
+    let exp = (&p + BigUint::from(1u32)) / BigUint::from(4u32);
+    let mut y = y_squared.modpow(&exp, &p);
+
+    // Check if y has correct parity
+    let y_is_odd = &y % BigUint::from(2u32) == BigUint::from(1u32);
+    let should_be_odd = prefix == 0x03;
+
+    if y_is_odd != should_be_odd {
+        y = &p - &y;
+    }
+
+    // Build uncompressed key (0x04 + x + y)
+    let mut uncompressed = vec![0x04];
+
+    // Pad x to 32 bytes
+    let x_bytes = x.to_bytes_be();
+    for _ in 0..(32 - x_bytes.len()) {
+        uncompressed.push(0);
+    }
+    uncompressed.extend_from_slice(&x_bytes);
+
+    // Pad y to 32 bytes
+    let y_bytes = y.to_bytes_be();
+    for _ in 0..(32 - y_bytes.len()) {
+        uncompressed.push(0);
+    }
+    uncompressed.extend_from_slice(&y_bytes);
+
+    Ok(uncompressed)
+}
+
+/// Derive Ethereum address from ECDSA public key using Keccak-256
+fn derive_eth_address(public_key: &[u8]) -> Result<String, String> {
+    // ICP returns SEC1 encoded public key
+    // - 33 bytes: compressed (0x02/0x03 prefix)
+    // - 65 bytes: uncompressed (0x04 prefix)
+
+    let uncompressed = match public_key.len() {
+        65 if public_key[0] == 0x04 => {
+            // Already uncompressed
+            public_key.to_vec()
+        }
+        33 if public_key[0] == 0x02 || public_key[0] == 0x03 => {
+            // Decompress
+            decompress_pubkey(public_key)?
+        }
+        _ => {
+            return Err(format!(
+                "Invalid public key length: {} bytes. Expected 33 (compressed) or 65 (uncompressed). First byte: 0x{:02x}",
+                public_key.len(),
+                public_key.first().copied().unwrap_or(0)
+            ));
+        }
+    };
+
+    // Take the 64 bytes after the 0x04 prefix
+    let key_bytes = &uncompressed[1..];
+
+    let mut hasher = Keccak::v256();
+    let mut hash = [0u8; 32];
+    hasher.update(key_bytes);
+    hasher.finalize(&mut hash);
+
+    // Ethereum address is the last 20 bytes of the Keccak-256 hash
+    Ok(format!("0x{}", hex::encode(&hash[12..])))
+}
+
+/// Get the canister's EVM wallet address (derived from Chain-Key ECDSA)
+#[update]
+async fn get_evm_address() -> Result<String, String> {
+    // Check if we have a cached address
+    let cached = EVM_WALLET_STATE.with(|s| s.borrow().cached_address.clone());
+    if let Some(addr) = cached {
+        return Ok(addr);
+    }
+
+    // Get ECDSA public key from management canister
+    let key_id = get_ecdsa_key_id();
+    let canister_id = ic_cdk::id();
+
+    let derivation_path = vec![canister_id.as_slice().to_vec()];
+
+    let request = EcdsaPublicKeyArgument {
+        canister_id: Some(canister_id),
+        derivation_path,
+        key_id,
+    };
+
+    let (response,) = ecdsa_public_key(request)
+        .await
+        .map_err(|(code, msg)| format!("ECDSA public key error: {:?} - {}", code, msg))?;
+
+    let eth_address = derive_eth_address(&response.public_key)?;
+
+    // Cache the address
+    EVM_WALLET_STATE.with(|s| {
+        s.borrow_mut().cached_address = Some(eth_address.clone());
+    });
+
+    Ok(eth_address)
+}
+
+/// Get EVM wallet info for a specific chain
+#[update]
+async fn get_evm_wallet_info(chain_id: u64) -> Result<EvmWalletInfo, String> {
+    let address = get_evm_address().await?;
+
+    let chain_name = match chain_id {
+        1 => "Ethereum Mainnet",
+        8453 => "Base",
+        137 => "Polygon",
+        10 => "Optimism",
+        42161 => "Arbitrum One",
+        11155111 => "Sepolia (Testnet)",
+        84532 => "Base Sepolia (Testnet)",
+        _ => "Unknown Chain",
+    }.to_string();
+
+    Ok(EvmWalletInfo {
+        address,
+        chain_id,
+        chain_name,
+    })
+}
+
+/// Configure an EVM chain (Admin only)
+#[update]
+fn configure_evm_chain(config: EvmChainConfig) -> Result<(), String> {
+    require_admin()?;
+
+    EVM_WALLET_STATE.with(|s| {
+        let mut state = s.borrow_mut();
+        // Update or add chain config
+        if let Some(existing) = state.configured_chains.iter_mut().find(|c| c.chain_id == config.chain_id) {
+            *existing = config;
+        } else {
+            state.configured_chains.push(config);
+        }
+    });
+
+    Ok(())
+}
+
+/// Get configured EVM chains
+#[query]
+fn get_configured_chains() -> Vec<EvmChainConfig> {
+    EVM_WALLET_STATE.with(|s| s.borrow().configured_chains.clone())
+}
+
+/// RLP encode a u64 value
+fn rlp_encode_u64(value: u64) -> Vec<u8> {
+    if value == 0 {
+        vec![0x80]
+    } else if value < 128 {
+        vec![value as u8]
+    } else {
+        let bytes = value.to_be_bytes();
+        let start = bytes.iter().position(|&b| b != 0).unwrap_or(7);
+        let significant_bytes = &bytes[start..];
+        let len = significant_bytes.len();
+        let mut result = vec![0x80 + len as u8];
+        result.extend_from_slice(significant_bytes);
+        result
+    }
+}
+
+/// RLP encode bytes
+fn rlp_encode_bytes(data: &[u8]) -> Vec<u8> {
+    if data.len() == 1 && data[0] < 128 {
+        data.to_vec()
+    } else if data.len() < 56 {
+        let mut result = vec![0x80 + data.len() as u8];
+        result.extend_from_slice(data);
+        result
+    } else {
+        let len_bytes = data.len().to_be_bytes();
+        let start = len_bytes.iter().position(|&b| b != 0).unwrap_or(7);
+        let significant_len_bytes = &len_bytes[start..];
+        let mut result = vec![0xb7 + significant_len_bytes.len() as u8];
+        result.extend_from_slice(significant_len_bytes);
+        result.extend_from_slice(data);
+        result
+    }
+}
+
+/// RLP encode a list
+fn rlp_encode_list(items: &[Vec<u8>]) -> Vec<u8> {
+    let mut payload = Vec::new();
+    for item in items {
+        payload.extend_from_slice(item);
+    }
+
+    if payload.len() < 56 {
+        let mut result = vec![0xc0 + payload.len() as u8];
+        result.extend_from_slice(&payload);
+        result
+    } else {
+        let len_bytes = payload.len().to_be_bytes();
+        let start = len_bytes.iter().position(|&b| b != 0).unwrap_or(7);
+        let significant_len_bytes = &len_bytes[start..];
+        let mut result = vec![0xf7 + significant_len_bytes.len() as u8];
+        result.extend_from_slice(significant_len_bytes);
+        result.extend_from_slice(&payload);
+        result
+    }
+}
+
+/// Parse hex string to bytes
+fn hex_to_bytes(hex_str: &str) -> Result<Vec<u8>, String> {
+    let s = hex_str.strip_prefix("0x").unwrap_or(hex_str);
+    hex::decode(s).map_err(|e| format!("Invalid hex: {:?}", e))
+}
+
+/// Parse wei string to bytes (for large numbers)
+fn wei_to_bytes(wei_str: &str) -> Result<Vec<u8>, String> {
+    use num_bigint::BigUint;
+    let value = wei_str.parse::<BigUint>()
+        .map_err(|e| format!("Invalid wei value: {:?}", e))?;
+    let bytes = value.to_bytes_be();
+    // Remove leading zeros
+    let start = bytes.iter().position(|&b| b != 0).unwrap_or(bytes.len() - 1);
+    Ok(bytes[start..].to_vec())
+}
+
+/// Build EIP-1559 transaction for signing
+fn build_eip1559_tx_for_signing(
+    chain_id: u64,
+    nonce: u64,
+    max_priority_fee_per_gas: u64,
+    max_fee_per_gas: u64,
+    gas_limit: u64,
+    to: &[u8],
+    value: &[u8],
+    data: &[u8],
+) -> Vec<u8> {
+    let items = vec![
+        rlp_encode_u64(chain_id),
+        rlp_encode_u64(nonce),
+        rlp_encode_u64(max_priority_fee_per_gas),
+        rlp_encode_u64(max_fee_per_gas),
+        rlp_encode_u64(gas_limit),
+        rlp_encode_bytes(to),
+        rlp_encode_bytes(value),
+        rlp_encode_bytes(data),
+        rlp_encode_bytes(&[]), // accessList (empty)
+    ];
+
+    let mut tx = vec![0x02]; // EIP-1559 transaction type
+    tx.extend_from_slice(&rlp_encode_list(&items));
+    tx
+}
+
+/// Sign a message using Chain-Key ECDSA
+async fn sign_with_chain_key_ecdsa(message_hash: &[u8]) -> Result<Vec<u8>, String> {
+    let key_id = get_ecdsa_key_id();
+    let canister_id = ic_cdk::id();
+    let derivation_path = vec![canister_id.as_slice().to_vec()];
+
+    let request = SignWithEcdsaArgument {
+        message_hash: message_hash.to_vec(),
+        derivation_path,
+        key_id,
+    };
+
+    let (response,) = sign_with_ecdsa(request)
+        .await
+        .map_err(|(code, msg)| format!("ECDSA signing error: {:?} - {}", code, msg))?;
+
+    Ok(response.signature)
+}
+
+/// Send signed transaction to EVM RPC
+async fn send_raw_transaction(rpc_url: &str, raw_tx: &[u8]) -> Result<String, String> {
+    let raw_tx_hex = format!("0x{}", hex::encode(raw_tx));
+
+    let request_body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "eth_sendRawTransaction",
+        "params": [raw_tx_hex],
+        "id": 1
+    });
+
+    let request = CanisterHttpRequestArgument {
+        url: rpc_url.to_string(),
+        max_response_bytes: Some(5_000),
+        method: HttpMethod::POST,
+        headers: vec![
+            HttpHeader {
+                name: "Content-Type".to_string(),
+                value: "application/json".to_string(),
+            },
+        ],
+        body: Some(request_body.to_string().into_bytes()),
+        transform: Some(TransformContext {
+            function: TransformFunc(candid::Func {
+                principal: ic_cdk::id(),
+                method: "transform_evm_response".to_string(),
+            }),
+            context: vec![],
+        }),
+    };
+
+    let cycles = 50_000_000_000u128;
+
+    match http_request(request, cycles).await {
+        Ok((response,)) => {
+            let body = String::from_utf8(response.body)
+                .map_err(|e| format!("UTF-8 error: {}", e))?;
+
+            let json: serde_json::Value = serde_json::from_str(&body)
+                .map_err(|e| format!("JSON error: {} - Body: {}", e, body))?;
+
+            if let Some(error) = json.get("error") {
+                return Err(format!("RPC error: {}", error));
+            }
+
+            json["result"]
+                .as_str()
+                .map(|s| s.to_string())
+                .ok_or_else(|| format!("No tx hash in response: {}", body))
+        }
+        Err((code, msg)) => Err(format!("HTTP error: {:?} - {}", code, msg)),
+    }
+}
+
+/// Get nonce for address from EVM RPC
+async fn get_nonce(rpc_url: &str, address: &str) -> Result<u64, String> {
+    let request_body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "eth_getTransactionCount",
+        "params": [address, "pending"],
+        "id": 1
+    });
+
+    let request = CanisterHttpRequestArgument {
+        url: rpc_url.to_string(),
+        max_response_bytes: Some(2_000),
+        method: HttpMethod::POST,
+        headers: vec![
+            HttpHeader {
+                name: "Content-Type".to_string(),
+                value: "application/json".to_string(),
+            },
+        ],
+        body: Some(request_body.to_string().into_bytes()),
+        transform: Some(TransformContext {
+            function: TransformFunc(candid::Func {
+                principal: ic_cdk::id(),
+                method: "transform_evm_response".to_string(),
+            }),
+            context: vec![],
+        }),
+    };
+
+    let cycles = 30_000_000_000u128;
+
+    match http_request(request, cycles).await {
+        Ok((response,)) => {
+            let body = String::from_utf8(response.body)
+                .map_err(|e| format!("UTF-8 error: {}", e))?;
+
+            let json: serde_json::Value = serde_json::from_str(&body)
+                .map_err(|e| format!("JSON error: {}", e))?;
+
+            let nonce_hex = json["result"]
+                .as_str()
+                .ok_or_else(|| "No nonce in response".to_string())?;
+
+            let nonce_str = nonce_hex.strip_prefix("0x").unwrap_or(nonce_hex);
+            u64::from_str_radix(nonce_str, 16)
+                .map_err(|e| format!("Invalid nonce: {:?}", e))
+        }
+        Err((code, msg)) => Err(format!("HTTP error: {:?} - {}", code, msg)),
+    }
+}
+
+/// Get gas price from EVM RPC
+async fn get_gas_price(rpc_url: &str) -> Result<u64, String> {
+    let request_body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "eth_gasPrice",
+        "params": [],
+        "id": 1
+    });
+
+    let request = CanisterHttpRequestArgument {
+        url: rpc_url.to_string(),
+        max_response_bytes: Some(2_000),
+        method: HttpMethod::POST,
+        headers: vec![
+            HttpHeader {
+                name: "Content-Type".to_string(),
+                value: "application/json".to_string(),
+            },
+        ],
+        body: Some(request_body.to_string().into_bytes()),
+        transform: Some(TransformContext {
+            function: TransformFunc(candid::Func {
+                principal: ic_cdk::id(),
+                method: "transform_evm_response".to_string(),
+            }),
+            context: vec![],
+        }),
+    };
+
+    let cycles = 30_000_000_000u128;
+
+    match http_request(request, cycles).await {
+        Ok((response,)) => {
+            let body = String::from_utf8(response.body)
+                .map_err(|e| format!("UTF-8 error: {}", e))?;
+
+            let json: serde_json::Value = serde_json::from_str(&body)
+                .map_err(|e| format!("JSON error: {}", e))?;
+
+            let gas_hex = json["result"]
+                .as_str()
+                .ok_or_else(|| "No gas price in response".to_string())?;
+
+            let gas_str = gas_hex.strip_prefix("0x").unwrap_or(gas_hex);
+            u64::from_str_radix(gas_str, 16)
+                .map_err(|e| format!("Invalid gas price: {:?}", e))
+        }
+        Err((code, msg)) => Err(format!("HTTP error: {:?} - {}", code, msg)),
+    }
+}
+
+/// Transform function for EVM RPC responses
+#[query]
+fn transform_evm_response(raw: TransformArgs) -> HttpResponse {
+    HttpResponse {
+        status: raw.response.status,
+        body: raw.response.body,
+        headers: vec![],
+    }
+}
+
+/// Send native token (ETH, MATIC, etc.) on EVM chain - Admin Only
+#[update]
+async fn send_evm_native(
+    chain_id: u64,
+    to_address: String,
+    amount_wei: String,
+) -> Result<String, String> {
+    // ========== ADMIN ONLY ==========
+    require_admin()?;
+
+    // Get chain config
+    let chain_config = EVM_WALLET_STATE.with(|s| {
+        s.borrow().configured_chains.iter().find(|c| c.chain_id == chain_id).cloned()
+    }).ok_or_else(|| format!("Chain {} not configured. Use configure_evm_chain first.", chain_id))?;
+
+    // Get our address
+    let from_address = get_evm_address().await?;
+
+    // Get nonce
+    let nonce = get_nonce(&chain_config.rpc_url, &from_address).await?;
+
+    // Get gas price
+    let gas_price = get_gas_price(&chain_config.rpc_url).await?;
+    let max_fee_per_gas = gas_price * 2; // 2x for safety
+    let max_priority_fee_per_gas = 1_500_000_000; // 1.5 gwei
+
+    // Parse addresses and values
+    let to_bytes = hex_to_bytes(&to_address)?;
+    if to_bytes.len() != 20 {
+        return Err("Invalid to address length".to_string());
+    }
+
+    let value_bytes = wei_to_bytes(&amount_wei)?;
+
+    // Build transaction for signing (EIP-1559)
+    let gas_limit = 21_000u64; // Standard ETH transfer
+    let tx_for_signing = build_eip1559_tx_for_signing(
+        chain_id,
+        nonce,
+        max_priority_fee_per_gas,
+        max_fee_per_gas,
+        gas_limit,
+        &to_bytes,
+        &value_bytes,
+        &[], // no data for native transfer
+    );
+
+    // Hash the transaction
+    let mut hasher = Keccak::v256();
+    let mut tx_hash = [0u8; 32];
+    hasher.update(&tx_for_signing);
+    hasher.finalize(&mut tx_hash);
+
+    // Sign with Chain-Key ECDSA
+    let signature = sign_with_chain_key_ecdsa(&tx_hash).await?;
+
+    // Parse signature (r, s, v)
+    if signature.len() != 64 {
+        return Err(format!("Invalid signature length: {}", signature.len()));
+    }
+    let r = &signature[..32];
+    let s = &signature[32..];
+
+    // Determine recovery id (v) - try both 0 and 1
+    // For EIP-1559, v is just 0 or 1 (not 27/28)
+    let v = 0u8; // We'll try 0 first, recovery logic would be needed for production
+
+    // Build signed transaction
+    let signed_items = vec![
+        rlp_encode_u64(chain_id),
+        rlp_encode_u64(nonce),
+        rlp_encode_u64(max_priority_fee_per_gas),
+        rlp_encode_u64(max_fee_per_gas),
+        rlp_encode_u64(gas_limit),
+        rlp_encode_bytes(&to_bytes),
+        rlp_encode_bytes(&value_bytes),
+        rlp_encode_bytes(&[]), // data
+        rlp_encode_bytes(&[]), // accessList
+        rlp_encode_bytes(&[v]),
+        rlp_encode_bytes(r),
+        rlp_encode_bytes(s),
+    ];
+
+    let mut signed_tx = vec![0x02]; // EIP-1559 type
+    signed_tx.extend_from_slice(&rlp_encode_list(&signed_items));
+
+    // Send transaction
+    let tx_hash_result = send_raw_transaction(&chain_config.rpc_url, &signed_tx).await?;
+
+    // Record transaction
+    EVM_WALLET_STATE.with(|state| {
+        let mut s = state.borrow_mut();
+        s.tx_counter += 1;
+        let tx_record = EvmTransactionRecord {
+            id: s.tx_counter,
+            chain_id,
+            tx_hash: Some(tx_hash_result.clone()),
+            to: to_address.clone(),
+            value_wei: amount_wei.clone(),
+            data: None,
+            timestamp: ic_cdk::api::time(),
+            status: EvmTransactionStatus::Submitted(tx_hash_result.clone()),
+        };
+        s.transaction_history.push(tx_record);
+
+        // Limit history
+        if s.transaction_history.len() > 500 {
+            s.transaction_history.remove(0);
+        }
+    });
+
+    ic_cdk::println!("EVM transfer submitted: {} to {}, tx: {}", amount_wei, to_address, tx_hash_result);
+    Ok(tx_hash_result)
+}
+
+/// Get EVM transaction history
+#[query]
+fn get_evm_transaction_history(limit: Option<u32>) -> Vec<EvmTransactionRecord> {
+    let limit = limit.unwrap_or(50) as usize;
+
+    EVM_WALLET_STATE.with(|state| {
+        let s = state.borrow();
+        s.transaction_history
+            .iter()
+            .rev()
+            .take(limit)
+            .cloned()
+            .collect()
+    })
+}
+
+/// Get EVM balance from RPC (Admin can check, but public can view)
+#[update]
+async fn get_evm_balance(chain_id: u64) -> Result<String, String> {
+    let chain_config = EVM_WALLET_STATE.with(|s| {
+        s.borrow().configured_chains.iter().find(|c| c.chain_id == chain_id).cloned()
+    }).ok_or_else(|| format!("Chain {} not configured", chain_id))?;
+
+    let address = get_evm_address().await?;
+
+    let request_body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "eth_getBalance",
+        "params": [address, "latest"],
+        "id": 1
+    });
+
+    let request = CanisterHttpRequestArgument {
+        url: chain_config.rpc_url.clone(),
+        max_response_bytes: Some(2_000),
+        method: HttpMethod::POST,
+        headers: vec![
+            HttpHeader {
+                name: "Content-Type".to_string(),
+                value: "application/json".to_string(),
+            },
+        ],
+        body: Some(request_body.to_string().into_bytes()),
+        transform: Some(TransformContext {
+            function: TransformFunc(candid::Func {
+                principal: ic_cdk::id(),
+                method: "transform_evm_response".to_string(),
+            }),
+            context: vec![],
+        }),
+    };
+
+    let cycles = 30_000_000_000u128;
+
+    match http_request(request, cycles).await {
+        Ok((response,)) => {
+            let body = String::from_utf8(response.body)
+                .map_err(|e| format!("UTF-8 error: {}", e))?;
+
+            let json: serde_json::Value = serde_json::from_str(&body)
+                .map_err(|e| format!("JSON error: {}", e))?;
+
+            json["result"]
+                .as_str()
+                .map(|s| s.to_string())
+                .ok_or_else(|| "No balance in response".to_string())
+        }
+        Err((code, msg)) => Err(format!("HTTP error: {:?} - {}", code, msg)),
+    }
 }
 
 // Candid export

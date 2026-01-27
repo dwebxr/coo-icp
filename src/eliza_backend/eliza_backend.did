@@ -128,6 +128,39 @@ type TransactionRecord = record {
     block_height: opt nat64;
 };
 
+// EVM Wallet Types (Chain-Key ECDSA)
+type EvmWalletInfo = record {
+    address: text;
+    chain_id: nat64;
+    chain_name: text;
+};
+
+type EvmTransactionStatus = variant {
+    Pending;
+    Submitted: text;
+    Confirmed: nat64;
+    Failed: text;
+};
+
+type EvmTransactionRecord = record {
+    id: nat64;
+    chain_id: nat64;
+    tx_hash: opt text;
+    to: text;
+    value_wei: text;
+    data: opt text;
+    timestamp: nat64;
+    status: EvmTransactionStatus;
+};
+
+type EvmChainConfig = record {
+    chain_id: nat64;
+    chain_name: text;
+    rpc_url: text;
+    native_symbol: text;
+    decimals: nat8;
+};
+
 service : {
     // Chat
     chat: (text) -> (variant { Ok: text; Err: text });
@@ -189,7 +222,7 @@ service : {
     get_auto_post_config: () -> (opt AutoPostConfig) query;
     trigger_auto_post: () -> (variant { Ok: text; Err: text });
 
-    // ========== Wallet ==========
+    // ========== ICP Wallet ==========
     get_wallet_address: () -> (text) query;
     get_wallet_info: () -> (WalletInfo) query;
     check_icp_balance: () -> (variant { Ok: nat64; Err: text });
@@ -197,7 +230,17 @@ service : {
     get_transaction_history: (opt nat32) -> (vec TransactionRecord) query;
     get_wallet_status: () -> (variant { Ok: WalletInfo; Err: text });
 
+    // ========== EVM Wallet (Chain-Key ECDSA) ==========
+    get_evm_address: () -> (variant { Ok: text; Err: text });
+    get_evm_wallet_info: (nat64) -> (variant { Ok: EvmWalletInfo; Err: text });
+    configure_evm_chain: (EvmChainConfig) -> (variant { Ok; Err: text });
+    get_configured_chains: () -> (vec EvmChainConfig) query;
+    get_evm_balance: (nat64) -> (variant { Ok: text; Err: text });
+    send_evm_native: (nat64, text, text) -> (variant { Ok: text; Err: text });
+    get_evm_transaction_history: (opt nat32) -> (vec EvmTransactionRecord) query;
+
     // Transform functions (internal)
     transform_openai_response: (record { response: record { status: nat; body: vec nat8; headers: vec record { name: text; value: text } }; context: vec nat8 }) -> (record { status: nat; body: vec nat8; headers: vec record { name: text; value: text } }) query;
     transform_social_response: (record { response: record { status: nat; body: vec nat8; headers: vec record { name: text; value: text } }; context: vec nat8 }) -> (record { status: nat; body: vec nat8; headers: vec record { name: text; value: text } }) query;
+    transform_evm_response: (record { response: record { status: nat; body: vec nat8; headers: vec record { name: text; value: text } }; context: vec nat8 }) -> (record { status: nat; body: vec nat8; headers: vec record { name: text; value: text } }) query;
 }

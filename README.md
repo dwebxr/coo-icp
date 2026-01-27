@@ -17,6 +17,7 @@ A fully decentralized AI agent running on the Internet Computer blockchain, powe
 - **Conversation Memory**: Maintains context across conversations
 - **Social Integration**: Twitter and Discord posting with auto-reply capabilities
 - **ICP Wallet**: Native ICP wallet with balance checking and transfer capabilities
+- **EVM Wallet**: Multi-chain EVM wallet via Chain-Key ECDSA (Base, Polygon, etc.)
 - **elizaOS Framework**: Built on the leading open-source AI agent framework
 
 ## Architecture
@@ -563,6 +564,155 @@ get_wallet_status: () -> (variant { Ok: WalletInfo; Err: text });
 
 ---
 
+## EVM Wallet (Chain-Key ECDSA)
+
+Coo has a multi-chain EVM wallet powered by ICP's **Chain-Key ECDSA** technology. No private keys are stored - all signatures are generated through threshold cryptography.
+
+### EVM Wallet Address
+
+Coo's EVM wallet address (same across all EVM chains):
+```
+0x38a756bd4082eb3bed2266eef3bea85df4c3e72e
+```
+
+### Supported Chains
+
+| Chain | Chain ID | Native Token |
+|-------|----------|--------------|
+| Ethereum | 1 | ETH |
+| Base | 8453 | ETH |
+| Polygon | 137 | MATIC |
+| Optimism | 10 | ETH |
+| Arbitrum | 42161 | ETH |
+
+### Configure a Chain (Admin Only)
+
+```bash
+# Configure Base mainnet
+dfx canister call eliza_backend configure_evm_chain '(record {
+  chain_id = 8453: nat64;
+  chain_name = "Base";
+  rpc_url = "https://mainnet.base.org";
+  native_symbol = "ETH";
+  decimals = 18: nat8;
+})' --network ic
+
+# Configure Polygon mainnet
+dfx canister call eliza_backend configure_evm_chain '(record {
+  chain_id = 137: nat64;
+  chain_name = "Polygon";
+  rpc_url = "https://polygon-rpc.com";
+  native_symbol = "MATIC";
+  decimals = 18: nat8;
+})' --network ic
+```
+
+### Check EVM Wallet
+
+```bash
+# Get EVM address (same for all chains)
+dfx canister call eliza_backend get_evm_address --network ic
+
+# Get wallet info for specific chain
+dfx canister call eliza_backend get_evm_wallet_info '(8453: nat64)' --network ic
+
+# Check balance on Base
+dfx canister call eliza_backend get_evm_balance '(8453: nat64)' --network ic
+
+# Get configured chains
+dfx canister call eliza_backend get_configured_chains --network ic
+```
+
+### Send Native Token (Admin Only)
+
+```bash
+# Send ETH on Base (amount in wei)
+# 0.001 ETH = 1000000000000000 wei
+dfx canister call eliza_backend send_evm_native '(
+  8453: nat64,
+  "0xRECIPIENT_ADDRESS",
+  "1000000000000000"
+)' --network ic
+
+# Send MATIC on Polygon
+dfx canister call eliza_backend send_evm_native '(
+  137: nat64,
+  "0xRECIPIENT_ADDRESS",
+  "1000000000000000000"
+)' --network ic
+```
+
+### EVM Transaction History
+
+```bash
+# Get last 50 EVM transactions
+dfx canister call eliza_backend get_evm_transaction_history '(null)' --network ic
+
+# Get last 10 transactions
+dfx canister call eliza_backend get_evm_transaction_history '(opt 10: nat32)' --network ic
+```
+
+### EVM Wallet Security
+
+| Function | Access | Description |
+|----------|--------|-------------|
+| `get_evm_address` | Public | View EVM address |
+| `get_evm_wallet_info` | Public | View wallet info |
+| `get_evm_balance` | Public | Check balance |
+| `get_configured_chains` | Public | List configured chains |
+| `configure_evm_chain` | **Admin Only** | Add/update chain config |
+| `send_evm_native` | **Admin Only** | Transfer native tokens |
+| `get_evm_transaction_history` | Public | View transactions |
+
+> **Security Note:** All EVM transfer functions (`send_evm_native`) require admin authentication. Third parties cannot transfer tokens from Coo's EVM wallet.
+
+### How Chain-Key ECDSA Works
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  ICP Management Canister (Threshold ECDSA)                  │
+│                                                              │
+│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐  │
+│  │   Node 1     │    │   Node 2     │    │   Node N     │  │
+│  │  Key Share   │    │  Key Share   │    │  Key Share   │  │
+│  └──────┬───────┘    └──────┬───────┘    └──────┬───────┘  │
+│         │                   │                   │          │
+│         └───────────────────┼───────────────────┘          │
+│                             │                               │
+│                   ┌─────────▼─────────┐                    │
+│                   │  Threshold Sign   │                    │
+│                   │  (No single key)  │                    │
+│                   └─────────┬─────────┘                    │
+│                             │                               │
+└─────────────────────────────┼───────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│  Coo Backend Canister                                       │
+│                                                              │
+│  1. Build EVM Transaction                                   │
+│  2. Request ECDSA Signature                                 │
+│  3. Send to EVM RPC                                         │
+│                                                              │
+└───────────────────────────┬─────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│  EVM Chain (Base, Polygon, etc.)                            │
+│                                                              │
+│  Transaction confirmed on-chain                             │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Benefits:**
+- **No private key storage**: Keys never exist in a single location
+- **Decentralized security**: Requires consensus of ICP nodes
+- **Multi-chain support**: Same address across all EVM chains
+- **Censorship-resistant**: No centralized key management
+
+---
+
 ## Tech Stack
 
 - **Backend**: Rust + ic-cdk + ic-llm
@@ -570,6 +720,8 @@ get_wallet_status: () -> (variant { Ok: WalletInfo; Err: text });
 - **AI Model**: Llama 3.1 8B (via IC LLM Canister)
 - **Auth**: Internet Identity
 - **Social**: Twitter API (OAuth 1.0a), Discord Webhooks
+- **ICP Wallet**: ICP Ledger integration
+- **EVM Wallet**: Chain-Key ECDSA (threshold signatures)
 - **Framework**: elizaOS
 
 ## Security
@@ -578,7 +730,9 @@ get_wallet_status: () -> (variant { Ok: WalletInfo; Err: text });
 - Admin functions require the deployer's identity
 - No external API calls with OnChain mode
 - API keys encrypted with vetKeys (for OpenAI mode)
-- **Wallet protection**: ICP transfers (`send_icp`) require admin authentication
+- **ICP Wallet protection**: ICP transfers (`send_icp`) require admin authentication
+- **EVM Wallet protection**: EVM transfers (`send_evm_native`) require admin authentication
+- **Chain-Key security**: No private keys stored; threshold ECDSA via ICP management canister
 - **Chat isolation**: Chat responses are text-only; users cannot trigger wallet operations through conversation
 
 ## About elizaOS
