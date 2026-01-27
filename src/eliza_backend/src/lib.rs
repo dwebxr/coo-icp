@@ -2571,11 +2571,14 @@ fn configure_evm_chain(config: EvmChainConfig) -> Result<(), String> {
         if let Some(existing) = state.configured_chains.iter_mut().find(|c| c.chain_id == config.chain_id) {
             *existing = config;
         } else {
+            // Limit to 20 chains max
+            if state.configured_chains.len() >= 20 {
+                return Err("Maximum 20 chains allowed. Remove a chain first.".to_string());
+            }
             state.configured_chains.push(config);
         }
-    });
-
-    Ok(())
+        Ok(())
+    })
 }
 
 /// Get configured EVM chains
@@ -2653,9 +2656,15 @@ fn wei_to_bytes(wei_str: &str) -> Result<Vec<u8>, String> {
     use num_bigint::BigUint;
     let value = wei_str.parse::<BigUint>()
         .map_err(|e| format!("Invalid wei value: {:?}", e))?;
+
+    // Handle zero case
+    if value == BigUint::from(0u32) {
+        return Ok(vec![]);
+    }
+
     let bytes = value.to_bytes_be();
     // Remove leading zeros
-    let start = bytes.iter().position(|&b| b != 0).unwrap_or(bytes.len() - 1);
+    let start = bytes.iter().position(|&b| b != 0).unwrap_or(0);
     Ok(bytes[start..].to_vec())
 }
 
@@ -2895,8 +2904,9 @@ async fn send_evm_native(
 
     // Get gas price
     let gas_price = get_gas_price(&chain_config.rpc_url).await?;
-    let max_fee_per_gas = gas_price * 2; // 2x for safety
-    let max_priority_fee_per_gas = 1_500_000_000; // 1.5 gwei
+    // Use saturating multiplication to prevent overflow
+    let max_fee_per_gas = gas_price.saturating_mul(2); // 2x for safety
+    let max_priority_fee_per_gas = 1_500_000_000u64; // 1.5 gwei
 
     // Parse addresses and values
     let to_bytes = hex_to_bytes(&to_address)?;
@@ -2928,38 +2938,54 @@ async fn send_evm_native(
     // Sign with Chain-Key ECDSA
     let signature = sign_with_chain_key_ecdsa(&tx_hash).await?;
 
-    // Parse signature (r, s, v)
+    // Parse signature (r, s)
     if signature.len() != 64 {
         return Err(format!("Invalid signature length: {}", signature.len()));
     }
     let r = &signature[..32];
     let s = &signature[32..];
 
-    // Determine recovery id (v) - try both 0 and 1
-    // For EIP-1559, v is just 0 or 1 (not 27/28)
-    let v = 0u8; // We'll try 0 first, recovery logic would be needed for production
+    // Try both recovery IDs (0 and 1) - EIP-1559 uses 0/1, not 27/28
+    // We try v=0 first, then v=1 if that fails
+    let mut tx_hash_result: Option<String> = None;
+    let mut last_error = String::new();
 
-    // Build signed transaction
-    let signed_items = vec![
-        rlp_encode_u64(chain_id),
-        rlp_encode_u64(nonce),
-        rlp_encode_u64(max_priority_fee_per_gas),
-        rlp_encode_u64(max_fee_per_gas),
-        rlp_encode_u64(gas_limit),
-        rlp_encode_bytes(&to_bytes),
-        rlp_encode_bytes(&value_bytes),
-        rlp_encode_bytes(&[]), // data
-        rlp_encode_bytes(&[]), // accessList
-        rlp_encode_bytes(&[v]),
-        rlp_encode_bytes(r),
-        rlp_encode_bytes(s),
-    ];
+    for v in [0u8, 1u8] {
+        // Build signed transaction
+        let signed_items = vec![
+            rlp_encode_u64(chain_id),
+            rlp_encode_u64(nonce),
+            rlp_encode_u64(max_priority_fee_per_gas),
+            rlp_encode_u64(max_fee_per_gas),
+            rlp_encode_u64(gas_limit),
+            rlp_encode_bytes(&to_bytes),
+            rlp_encode_bytes(&value_bytes),
+            rlp_encode_bytes(&[]), // data
+            rlp_encode_bytes(&[]), // accessList
+            rlp_encode_bytes(&[v]),
+            rlp_encode_bytes(r),
+            rlp_encode_bytes(s),
+        ];
 
-    let mut signed_tx = vec![0x02]; // EIP-1559 type
-    signed_tx.extend_from_slice(&rlp_encode_list(&signed_items));
+        let mut signed_tx = vec![0x02]; // EIP-1559 type
+        signed_tx.extend_from_slice(&rlp_encode_list(&signed_items));
 
-    // Send transaction
-    let tx_hash_result = send_raw_transaction(&chain_config.rpc_url, &signed_tx).await?;
+        // Try to send transaction
+        match send_raw_transaction(&chain_config.rpc_url, &signed_tx).await {
+            Ok(hash) => {
+                tx_hash_result = Some(hash);
+                break;
+            }
+            Err(e) => {
+                last_error = e;
+                // Continue to try next v value
+            }
+        }
+    }
+
+    let tx_hash_result = tx_hash_result.ok_or_else(|| {
+        format!("Transaction failed with both recovery IDs. Last error: {}", last_error)
+    })?;
 
     // Record transaction
     EVM_WALLET_STATE.with(|state| {
