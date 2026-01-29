@@ -155,7 +155,7 @@ dfx canister call eliza_backend get_config --network ic
 ## Project Structure
 
 ```
-eliza-icp/
+coo-icp/
 ├── dfx.json                          # IC project configuration
 ├── Cargo.toml                        # Rust workspace
 ├── canister_ids.json                 # Mainnet canister IDs
