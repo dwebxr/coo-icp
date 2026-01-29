@@ -18,6 +18,9 @@ A fully decentralized AI agent running on the Internet Computer blockchain, powe
 - **Social Integration**: Twitter and Discord posting with auto-reply capabilities
 - **ICP Wallet**: Native ICP wallet with balance checking and transfer capabilities
 - **EVM Wallet**: Multi-chain EVM wallet via Chain-Key ECDSA (Base, Polygon, etc.)
+- **Solana Wallet**: Ed25519-based Solana wallet with SOL and SPL token support
+- **Cross-Chain DeFi**: Jupiter swap (Solana), Uniswap swap (EVM), LiFi bridge
+- **Portfolio Analysis**: Unified view of assets across all chains
 - **elizaOS Framework**: Built on the leading open-source AI agent framework
 
 ## Architecture
@@ -33,15 +36,24 @@ A fully decentralized AI agent running on the Internet Computer blockchain, powe
 │  │                 │    │  ┌────────────────────────────┐  │   │
 │  │ 4res3-liaaa-... │    │  │   IC LLM Canister          │  │   │
 │  └─────────────────┘    │  │   (Llama 3.1 8B)           │  │   │
-│                         │  │   w36hm-eqaaa-aaaal-qr76a  │  │   │
-│  ┌─────────────────┐    │  └────────────────────────────┘  │   │
-│  │    Internet     │    │                                  │   │
-│  │    Identity     │◄──►│  ┌────────────────────────────┐  │   │
-│  └─────────────────┘    │  │   ICP Ledger               │  │   │
-│                         │  │   ryjl3-tyaaa-aaaaa-aaaba  │  │   │
-│  ┌─────────────────┐    │  └────────────────────────────┘  │   │
-│  │   Twitter API   │◄──►│                                  │   │
-│  │   Discord API   │    │  4wfup-gqaaa-aaaas-qdqca-cai   │   │
+│                         │  └────────────────────────────┘  │   │
+│  ┌─────────────────┐    │                                  │   │
+│  │    Internet     │    │  ┌────────────────────────────┐  │   │
+│  │    Identity     │◄──►│  │   ICP Ledger               │  │   │
+│  └─────────────────┘    │  └────────────────────────────┘  │   │
+│                         │                                  │   │
+│  ┌─────────────────┐    │  ┌────────────────────────────┐  │   │
+│  │   Twitter API   │◄──►│  │   Chain-Key ECDSA          │  │   │
+│  │   Discord API   │    │  │   (EVM Signing)            │  │   │
+│  └─────────────────┘    │  └────────────────────────────┘  │   │
+│                         │                                  │   │
+│  ┌─────────────────┐    │  4wfup-gqaaa-aaaas-qdqca-cai   │   │
+│  │   EVM RPCs      │◄──►│                                  │   │
+│  │  (Base, Polygon)│    └──────────────────────────────────┘   │
+│  └─────────────────┘                                            │
+│                                                                  │
+│  ┌─────────────────┐    ┌──────────────────────────────────┐   │
+│  │  Solana RPC     │◄──►│   Jupiter API / LiFi API         │   │
 │  └─────────────────┘    └──────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -575,6 +587,13 @@ Coo's EVM wallet address (same across all EVM chains):
 0x38a756bd4082eb3bed2266eef3bea85df4c3e72e
 ```
 
+### Solana Wallet Address
+
+Coo's Solana wallet address:
+```
+F6zG6GmpMLLCcm1fUCD8wZzXoWw7SxQy9qBkoXfReFSQ
+```
+
 ### Supported Chains
 
 | Chain | Chain ID | Native Token |
@@ -713,6 +732,284 @@ dfx canister call eliza_backend get_evm_transaction_history '(opt 10: nat32)' --
 
 ---
 
+## ERC-20 Token Operations
+
+Coo supports ERC-20 token transfers and balance queries on any configured EVM chain.
+
+### Send ERC-20 Tokens (Admin Only)
+
+```bash
+# Send USDC on Base
+# Parameters: chain_id, token_contract, to_address, amount (smallest unit)
+dfx canister call eliza_backend send_erc20 '(
+  8453: nat64,
+  "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+  "0xRECIPIENT_ADDRESS",
+  "1000000"
+)' --network ic
+```
+
+### Check ERC-20 Balance
+
+```bash
+# Check USDC balance on Base
+dfx canister call eliza_backend get_erc20_balance '(
+  8453: nat64,
+  "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+  null
+)' --network ic
+```
+
+---
+
+## Solana Wallet (Ed25519)
+
+Coo has a native Solana wallet using Ed25519 cryptography, enabling SOL transfers and SPL token operations.
+
+### Solana Wallet Address
+
+```
+F6zG6GmpMLLCcm1fUCD8wZzXoWw7SxQy9qBkoXfReFSQ
+```
+
+### Initialize Solana Wallet (Admin Only)
+
+The Solana wallet must be initialized once to generate a keypair:
+
+```bash
+# Initialize wallet (generates Ed25519 keypair)
+dfx canister call eliza_backend init_solana_wallet --network ic
+```
+
+### Configure Solana Network
+
+```bash
+# Configure mainnet
+dfx canister call eliza_backend configure_solana_network '(record {
+  network_name = "mainnet";
+  rpc_url = "https://api.mainnet-beta.solana.com";
+})' --network ic
+
+# Configure devnet
+dfx canister call eliza_backend configure_solana_network '(record {
+  network_name = "devnet";
+  rpc_url = "https://api.devnet.solana.com";
+})' --network ic
+```
+
+### Check Solana Wallet
+
+```bash
+# Get wallet address
+dfx canister call eliza_backend get_solana_address --network ic
+
+# Get wallet info
+dfx canister call eliza_backend get_solana_wallet_info '("mainnet")' --network ic
+
+# Check SOL balance
+dfx canister call eliza_backend get_solana_balance '("mainnet")' --network ic
+
+# Get configured networks
+dfx canister call eliza_backend get_solana_networks --network ic
+```
+
+### Send SOL (Admin Only)
+
+```bash
+# Send SOL (amount in lamports, 1 SOL = 1,000,000,000 lamports)
+dfx canister call eliza_backend send_solana '(
+  "mainnet",
+  "RECIPIENT_SOLANA_ADDRESS",
+  100000000: nat64
+)' --network ic
+```
+
+### Solana Transaction History
+
+```bash
+# Get last 50 transactions
+dfx canister call eliza_backend get_solana_transaction_history '(null)' --network ic
+```
+
+---
+
+## SPL Token Operations
+
+Coo supports SPL token transfers and balance queries on Solana.
+
+### Send SPL Tokens (Admin Only)
+
+```bash
+# Send SPL tokens
+# Parameters: network, token_mint, to_address, amount (smallest unit)
+dfx canister call eliza_backend send_spl_token '(
+  "mainnet",
+  "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+  "RECIPIENT_ADDRESS",
+  1000000: nat64
+)' --network ic
+```
+
+### Check SPL Token Balance
+
+```bash
+# Check SPL token balance
+dfx canister call eliza_backend get_spl_token_balance '(
+  "mainnet",
+  "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+  null
+)' --network ic
+```
+
+---
+
+## Jupiter Swap (Solana DEX Aggregator)
+
+Coo integrates with Jupiter for optimal swap routing on Solana.
+
+### Get Swap Quote
+
+```bash
+# Get Jupiter quote (SOL -> USDC)
+dfx canister call eliza_backend get_jupiter_quote '(
+  "So11111111111111111111111111111111111111112",
+  "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+  100000000: nat64,
+  opt 50: nat64
+)' --network ic
+```
+
+### Execute Swap (Admin Only)
+
+```bash
+# Execute Jupiter swap
+dfx canister call eliza_backend execute_jupiter_swap '(
+  "mainnet",
+  "So11111111111111111111111111111111111111112",
+  "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+  100000000: nat64,
+  opt 50: nat64
+)' --network ic
+```
+
+---
+
+## LiFi Cross-Chain Bridge
+
+Coo integrates with LiFi for cross-chain token bridging between EVM chains.
+
+### Get Bridge Quote
+
+```bash
+# Get LiFi bridge quote (ETH on Base -> ETH on Polygon)
+dfx canister call eliza_backend get_lifi_quote '(
+  8453: nat64,
+  137: nat64,
+  "0x0000000000000000000000000000000000000000",
+  "0x0000000000000000000000000000000000000000",
+  "1000000000000000"
+)' --network ic
+```
+
+### Execute Bridge (Admin Only)
+
+```bash
+# Execute LiFi bridge
+dfx canister call eliza_backend execute_lifi_bridge '(
+  8453: nat64,
+  137: nat64,
+  "0x0000000000000000000000000000000000000000",
+  "0x0000000000000000000000000000000000000000",
+  "1000000000000000"
+)' --network ic
+```
+
+---
+
+## Uniswap/DEX Swap (EVM)
+
+Coo supports Uniswap V3 swaps on EVM chains.
+
+### Get Swap Quote
+
+```bash
+# Get Uniswap quote (WETH -> USDC on Base)
+dfx canister call eliza_backend get_uniswap_quote '(
+  8453: nat64,
+  "0x4200000000000000000000000000000000000006",
+  "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+  "1000000000000000",
+  opt 3000: nat32
+)' --network ic
+```
+
+### Execute Swap (Admin Only)
+
+```bash
+# Execute Uniswap swap
+dfx canister call eliza_backend execute_uniswap_swap '(
+  8453: nat64,
+  "0x4200000000000000000000000000000000000006",
+  "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+  "1000000000000000",
+  "1900000",
+  opt 3000: nat32
+)' --network ic
+```
+
+---
+
+## Portfolio Analysis
+
+Coo provides a unified view of all assets across ICP, EVM chains, and Solana.
+
+### Get Complete Portfolio
+
+```bash
+# Get portfolio overview (all chains)
+dfx canister call eliza_backend get_portfolio --network ic
+```
+
+Returns:
+```
+record {
+  icp = record { chain = "ICP"; symbol = "ICP"; address = "..."; balance = "1000000000" };
+  evm_assets = vec { record { chain = "Base"; symbol = "ETH"; ... } };
+  solana_assets = vec { record { chain = "Solana"; symbol = "SOL"; ... } };
+  total_chains = 3;
+  last_updated = 1234567890000000000;
+}
+```
+
+### Get Wallet Addresses
+
+```bash
+# Get all wallet addresses
+dfx canister call eliza_backend get_wallet_addresses --network ic
+
+# Returns:
+# vec { ("ICP", "e04d..."); ("EVM", "0x38a..."); ("Solana", "F6zG...") }
+```
+
+---
+
+## Wallet Security Summary
+
+| Function | Access | Chain |
+|----------|--------|-------|
+| `send_icp` | Admin | ICP |
+| `send_evm_native` | Admin | EVM |
+| `send_erc20` | Admin | EVM |
+| `send_solana` | Admin | Solana |
+| `send_spl_token` | Admin | Solana |
+| `execute_lifi_bridge` | Admin | EVM |
+| `execute_uniswap_swap` | Admin | EVM |
+| `execute_jupiter_swap` | Admin | Solana |
+
+> **Security Note:** All transfer and swap operations require admin authentication. Users cannot trigger fund movements through chat or without proper authentication.
+
+---
+
 ## Tech Stack
 
 - **Backend**: Rust + ic-cdk + ic-llm
@@ -722,6 +1019,8 @@ dfx canister call eliza_backend get_evm_transaction_history '(opt 10: nat32)' --
 - **Social**: Twitter API (OAuth 1.0a), Discord Webhooks
 - **ICP Wallet**: ICP Ledger integration
 - **EVM Wallet**: Chain-Key ECDSA (threshold signatures)
+- **Solana Wallet**: Ed25519 with on-chain key storage
+- **DeFi**: Jupiter (Solana), Uniswap V3 (EVM), LiFi (cross-chain)
 - **Framework**: elizaOS
 
 ## Security
@@ -731,8 +1030,12 @@ dfx canister call eliza_backend get_evm_transaction_history '(opt 10: nat32)' --
 - No external API calls with OnChain mode
 - API keys encrypted with vetKeys (for OpenAI mode)
 - **ICP Wallet protection**: ICP transfers (`send_icp`) require admin authentication
-- **EVM Wallet protection**: EVM transfers (`send_evm_native`) require admin authentication
-- **Chain-Key security**: No private keys stored; threshold ECDSA via ICP management canister
+- **EVM Wallet protection**: EVM transfers (`send_evm_native`, `send_erc20`) require admin authentication
+- **Solana Wallet protection**: Solana transfers (`send_solana`, `send_spl_token`) require admin authentication
+- **DeFi protection**: All swap and bridge operations require admin authentication
+- **Chain-Key security**: No private keys stored for EVM; threshold ECDSA via ICP management canister
+- **Solana key security**: Ed25519 keys encrypted and stored on-chain (vetKeys integration recommended for production)
+- **Stable memory**: All wallet states persist across canister upgrades
 - **Chat isolation**: Chat responses are text-only; users cannot trigger wallet operations through conversation
 
 ## About elizaOS

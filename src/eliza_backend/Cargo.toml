@@ -32,5 +32,11 @@ tiny-keccak = { version = "2.0", features = ["keccak"] }
 rlp = "0.5"
 num-bigint = "0.4"
 
+# Solana Wallet
+ed25519-dalek = { version = "2.1", default-features = false, features = ["rand_core"] }
+bs58 = "0.5"
+rand = { version = "0.8", default-features = false }
+getrandom = { version = "0.2", features = ["custom"] }
+
 [features]
 default = []

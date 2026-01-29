@@ -161,6 +161,82 @@ type EvmChainConfig = record {
     decimals: nat8;
 };
 
+// Solana Wallet Types (Ed25519)
+type SolanaWalletInfo = record {
+    address: text;
+    network: text;
+};
+
+type SolanaTransactionStatus = variant {
+    Pending;
+    Submitted: text;
+    Confirmed: nat64;
+    Failed: text;
+};
+
+type SolanaTransactionRecord = record {
+    id: nat64;
+    signature: opt text;
+    to: text;
+    amount_lamports: nat64;
+    timestamp: nat64;
+    status: SolanaTransactionStatus;
+};
+
+type SolanaNetworkConfig = record {
+    network_name: text;
+    rpc_url: text;
+};
+
+// Jupiter Swap Types
+type JupiterQuote = record {
+    input_mint: text;
+    output_mint: text;
+    in_amount: text;
+    out_amount: text;
+    price_impact_pct: text;
+    slippage_bps: nat64;
+};
+
+// LiFi Bridge Types
+type LiFiBridgeQuote = record {
+    from_chain_id: nat64;
+    to_chain_id: nat64;
+    from_token: text;
+    to_token: text;
+    from_amount: text;
+    to_amount: text;
+    estimated_gas: text;
+    tool: text;
+};
+
+// DEX Swap Types
+type DexSwapQuote = record {
+    chain_id: nat64;
+    token_in: text;
+    token_out: text;
+    amount_in: text;
+    amount_out: text;
+    price_impact: text;
+};
+
+// Portfolio Types
+type PortfolioAsset = record {
+    chain: text;
+    symbol: text;
+    address: text;
+    balance: text;
+    token_address: opt text;
+};
+
+type Portfolio = record {
+    icp: PortfolioAsset;
+    evm_assets: vec PortfolioAsset;
+    solana_assets: vec PortfolioAsset;
+    total_chains: nat32;
+    last_updated: nat64;
+};
+
 service : {
     // Chat
     chat: (text) -> (variant { Ok: text; Err: text });
@@ -239,8 +315,44 @@ service : {
     send_evm_native: (nat64, text, text) -> (variant { Ok: text; Err: text });
     get_evm_transaction_history: (opt nat32) -> (vec EvmTransactionRecord) query;
 
+    // ERC-20 Token Operations
+    send_erc20: (nat64, text, text, text) -> (variant { Ok: text; Err: text });
+    get_erc20_balance: (nat64, text, opt text) -> (variant { Ok: text; Err: text });
+
+    // LiFi Cross-Chain Bridge
+    get_lifi_quote: (nat64, nat64, text, text, text) -> (variant { Ok: LiFiBridgeQuote; Err: text });
+    execute_lifi_bridge: (nat64, nat64, text, text, text) -> (variant { Ok: text; Err: text });
+
+    // Uniswap/DEX Swap
+    get_uniswap_quote: (nat64, text, text, text, opt nat32) -> (variant { Ok: DexSwapQuote; Err: text });
+    execute_uniswap_swap: (nat64, text, text, text, text, opt nat32) -> (variant { Ok: text; Err: text });
+
+    // ========== Solana Wallet (Ed25519) ==========
+    init_solana_wallet: () -> (variant { Ok: text; Err: text });
+    get_solana_address: () -> (variant { Ok: text; Err: text });
+    get_solana_wallet_info: (text) -> (variant { Ok: SolanaWalletInfo; Err: text });
+    configure_solana_network: (SolanaNetworkConfig) -> (variant { Ok; Err: text });
+    get_solana_networks: () -> (vec SolanaNetworkConfig) query;
+    get_solana_balance: (text) -> (variant { Ok: nat64; Err: text });
+    send_solana: (text, text, nat64) -> (variant { Ok: text; Err: text });
+    get_solana_transaction_history: (opt nat32) -> (vec SolanaTransactionRecord) query;
+    reset_solana_wallet: () -> (variant { Ok; Err: text });
+
+    // SPL Token Operations
+    send_spl_token: (text, text, text, nat64) -> (variant { Ok: text; Err: text });
+    get_spl_token_balance: (text, text, opt text) -> (variant { Ok: text; Err: text });
+
+    // Jupiter Swap Integration
+    get_jupiter_quote: (text, text, nat64, opt nat64) -> (variant { Ok: JupiterQuote; Err: text });
+    execute_jupiter_swap: (text, text, text, nat64, opt nat64) -> (variant { Ok: text; Err: text });
+
+    // ========== Portfolio Analysis ==========
+    get_portfolio: () -> (variant { Ok: Portfolio; Err: text });
+    get_wallet_addresses: () -> (vec record { text; text }) query;
+
     // Transform functions (internal)
     transform_openai_response: (record { response: record { status: nat; body: vec nat8; headers: vec record { name: text; value: text } }; context: vec nat8 }) -> (record { status: nat; body: vec nat8; headers: vec record { name: text; value: text } }) query;
     transform_social_response: (record { response: record { status: nat; body: vec nat8; headers: vec record { name: text; value: text } }; context: vec nat8 }) -> (record { status: nat; body: vec nat8; headers: vec record { name: text; value: text } }) query;
     transform_evm_response: (record { response: record { status: nat; body: vec nat8; headers: vec record { name: text; value: text } }; context: vec nat8 }) -> (record { status: nat; body: vec nat8; headers: vec record { name: text; value: text } }) query;
+    transform_solana_response: (record { response: record { status: nat; body: vec nat8; headers: vec record { name: text; value: text } }; context: vec nat8 }) -> (record { status: nat; body: vec nat8; headers: vec record { name: text; value: text } }) query;
 }

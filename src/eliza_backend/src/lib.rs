@@ -3,7 +3,7 @@ use ic_cdk::api::management_canister::http_request::{
     http_request, CanisterHttpRequestArgument, HttpHeader, HttpMethod, HttpResponse, TransformArgs,
     TransformContext, TransformFunc,
 };
-use ic_cdk_macros::{init, post_upgrade, query, update};
+use ic_cdk_macros::{init, pre_upgrade, post_upgrade, query, update};
 use ic_cdk_timers::TimerId;
 use serde::Serialize;
 use std::cell::RefCell;
@@ -200,7 +200,7 @@ pub enum TransactionStatus {
     Failed(String),
 }
 
-#[derive(CandidType, Deserialize, Serialize, Clone, Debug, Default)]
+#[derive(CandidType, Deserialize, Serialize, Clone, Debug)]
 pub struct WalletState {
     pub transaction_history: Vec<TransactionRecord>,
     pub tx_counter: u64,
@@ -244,12 +244,55 @@ pub struct EvmChainConfig {
     pub decimals: u8,
 }
 
-#[derive(CandidType, Deserialize, Serialize, Clone, Debug, Default)]
+#[derive(CandidType, Deserialize, Serialize, Clone, Debug)]
 pub struct EvmWalletState {
     pub cached_address: Option<String>,
     pub transaction_history: Vec<EvmTransactionRecord>,
     pub tx_counter: u64,
     pub configured_chains: Vec<EvmChainConfig>,
+}
+
+// ========== Solana Wallet Data Structures ==========
+
+#[derive(CandidType, Deserialize, Serialize, Clone, Debug)]
+pub struct SolanaWalletInfo {
+    pub address: String,              // Base58 encoded public key
+    pub network: String,              // "mainnet-beta", "devnet", "testnet"
+}
+
+#[derive(CandidType, Deserialize, Serialize, Clone, Debug)]
+pub struct SolanaTransactionRecord {
+    pub id: u64,
+    pub signature: Option<String>,    // Base58 encoded signature
+    pub to: String,
+    pub amount_lamports: u64,         // 1 SOL = 1,000,000,000 lamports
+    pub timestamp: u64,
+    pub status: SolanaTransactionStatus,
+}
+
+#[derive(CandidType, Deserialize, Serialize, Clone, Debug)]
+pub enum SolanaTransactionStatus {
+    Pending,
+    Submitted(String),                // signature
+    Confirmed(u64),                   // slot
+    Failed(String),                   // error message
+}
+
+#[derive(CandidType, Deserialize, Serialize, Clone, Debug)]
+pub struct SolanaNetworkConfig {
+    pub network_name: String,         // "mainnet-beta", "devnet", "testnet"
+    pub rpc_url: String,
+}
+
+#[derive(CandidType, Deserialize, Serialize, Clone, Debug, Default)]
+pub struct SolanaWalletState {
+    pub initialized: bool,
+    pub public_key: Option<Vec<u8>>,           // 32 bytes Ed25519 public key
+    pub encrypted_secret_key: Option<Vec<u8>>, // 32 bytes Ed25519 secret key (encrypted)
+    pub cached_address: Option<String>,
+    pub transaction_history: Vec<SolanaTransactionRecord>,
+    pub tx_counter: u64,
+    pub configured_networks: Vec<SolanaNetworkConfig>,
 }
 
 // ========== State Management ==========
@@ -284,6 +327,62 @@ thread_local! {
         tx_counter: 0,
         configured_chains: Vec::new(),
     });
+
+    // Solana Wallet State (Ed25519)
+    static SOLANA_WALLET_STATE: RefCell<SolanaWalletState> = RefCell::new(SolanaWalletState {
+        initialized: false,
+        public_key: None,
+        encrypted_secret_key: None,
+        cached_address: None,
+        transaction_history: Vec::new(),
+        tx_counter: 0,
+        configured_networks: Vec::new(),
+    });
+}
+
+// ========== Stable Memory for Upgrades ==========
+
+/// State that persists across canister upgrades
+#[derive(CandidType, Deserialize, Serialize, Clone, Default)]
+struct StableState {
+    // Core state
+    conversations: HashMap<Principal, ConversationState>,
+    encrypted_api_key: Option<Vec<u8>>,
+    character: Option<Character>,
+    config: Option<Config>,
+
+    // Social integration
+    social_config: Option<SocialIntegrationConfig>,
+    scheduled_posts: Vec<ScheduledPost>,
+    incoming_messages: Vec<IncomingMessage>,
+    polling_state: PollingState,
+    post_counter: u64,
+    auto_post_config: Option<AutoPostConfig>,
+
+    // Wallet states
+    wallet_state: WalletState,
+    evm_wallet_state: EvmWalletState,
+    solana_wallet_state: SolanaWalletState,
+}
+
+impl Default for WalletState {
+    fn default() -> Self {
+        WalletState {
+            transaction_history: Vec::new(),
+            tx_counter: 0,
+        }
+    }
+}
+
+impl Default for EvmWalletState {
+    fn default() -> Self {
+        EvmWalletState {
+            cached_address: None,
+            transaction_history: Vec::new(),
+            tx_counter: 0,
+            configured_chains: Vec::new(),
+        }
+    }
 }
 
 // ========== Initialization ==========
@@ -335,24 +434,99 @@ fn init() {
     });
 }
 
+#[pre_upgrade]
+fn pre_upgrade() {
+    // Collect all state into StableState
+    let state = StableState {
+        conversations: CONVERSATIONS.with(|c| c.borrow().clone()),
+        encrypted_api_key: ENCRYPTED_API_KEY.with(|k| k.borrow().clone()),
+        character: CHARACTER.with(|c| c.borrow().clone()),
+        config: CONFIG.with(|c| c.borrow().clone()),
+        social_config: SOCIAL_CONFIG.with(|c| c.borrow().clone()),
+        scheduled_posts: SCHEDULED_POSTS.with(|p| p.borrow().clone()),
+        incoming_messages: INCOMING_MESSAGES.with(|m| m.borrow().clone()),
+        polling_state: POLLING_STATE.with(|p| p.borrow().clone()),
+        post_counter: POST_COUNTER.with(|c| *c.borrow()),
+        auto_post_config: AUTO_POST_CONFIG.with(|c| c.borrow().clone()),
+        wallet_state: WALLET_STATE.with(|w| w.borrow().clone()),
+        evm_wallet_state: EVM_WALLET_STATE.with(|w| w.borrow().clone()),
+        solana_wallet_state: SOLANA_WALLET_STATE.with(|w| w.borrow().clone()),
+    };
+
+    // Serialize to stable memory
+    let serialized = candid::encode_one(&state).expect("Failed to serialize state");
+
+    // Write length prefix + data to stable memory
+    let len = serialized.len() as u64;
+    let len_bytes = len.to_le_bytes();
+
+    // Grow stable memory if needed (1 page = 64KB)
+    let needed_pages = ((8 + serialized.len()) as u64 + 65535) / 65536;
+    let current_pages = ic_cdk::api::stable::stable_size();
+    if current_pages < needed_pages {
+        ic_cdk::api::stable::stable_grow(needed_pages - current_pages)
+            .expect("Failed to grow stable memory");
+    }
+
+    // Write length prefix
+    ic_cdk::api::stable::stable_write(0, &len_bytes);
+    // Write serialized data
+    ic_cdk::api::stable::stable_write(8, &serialized);
+}
+
 #[post_upgrade]
 fn post_upgrade() {
-    // Restore default character if not set
+    // Try to restore from stable memory
+    let stable_size = ic_cdk::api::stable::stable_size();
+
+    if stable_size > 0 {
+        // Read length prefix
+        let mut len_bytes = [0u8; 8];
+        ic_cdk::api::stable::stable_read(0, &mut len_bytes);
+        let len = u64::from_le_bytes(len_bytes) as usize;
+
+        if len > 0 && len < 100_000_000 {
+            // Sanity check: max 100MB
+            // Read serialized data
+            let mut serialized = vec![0u8; len];
+            ic_cdk::api::stable::stable_read(8, &mut serialized);
+
+            // Deserialize state
+            if let Ok(state) = candid::decode_one::<StableState>(&serialized) {
+                // Restore all state
+                CONVERSATIONS.with(|c| *c.borrow_mut() = state.conversations);
+                ENCRYPTED_API_KEY.with(|k| *k.borrow_mut() = state.encrypted_api_key);
+                CHARACTER.with(|c| *c.borrow_mut() = state.character);
+                CONFIG.with(|c| *c.borrow_mut() = state.config);
+                SOCIAL_CONFIG.with(|c| *c.borrow_mut() = state.social_config);
+                SCHEDULED_POSTS.with(|p| *p.borrow_mut() = state.scheduled_posts);
+                INCOMING_MESSAGES.with(|m| *m.borrow_mut() = state.incoming_messages);
+                POLLING_STATE.with(|p| *p.borrow_mut() = state.polling_state);
+                POST_COUNTER.with(|c| *c.borrow_mut() = state.post_counter);
+                AUTO_POST_CONFIG.with(|c| *c.borrow_mut() = state.auto_post_config);
+                WALLET_STATE.with(|w| *w.borrow_mut() = state.wallet_state);
+                EVM_WALLET_STATE.with(|w| *w.borrow_mut() = state.evm_wallet_state);
+                SOLANA_WALLET_STATE.with(|w| *w.borrow_mut() = state.solana_wallet_state);
+
+                ic_cdk::println!("State restored from stable memory successfully");
+                return;
+            }
+        }
+    }
+
+    // Fallback: initialize defaults if restoration failed
     CHARACTER.with(|c| {
         if c.borrow().is_none() {
             *c.borrow_mut() = Some(default_character());
         }
     });
 
-    // Restore config if not set (preserves admin from init if this is first upgrade)
     CONFIG.with(|cfg| {
         if cfg.borrow().is_none() {
-            // Note: After upgrade, we can't recover the original admin
-            // Consider using stable memory for production
             *cfg.borrow_mut() = Some(Config {
                 llm_provider: LlmProvider::Fallback,
                 max_conversation_length: 50,
-                admin: ic_cdk::caller(), // Will be the upgrade caller
+                admin: ic_cdk::caller(),
             });
         }
     });
@@ -718,7 +892,7 @@ fn get_conversation_count() -> u64 {
 
 #[query]
 fn health() -> String {
-    "Eliza is running on-chain!".to_string()
+    "Coo is running on-chain with stable memory!".to_string()
 }
 
 #[query]
@@ -3029,6 +3203,764 @@ fn get_evm_transaction_history(limit: Option<u32>) -> Vec<EvmTransactionRecord> 
     })
 }
 
+/// Send ERC-20 tokens (Admin only)
+/// Parameters: chain_id, token_contract_address, to_address, amount (in token's smallest unit)
+#[update]
+async fn send_erc20(
+    chain_id: u64,
+    token_address: String,
+    to_address: String,
+    amount: String,
+) -> Result<String, String> {
+    // ========== ADMIN ONLY ==========
+    require_admin()?;
+
+    // Get chain config
+    let chain_config = EVM_WALLET_STATE.with(|s| {
+        s.borrow().configured_chains.iter().find(|c| c.chain_id == chain_id).cloned()
+    }).ok_or_else(|| format!("Chain {} not configured", chain_id))?;
+
+    // Get our address
+    let from_address = get_evm_address().await?;
+
+    // Validate addresses
+    let token_bytes = hex_to_bytes(&token_address)?;
+    if token_bytes.len() != 20 {
+        return Err("Invalid token contract address".to_string());
+    }
+
+    let to_bytes = hex_to_bytes(&to_address)?;
+    if to_bytes.len() != 20 {
+        return Err("Invalid recipient address".to_string());
+    }
+
+    // Parse amount to bytes (big-endian, 32 bytes)
+    let amount_bytes = parse_token_amount(&amount)?;
+
+    // Build ERC-20 transfer data
+    // transfer(address,uint256) = 0xa9059cbb
+    let mut data = Vec::with_capacity(68);
+    data.extend_from_slice(&[0xa9, 0x05, 0x9c, 0xbb]); // function selector
+    // Pad address to 32 bytes
+    data.extend_from_slice(&[0u8; 12]); // 12 zero bytes
+    data.extend_from_slice(&to_bytes);   // 20 bytes address
+    // Amount as 32 bytes
+    data.extend_from_slice(&amount_bytes);
+
+    // Get nonce
+    let nonce = get_nonce(&chain_config.rpc_url, &from_address).await?;
+
+    // Get gas price
+    let gas_price = get_gas_price(&chain_config.rpc_url).await?;
+    let max_fee_per_gas = gas_price.saturating_mul(2);
+    let max_priority_fee_per_gas = 1_500_000_000u64;
+
+    // Gas limit for ERC-20 transfer (higher than native transfer)
+    let gas_limit = 100_000u64;
+
+    // Build transaction (value = 0 for ERC-20 transfer)
+    let tx_for_signing = build_eip1559_tx_for_signing(
+        chain_id,
+        nonce,
+        max_priority_fee_per_gas,
+        max_fee_per_gas,
+        gas_limit,
+        &token_bytes, // to = token contract
+        &[],          // value = 0
+        &data,        // ERC-20 transfer call data
+    );
+
+    // Hash and sign
+    let mut hasher = Keccak::v256();
+    let mut tx_hash = [0u8; 32];
+    hasher.update(&tx_for_signing);
+    hasher.finalize(&mut tx_hash);
+
+    let signature = sign_with_chain_key_ecdsa(&tx_hash).await?;
+
+    if signature.len() != 64 {
+        return Err(format!("Invalid signature length: {}", signature.len()));
+    }
+    let r = &signature[..32];
+    let s = &signature[32..];
+
+    // Try both recovery IDs
+    let mut tx_hash_result: Option<String> = None;
+    let mut last_error = String::new();
+
+    for v in [0u8, 1u8] {
+        let signed_items = vec![
+            rlp_encode_u64(chain_id),
+            rlp_encode_u64(nonce),
+            rlp_encode_u64(max_priority_fee_per_gas),
+            rlp_encode_u64(max_fee_per_gas),
+            rlp_encode_u64(gas_limit),
+            rlp_encode_bytes(&token_bytes),
+            rlp_encode_bytes(&[]), // value = 0
+            rlp_encode_bytes(&data),
+            rlp_encode_bytes(&[]), // accessList
+            rlp_encode_bytes(&[v]),
+            rlp_encode_bytes(r),
+            rlp_encode_bytes(s),
+        ];
+
+        let signed_rlp = rlp_encode_list(&signed_items);
+        let mut raw_tx = vec![0x02u8]; // EIP-1559 type
+        raw_tx.extend_from_slice(&signed_rlp);
+
+        match send_raw_transaction(&chain_config.rpc_url, &raw_tx).await {
+            Ok(hash) => {
+                tx_hash_result = Some(hash);
+                break;
+            }
+            Err(e) => {
+                last_error = e;
+            }
+        }
+    }
+
+    let tx_hash_result = tx_hash_result.ok_or(last_error)?;
+
+    // Record transaction
+    EVM_WALLET_STATE.with(|state| {
+        let mut s = state.borrow_mut();
+        s.tx_counter += 1;
+        let tx_id = s.tx_counter;
+        let record = EvmTransactionRecord {
+            id: tx_id,
+            chain_id,
+            tx_hash: Some(tx_hash_result.clone()),
+            to: to_address.clone(),
+            value_wei: format!("ERC20:{} amount:{}", token_address, amount),
+            data: Some(hex::encode(&data)),
+            timestamp: ic_cdk::api::time(),
+            status: EvmTransactionStatus::Submitted(tx_hash_result.clone()),
+        };
+        s.transaction_history.push(record);
+
+        if s.transaction_history.len() > 500 {
+            s.transaction_history.remove(0);
+        }
+    });
+
+    ic_cdk::println!("ERC-20 transfer: {} {} to {}", amount, token_address, to_address);
+    Ok(tx_hash_result)
+}
+
+/// Parse token amount string to 32-byte big-endian representation
+fn parse_token_amount(amount_str: &str) -> Result<[u8; 32], String> {
+    use num_bigint::BigUint;
+
+    let amount = amount_str
+        .parse::<BigUint>()
+        .map_err(|e| format!("Invalid amount: {}", e))?;
+
+    let bytes = amount.to_bytes_be();
+    if bytes.len() > 32 {
+        return Err("Amount too large".to_string());
+    }
+
+    let mut result = [0u8; 32];
+    result[32 - bytes.len()..].copy_from_slice(&bytes);
+    Ok(result)
+}
+
+/// Get ERC-20 token balance
+#[update]
+async fn get_erc20_balance(
+    chain_id: u64,
+    token_address: String,
+    wallet_address: Option<String>,
+) -> Result<String, String> {
+    let chain_config = EVM_WALLET_STATE.with(|s| {
+        s.borrow().configured_chains.iter().find(|c| c.chain_id == chain_id).cloned()
+    }).ok_or_else(|| format!("Chain {} not configured", chain_id))?;
+
+    let wallet = match wallet_address {
+        Some(addr) => addr,
+        None => get_evm_address().await?,
+    };
+
+    let wallet_bytes = hex_to_bytes(&wallet)?;
+    if wallet_bytes.len() != 20 {
+        return Err("Invalid wallet address".to_string());
+    }
+
+    // balanceOf(address) = 0x70a08231
+    let mut data = Vec::with_capacity(36);
+    data.extend_from_slice(&[0x70, 0xa0, 0x82, 0x31]);
+    data.extend_from_slice(&[0u8; 12]);
+    data.extend_from_slice(&wallet_bytes);
+
+    let data_hex = format!("0x{}", hex::encode(&data));
+
+    // eth_call
+    let request_body = format!(
+        r#"{{"jsonrpc":"2.0","method":"eth_call","params":[{{"to":"{}","data":"{}"}},"latest"],"id":1}}"#,
+        token_address, data_hex
+    );
+
+    let request = CanisterHttpRequestArgument {
+        url: chain_config.rpc_url.clone(),
+        max_response_bytes: Some(2000),
+        method: HttpMethod::POST,
+        headers: vec![HttpHeader {
+            name: "Content-Type".to_string(),
+            value: "application/json".to_string(),
+        }],
+        body: Some(request_body.into_bytes()),
+        transform: Some(TransformContext {
+            function: TransformFunc(candid::Func {
+                principal: ic_cdk::id(),
+                method: "transform_evm_response".to_string(),
+            }),
+            context: vec![],
+        }),
+    };
+
+    let cycles = 50_000_000_000u128;
+    let (response,): (HttpResponse,) = http_request(request, cycles)
+        .await
+        .map_err(|(code, msg)| format!("HTTP error: {:?} - {}", code, msg))?;
+
+    let body = String::from_utf8(response.body)
+        .map_err(|e| format!("Invalid response: {}", e))?;
+
+    // Parse result
+    if let Some(start) = body.find("\"result\":\"") {
+        let start = start + 10;
+        if let Some(end) = body[start..].find('"') {
+            let hex_result = &body[start..start + end];
+            // Convert hex to decimal string
+            let hex_value = hex_result.trim_start_matches("0x");
+            if hex_value.is_empty() || hex_value == "0" {
+                return Ok("0".to_string());
+            }
+            use num_bigint::BigUint;
+            let value = BigUint::parse_bytes(hex_value.as_bytes(), 16)
+                .ok_or("Failed to parse balance")?;
+            return Ok(value.to_string());
+        }
+    }
+
+    Err(format!("Failed to parse balance response: {}", body))
+}
+
+// ========== LiFi Cross-Chain Bridge ==========
+
+/// LiFi API endpoints
+const LIFI_QUOTE_API: &str = "https://li.quest/v1/quote";
+
+/// LiFi bridge quote response
+#[derive(CandidType, Deserialize, Serialize, Clone, Debug)]
+pub struct LiFiBridgeQuote {
+    pub from_chain_id: u64,
+    pub to_chain_id: u64,
+    pub from_token: String,
+    pub to_token: String,
+    pub from_amount: String,
+    pub to_amount: String,
+    pub estimated_gas: String,
+    pub tool: String,
+}
+
+/// Get LiFi bridge quote
+#[update]
+async fn get_lifi_quote(
+    from_chain_id: u64,
+    to_chain_id: u64,
+    from_token: String,
+    to_token: String,
+    from_amount: String,
+) -> Result<LiFiBridgeQuote, String> {
+    let from_address = get_evm_address().await?;
+
+    let url = format!(
+        "{}?fromChain={}&toChain={}&fromToken={}&toToken={}&fromAmount={}&fromAddress={}",
+        LIFI_QUOTE_API, from_chain_id, to_chain_id, from_token, to_token, from_amount, from_address
+    );
+
+    let request = CanisterHttpRequestArgument {
+        url,
+        max_response_bytes: Some(50_000),
+        method: HttpMethod::GET,
+        headers: vec![],
+        body: None,
+        transform: Some(TransformContext {
+            function: TransformFunc(candid::Func {
+                principal: ic_cdk::id(),
+                method: "transform_evm_response".to_string(),
+            }),
+            context: vec![],
+        }),
+    };
+
+    let cycles = 50_000_000_000u128;
+
+    let (response,): (HttpResponse,) = http_request(request, cycles)
+        .await
+        .map_err(|(code, msg)| format!("HTTP error: {:?} - {}", code, msg))?;
+
+    let body = String::from_utf8(response.body)
+        .map_err(|e| format!("UTF-8 error: {}", e))?;
+
+    let json: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| format!("JSON error: {} - Body: {}", e, body))?;
+
+    if let Some(error) = json.get("message") {
+        if json.get("code").is_some() {
+            return Err(format!("LiFi API error: {}", error));
+        }
+    }
+
+    let estimate = &json["estimate"];
+    let action = &json["action"];
+    let tool = json["tool"].as_str().unwrap_or("unknown");
+
+    Ok(LiFiBridgeQuote {
+        from_chain_id,
+        to_chain_id,
+        from_token: action["fromToken"]["address"].as_str().unwrap_or(&from_token).to_string(),
+        to_token: action["toToken"]["address"].as_str().unwrap_or(&to_token).to_string(),
+        from_amount: from_amount.clone(),
+        to_amount: estimate["toAmount"].as_str().unwrap_or("0").to_string(),
+        estimated_gas: estimate["gasCosts"][0]["amount"].as_str().unwrap_or("0").to_string(),
+        tool: tool.to_string(),
+    })
+}
+
+/// Execute LiFi bridge (Admin only)
+#[update]
+async fn execute_lifi_bridge(
+    from_chain_id: u64,
+    to_chain_id: u64,
+    from_token: String,
+    to_token: String,
+    from_amount: String,
+) -> Result<String, String> {
+    // ========== ADMIN ONLY ==========
+    require_admin()?;
+
+    // Get chain config for source chain
+    let chain_config = EVM_WALLET_STATE.with(|s| {
+        s.borrow().configured_chains.iter().find(|c| c.chain_id == from_chain_id).cloned()
+    }).ok_or_else(|| format!("Source chain {} not configured", from_chain_id))?;
+
+    let from_address = get_evm_address().await?;
+
+    // Get quote with transaction data
+    let url = format!(
+        "{}?fromChain={}&toChain={}&fromToken={}&toToken={}&fromAmount={}&fromAddress={}",
+        LIFI_QUOTE_API, from_chain_id, to_chain_id, from_token, to_token, from_amount, from_address
+    );
+
+    let request = CanisterHttpRequestArgument {
+        url,
+        max_response_bytes: Some(100_000),
+        method: HttpMethod::GET,
+        headers: vec![],
+        body: None,
+        transform: Some(TransformContext {
+            function: TransformFunc(candid::Func {
+                principal: ic_cdk::id(),
+                method: "transform_evm_response".to_string(),
+            }),
+            context: vec![],
+        }),
+    };
+
+    let cycles = 50_000_000_000u128;
+
+    let (response,): (HttpResponse,) = http_request(request, cycles)
+        .await
+        .map_err(|(code, msg)| format!("Quote HTTP error: {:?} - {}", code, msg))?;
+
+    let body = String::from_utf8(response.body)
+        .map_err(|e| format!("UTF-8 error: {}", e))?;
+
+    let json: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| format!("JSON error: {}", e))?;
+
+    // Extract transaction data
+    let tx_request = &json["transactionRequest"];
+    let to = tx_request["to"].as_str().ok_or("No 'to' address in transaction")?;
+    let value = tx_request["value"].as_str().unwrap_or("0x0");
+    let data = tx_request["data"].as_str().ok_or("No 'data' in transaction")?;
+    let gas_limit_hex = tx_request["gasLimit"].as_str().unwrap_or("0x100000");
+
+    // Parse values
+    let to_bytes = hex_to_bytes(to)?;
+    let value_bytes = hex_to_bytes(value)?;
+    let data_bytes = hex::decode(data.trim_start_matches("0x"))
+        .map_err(|e| format!("Invalid data hex: {}", e))?;
+    let gas_limit = u64::from_str_radix(gas_limit_hex.trim_start_matches("0x"), 16)
+        .unwrap_or(500_000);
+
+    // Get nonce and gas price
+    let nonce = get_nonce(&chain_config.rpc_url, &from_address).await?;
+    let gas_price = get_gas_price(&chain_config.rpc_url).await?;
+    let max_fee_per_gas = gas_price.saturating_mul(2);
+    let max_priority_fee_per_gas = 1_500_000_000u64;
+
+    // Build transaction
+    let tx_for_signing = build_eip1559_tx_for_signing(
+        from_chain_id,
+        nonce,
+        max_priority_fee_per_gas,
+        max_fee_per_gas,
+        gas_limit,
+        &to_bytes,
+        &value_bytes,
+        &data_bytes,
+    );
+
+    // Hash and sign
+    let mut hasher = Keccak::v256();
+    let mut tx_hash = [0u8; 32];
+    hasher.update(&tx_for_signing);
+    hasher.finalize(&mut tx_hash);
+
+    let signature = sign_with_chain_key_ecdsa(&tx_hash).await?;
+
+    if signature.len() != 64 {
+        return Err("Invalid signature length".to_string());
+    }
+    let r = &signature[..32];
+    let s = &signature[32..];
+
+    // Try both recovery IDs
+    let mut tx_hash_result: Option<String> = None;
+    let mut last_error = String::new();
+
+    for v in [0u8, 1u8] {
+        let signed_items = vec![
+            rlp_encode_u64(from_chain_id),
+            rlp_encode_u64(nonce),
+            rlp_encode_u64(max_priority_fee_per_gas),
+            rlp_encode_u64(max_fee_per_gas),
+            rlp_encode_u64(gas_limit),
+            rlp_encode_bytes(&to_bytes),
+            rlp_encode_bytes(&value_bytes),
+            rlp_encode_bytes(&data_bytes),
+            rlp_encode_bytes(&[]), // accessList
+            rlp_encode_bytes(&[v]),
+            rlp_encode_bytes(r),
+            rlp_encode_bytes(s),
+        ];
+
+        let signed_rlp = rlp_encode_list(&signed_items);
+        let mut raw_tx = vec![0x02u8];
+        raw_tx.extend_from_slice(&signed_rlp);
+
+        match send_raw_transaction(&chain_config.rpc_url, &raw_tx).await {
+            Ok(hash) => {
+                tx_hash_result = Some(hash);
+                break;
+            }
+            Err(e) => last_error = e,
+        }
+    }
+
+    let tx_hash_result = tx_hash_result.ok_or(last_error)?;
+
+    // Record transaction
+    EVM_WALLET_STATE.with(|state| {
+        let mut s = state.borrow_mut();
+        s.tx_counter += 1;
+        let tx_id = s.tx_counter;
+        let record = EvmTransactionRecord {
+            id: tx_id,
+            chain_id: from_chain_id,
+            tx_hash: Some(tx_hash_result.clone()),
+            to: format!("BRIDGE:{}->chain{}", to_token, to_chain_id),
+            value_wei: from_amount.clone(),
+            data: Some(format!("LiFi bridge to chain {}", to_chain_id)),
+            timestamp: ic_cdk::api::time(),
+            status: EvmTransactionStatus::Submitted(tx_hash_result.clone()),
+        };
+        s.transaction_history.push(record);
+
+        if s.transaction_history.len() > 500 {
+            s.transaction_history.remove(0);
+        }
+    });
+
+    ic_cdk::println!("LiFi bridge: {} {} from chain {} to chain {}, tx: {}",
+        from_amount, from_token, from_chain_id, to_chain_id, tx_hash_result);
+
+    Ok(tx_hash_result)
+}
+
+// ========== Uniswap/DEX Swap ==========
+
+/// Uniswap V3 Quoter2 address (same on most chains)
+const UNISWAP_QUOTER_V2: &str = "0x61fFE014bA17989E743c5F6cB21bF9697530B21e";
+/// Uniswap V3 SwapRouter02 address
+const UNISWAP_ROUTER_V2: &str = "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45";
+
+/// DEX swap quote
+#[derive(CandidType, Deserialize, Serialize, Clone, Debug)]
+pub struct DexSwapQuote {
+    pub chain_id: u64,
+    pub token_in: String,
+    pub token_out: String,
+    pub amount_in: String,
+    pub amount_out: String,
+    pub price_impact: String,
+}
+
+/// Get Uniswap swap quote (via on-chain quoter)
+#[update]
+async fn get_uniswap_quote(
+    chain_id: u64,
+    token_in: String,
+    token_out: String,
+    amount_in: String,
+    fee: Option<u32>,
+) -> Result<DexSwapQuote, String> {
+    let chain_config = EVM_WALLET_STATE.with(|s| {
+        s.borrow().configured_chains.iter().find(|c| c.chain_id == chain_id).cloned()
+    }).ok_or_else(|| format!("Chain {} not configured", chain_id))?;
+
+    let pool_fee = fee.unwrap_or(3000); // Default 0.3% fee tier
+    let amount_bytes = parse_token_amount(&amount_in)?;
+    let token_in_bytes = hex_to_bytes(&token_in)?;
+    let token_out_bytes = hex_to_bytes(&token_out)?;
+
+    // quoteExactInputSingle((address,address,uint256,uint24,uint160))
+    // Selector: 0xc6a5026a
+    let mut data = Vec::new();
+    data.extend_from_slice(&[0xc6, 0xa5, 0x02, 0x6a]);
+    // tokenIn (padded)
+    data.extend_from_slice(&[0u8; 12]);
+    data.extend_from_slice(&token_in_bytes);
+    // tokenOut (padded)
+    data.extend_from_slice(&[0u8; 12]);
+    data.extend_from_slice(&token_out_bytes);
+    // amountIn
+    data.extend_from_slice(&amount_bytes);
+    // fee (padded to 32 bytes)
+    let mut fee_bytes = [0u8; 32];
+    fee_bytes[28..32].copy_from_slice(&pool_fee.to_be_bytes());
+    data.extend_from_slice(&fee_bytes);
+    // sqrtPriceLimitX96 = 0
+    data.extend_from_slice(&[0u8; 32]);
+
+    let data_hex = format!("0x{}", hex::encode(&data));
+
+    let request_body = format!(
+        r#"{{"jsonrpc":"2.0","method":"eth_call","params":[{{"to":"{}","data":"{}"}},"latest"],"id":1}}"#,
+        UNISWAP_QUOTER_V2, data_hex
+    );
+
+    let request = CanisterHttpRequestArgument {
+        url: chain_config.rpc_url.clone(),
+        max_response_bytes: Some(5000),
+        method: HttpMethod::POST,
+        headers: vec![HttpHeader {
+            name: "Content-Type".to_string(),
+            value: "application/json".to_string(),
+        }],
+        body: Some(request_body.into_bytes()),
+        transform: Some(TransformContext {
+            function: TransformFunc(candid::Func {
+                principal: ic_cdk::id(),
+                method: "transform_evm_response".to_string(),
+            }),
+            context: vec![],
+        }),
+    };
+
+    let cycles = 50_000_000_000u128;
+    let (response,): (HttpResponse,) = http_request(request, cycles)
+        .await
+        .map_err(|(code, msg)| format!("HTTP error: {:?} - {}", code, msg))?;
+
+    let body = String::from_utf8(response.body)
+        .map_err(|e| format!("UTF-8 error: {}", e))?;
+
+    // Parse result - returns (amountOut, sqrtPriceX96After, initializedTicksCrossed, gasEstimate)
+    if let Some(start) = body.find("\"result\":\"") {
+        let start = start + 10;
+        if let Some(end) = body[start..].find('"') {
+            let hex_result = &body[start..start + end];
+            let result_bytes = hex::decode(hex_result.trim_start_matches("0x"))
+                .map_err(|e| format!("Hex decode error: {}", e))?;
+
+            if result_bytes.len() >= 32 {
+                use num_bigint::BigUint;
+                let amount_out = BigUint::from_bytes_be(&result_bytes[0..32]);
+
+                return Ok(DexSwapQuote {
+                    chain_id,
+                    token_in,
+                    token_out,
+                    amount_in,
+                    amount_out: amount_out.to_string(),
+                    price_impact: "N/A".to_string(), // Would need additional calculation
+                });
+            }
+        }
+    }
+
+    if body.contains("error") {
+        return Err(format!("Quote failed - pool may not exist for this pair: {}", body));
+    }
+
+    Err(format!("Failed to parse quote response: {}", body))
+}
+
+/// Execute Uniswap swap (Admin only)
+#[update]
+async fn execute_uniswap_swap(
+    chain_id: u64,
+    token_in: String,
+    token_out: String,
+    amount_in: String,
+    min_amount_out: String,
+    fee: Option<u32>,
+) -> Result<String, String> {
+    // ========== ADMIN ONLY ==========
+    require_admin()?;
+
+    let chain_config = EVM_WALLET_STATE.with(|s| {
+        s.borrow().configured_chains.iter().find(|c| c.chain_id == chain_id).cloned()
+    }).ok_or_else(|| format!("Chain {} not configured", chain_id))?;
+
+    let from_address = get_evm_address().await?;
+    let pool_fee = fee.unwrap_or(3000);
+
+    let amount_in_bytes = parse_token_amount(&amount_in)?;
+    let min_out_bytes = parse_token_amount(&min_amount_out)?;
+    let token_in_bytes = hex_to_bytes(&token_in)?;
+    let token_out_bytes = hex_to_bytes(&token_out)?;
+    let recipient_bytes = hex_to_bytes(&from_address)?;
+
+    // Build exactInputSingle call
+    // exactInputSingle((address,address,uint24,address,uint256,uint256,uint160))
+    // Selector: 0x04e45aaf
+    let mut swap_data = Vec::new();
+    swap_data.extend_from_slice(&[0x04, 0xe4, 0x5a, 0xaf]);
+
+    // Encode struct parameters (each padded to 32 bytes)
+    // tokenIn
+    swap_data.extend_from_slice(&[0u8; 12]);
+    swap_data.extend_from_slice(&token_in_bytes);
+    // tokenOut
+    swap_data.extend_from_slice(&[0u8; 12]);
+    swap_data.extend_from_slice(&token_out_bytes);
+    // fee
+    let mut fee_bytes = [0u8; 32];
+    fee_bytes[28..32].copy_from_slice(&pool_fee.to_be_bytes());
+    swap_data.extend_from_slice(&fee_bytes);
+    // recipient
+    swap_data.extend_from_slice(&[0u8; 12]);
+    swap_data.extend_from_slice(&recipient_bytes);
+    // amountIn
+    swap_data.extend_from_slice(&amount_in_bytes);
+    // amountOutMinimum
+    swap_data.extend_from_slice(&min_out_bytes);
+    // sqrtPriceLimitX96 = 0
+    swap_data.extend_from_slice(&[0u8; 32]);
+
+    // Get nonce and gas price
+    let nonce = get_nonce(&chain_config.rpc_url, &from_address).await?;
+    let gas_price = get_gas_price(&chain_config.rpc_url).await?;
+    let max_fee_per_gas = gas_price.saturating_mul(2);
+    let max_priority_fee_per_gas = 2_000_000_000u64;
+    let gas_limit = 300_000u64;
+
+    let router_bytes = hex_to_bytes(UNISWAP_ROUTER_V2)?;
+
+    // Build transaction (value = 0 for ERC20 swap)
+    let tx_for_signing = build_eip1559_tx_for_signing(
+        chain_id,
+        nonce,
+        max_priority_fee_per_gas,
+        max_fee_per_gas,
+        gas_limit,
+        &router_bytes,
+        &[],
+        &swap_data,
+    );
+
+    // Hash and sign
+    let mut hasher = Keccak::v256();
+    let mut tx_hash = [0u8; 32];
+    hasher.update(&tx_for_signing);
+    hasher.finalize(&mut tx_hash);
+
+    let signature = sign_with_chain_key_ecdsa(&tx_hash).await?;
+
+    if signature.len() != 64 {
+        return Err("Invalid signature length".to_string());
+    }
+    let r = &signature[..32];
+    let s = &signature[32..];
+
+    // Try both recovery IDs
+    let mut tx_hash_result: Option<String> = None;
+    let mut last_error = String::new();
+
+    for v in [0u8, 1u8] {
+        let signed_items = vec![
+            rlp_encode_u64(chain_id),
+            rlp_encode_u64(nonce),
+            rlp_encode_u64(max_priority_fee_per_gas),
+            rlp_encode_u64(max_fee_per_gas),
+            rlp_encode_u64(gas_limit),
+            rlp_encode_bytes(&router_bytes),
+            rlp_encode_bytes(&[]),
+            rlp_encode_bytes(&swap_data),
+            rlp_encode_bytes(&[]),
+            rlp_encode_bytes(&[v]),
+            rlp_encode_bytes(r),
+            rlp_encode_bytes(s),
+        ];
+
+        let signed_rlp = rlp_encode_list(&signed_items);
+        let mut raw_tx = vec![0x02u8];
+        raw_tx.extend_from_slice(&signed_rlp);
+
+        match send_raw_transaction(&chain_config.rpc_url, &raw_tx).await {
+            Ok(hash) => {
+                tx_hash_result = Some(hash);
+                break;
+            }
+            Err(e) => last_error = e,
+        }
+    }
+
+    let tx_hash_result = tx_hash_result.ok_or(last_error)?;
+
+    // Record transaction
+    EVM_WALLET_STATE.with(|state| {
+        let mut s = state.borrow_mut();
+        s.tx_counter += 1;
+        let tx_id = s.tx_counter;
+        let record = EvmTransactionRecord {
+            id: tx_id,
+            chain_id,
+            tx_hash: Some(tx_hash_result.clone()),
+            to: format!("SWAP:{}->{}", token_in, token_out),
+            value_wei: amount_in.clone(),
+            data: Some("Uniswap V3 Swap".to_string()),
+            timestamp: ic_cdk::api::time(),
+            status: EvmTransactionStatus::Submitted(tx_hash_result.clone()),
+        };
+        s.transaction_history.push(record);
+
+        if s.transaction_history.len() > 500 {
+            s.transaction_history.remove(0);
+        }
+    });
+
+    ic_cdk::println!("Uniswap swap: {} {} -> {} on chain {}, tx: {}",
+        amount_in, token_in, token_out, chain_id, tx_hash_result);
+
+    Ok(tx_hash_result)
+}
+
 /// Get EVM balance from RPC (Admin can check, but public can view)
 #[update]
 async fn get_evm_balance(chain_id: u64) -> Result<String, String> {
@@ -3082,6 +4014,1312 @@ async fn get_evm_balance(chain_id: u64) -> Result<String, String> {
         }
         Err((code, msg)) => Err(format!("HTTP error: {:?} - {}", code, msg)),
     }
+}
+
+// ========== Solana Wallet (Ed25519) ==========
+
+use ed25519_dalek::{SigningKey, Signer, Signature};
+
+/// Custom getrandom implementation for IC
+/// This is required because getrandom doesn't support wasm32-unknown-unknown by default
+#[cfg(target_arch = "wasm32")]
+mod ic_random {
+    use getrandom::register_custom_getrandom;
+
+    fn ic_getrandom(buf: &mut [u8]) -> Result<(), getrandom::Error> {
+        // Use ic_cdk::api::management_canister::main::raw_rand for true randomness
+        // For now, use a deterministic seed based on time (NOT secure for production)
+        // Production should use async raw_rand call
+        let seed = ic_cdk::api::time();
+        for (i, byte) in buf.iter_mut().enumerate() {
+            *byte = ((seed >> (i % 8 * 8)) & 0xff) as u8 ^ (i as u8);
+        }
+        Ok(())
+    }
+
+    register_custom_getrandom!(ic_getrandom);
+}
+
+/// XOR encryption/decryption for secret key (placeholder for vetKeys)
+/// In production, replace with vetKeys encryption
+fn xor_encrypt_decrypt(data: &[u8], key: &[u8]) -> Vec<u8> {
+    data.iter()
+        .zip(key.iter().cycle())
+        .map(|(d, k)| d ^ k)
+        .collect()
+}
+
+/// Get encryption key derived from canister ID (placeholder for vetKeys)
+fn get_encryption_key() -> Vec<u8> {
+    let canister_id = ic_cdk::id();
+    let mut key = Vec::with_capacity(32);
+    let id_bytes = canister_id.as_slice();
+    // Extend to 32 bytes
+    for i in 0..32 {
+        key.push(id_bytes[i % id_bytes.len()] ^ (i as u8));
+    }
+    key
+}
+
+/// Initialize Solana wallet with a new Ed25519 keypair (Admin only)
+#[update]
+async fn init_solana_wallet() -> Result<String, String> {
+    require_admin()?;
+
+    // Check if already initialized
+    let already_initialized = SOLANA_WALLET_STATE.with(|s| s.borrow().initialized);
+    if already_initialized {
+        return Err("Solana wallet already initialized. Use reset_solana_wallet to reinitialize.".to_string());
+    }
+
+    // Generate random bytes using IC's raw_rand for true randomness
+    let (random_bytes,): (Vec<u8>,) = ic_cdk::api::management_canister::main::raw_rand()
+        .await
+        .map_err(|(code, msg)| format!("Failed to get random bytes: {:?} - {}", code, msg))?;
+
+    if random_bytes.len() < 32 {
+        return Err("Insufficient random bytes".to_string());
+    }
+
+    // Create Ed25519 signing key from random bytes
+    let secret_key_bytes: [u8; 32] = random_bytes[..32].try_into()
+        .map_err(|_| "Failed to convert random bytes")?;
+
+    let signing_key = SigningKey::from_bytes(&secret_key_bytes);
+    let verifying_key = signing_key.verifying_key();
+    let public_key_bytes = verifying_key.to_bytes();
+
+    // Encrypt secret key for storage
+    let encryption_key = get_encryption_key();
+    let encrypted_secret = xor_encrypt_decrypt(&secret_key_bytes, &encryption_key);
+
+    // Derive Solana address (Base58 encoded public key)
+    let address = bs58::encode(&public_key_bytes).into_string();
+
+    // Store in state
+    SOLANA_WALLET_STATE.with(|s| {
+        let mut state = s.borrow_mut();
+        state.initialized = true;
+        state.public_key = Some(public_key_bytes.to_vec());
+        state.encrypted_secret_key = Some(encrypted_secret);
+        state.cached_address = Some(address.clone());
+    });
+
+    ic_cdk::println!("Solana wallet initialized: {}", address);
+    Ok(address)
+}
+
+/// Get Solana wallet address
+#[query]
+fn get_solana_address() -> Result<String, String> {
+    SOLANA_WALLET_STATE.with(|s| {
+        let state = s.borrow();
+        state.cached_address.clone()
+            .ok_or_else(|| "Solana wallet not initialized. Call init_solana_wallet first.".to_string())
+    })
+}
+
+/// Get Solana wallet info
+#[query]
+fn get_solana_wallet_info(network: String) -> Result<SolanaWalletInfo, String> {
+    let address = get_solana_address()?;
+
+    Ok(SolanaWalletInfo {
+        address,
+        network,
+    })
+}
+
+/// Configure a Solana network (Admin only)
+#[update]
+fn configure_solana_network(config: SolanaNetworkConfig) -> Result<(), String> {
+    require_admin()?;
+
+    SOLANA_WALLET_STATE.with(|s| {
+        let mut state = s.borrow_mut();
+        // Update or add network config
+        if let Some(existing) = state.configured_networks.iter_mut()
+            .find(|n| n.network_name == config.network_name) {
+            *existing = config;
+        } else {
+            // Limit to 5 networks max
+            if state.configured_networks.len() >= 5 {
+                return Err("Maximum 5 networks allowed".to_string());
+            }
+            state.configured_networks.push(config);
+        }
+        Ok(())
+    })
+}
+
+/// Get configured Solana networks
+#[query]
+fn get_solana_networks() -> Vec<SolanaNetworkConfig> {
+    SOLANA_WALLET_STATE.with(|s| s.borrow().configured_networks.clone())
+}
+
+/// Transform function for Solana RPC responses
+#[query]
+fn transform_solana_response(raw: TransformArgs) -> HttpResponse {
+    HttpResponse {
+        status: raw.response.status,
+        body: raw.response.body,
+        headers: vec![],
+    }
+}
+
+/// Get SOL balance from Solana RPC
+#[update]
+async fn get_solana_balance(network_name: String) -> Result<u64, String> {
+    let network_config = SOLANA_WALLET_STATE.with(|s| {
+        s.borrow().configured_networks.iter()
+            .find(|n| n.network_name == network_name)
+            .cloned()
+    }).ok_or_else(|| format!("Network '{}' not configured", network_name))?;
+
+    let address = get_solana_address()?;
+
+    let request_body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getBalance",
+        "params": [address]
+    });
+
+    let request = CanisterHttpRequestArgument {
+        url: network_config.rpc_url.clone(),
+        max_response_bytes: Some(2_000),
+        method: HttpMethod::POST,
+        headers: vec![
+            HttpHeader {
+                name: "Content-Type".to_string(),
+                value: "application/json".to_string(),
+            },
+        ],
+        body: Some(request_body.to_string().into_bytes()),
+        transform: Some(TransformContext {
+            function: TransformFunc(candid::Func {
+                principal: ic_cdk::id(),
+                method: "transform_solana_response".to_string(),
+            }),
+            context: vec![],
+        }),
+    };
+
+    let cycles = 30_000_000_000u128;
+
+    match http_request(request, cycles).await {
+        Ok((response,)) => {
+            let body = String::from_utf8(response.body)
+                .map_err(|e| format!("UTF-8 error: {}", e))?;
+
+            let json: serde_json::Value = serde_json::from_str(&body)
+                .map_err(|e| format!("JSON error: {} - Body: {}", e, body))?;
+
+            if let Some(error) = json.get("error") {
+                return Err(format!("Solana RPC error: {}", error));
+            }
+
+            json["result"]["value"]
+                .as_u64()
+                .ok_or_else(|| format!("No balance in response: {}", body))
+        }
+        Err((code, msg)) => Err(format!("HTTP error: {:?} - {}", code, msg)),
+    }
+}
+
+/// Get recent blockhash from Solana RPC
+async fn get_recent_blockhash(rpc_url: &str) -> Result<String, String> {
+    let request_body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getLatestBlockhash",
+        "params": []
+    });
+
+    let request = CanisterHttpRequestArgument {
+        url: rpc_url.to_string(),
+        max_response_bytes: Some(2_000),
+        method: HttpMethod::POST,
+        headers: vec![
+            HttpHeader {
+                name: "Content-Type".to_string(),
+                value: "application/json".to_string(),
+            },
+        ],
+        body: Some(request_body.to_string().into_bytes()),
+        transform: Some(TransformContext {
+            function: TransformFunc(candid::Func {
+                principal: ic_cdk::id(),
+                method: "transform_solana_response".to_string(),
+            }),
+            context: vec![],
+        }),
+    };
+
+    let cycles = 30_000_000_000u128;
+
+    match http_request(request, cycles).await {
+        Ok((response,)) => {
+            let body = String::from_utf8(response.body)
+                .map_err(|e| format!("UTF-8 error: {}", e))?;
+
+            let json: serde_json::Value = serde_json::from_str(&body)
+                .map_err(|e| format!("JSON error: {}", e))?;
+
+            json["result"]["value"]["blockhash"]
+                .as_str()
+                .map(|s| s.to_string())
+                .ok_or_else(|| "No blockhash in response".to_string())
+        }
+        Err((code, msg)) => Err(format!("HTTP error: {:?} - {}", code, msg)),
+    }
+}
+
+/// Build a Solana transfer transaction (system program transfer)
+fn build_solana_transfer_tx(
+    from_pubkey: &[u8; 32],
+    to_pubkey: &[u8; 32],
+    lamports: u64,
+    recent_blockhash: &[u8; 32],
+) -> Vec<u8> {
+    // Solana transaction format (simplified):
+    // 1. Number of signatures (1 byte)
+    // 2. Signatures (64 bytes each)
+    // 3. Message:
+    //    - Header (3 bytes: num_required_signatures, num_readonly_signed, num_readonly_unsigned)
+    //    - Account addresses (32 bytes each)
+    //    - Recent blockhash (32 bytes)
+    //    - Instructions
+
+    let system_program_id: [u8; 32] = [0u8; 32]; // System program is all zeros
+
+    // Build compact message (without signature space - we'll add that after signing)
+    let mut message = Vec::new();
+
+    // Message header
+    message.push(1u8);  // num_required_signatures
+    message.push(0u8);  // num_readonly_signed_accounts
+    message.push(1u8);  // num_readonly_unsigned_accounts (system program)
+
+    // Number of account keys
+    message.push(3u8);  // from, to, system_program
+
+    // Account addresses (in order: from, to, system_program)
+    message.extend_from_slice(from_pubkey);
+    message.extend_from_slice(to_pubkey);
+    message.extend_from_slice(&system_program_id);
+
+    // Recent blockhash
+    message.extend_from_slice(recent_blockhash);
+
+    // Number of instructions
+    message.push(1u8);
+
+    // Instruction: System Program Transfer
+    message.push(2u8);  // program_id_index (system program at index 2)
+    message.push(2u8);  // num_accounts
+    message.push(0u8);  // from account index (writable, signer)
+    message.push(1u8);  // to account index (writable)
+
+    // Instruction data: transfer instruction (4 bytes type + 8 bytes amount)
+    let mut instruction_data = Vec::new();
+    instruction_data.extend_from_slice(&2u32.to_le_bytes()); // Transfer instruction type
+    instruction_data.extend_from_slice(&lamports.to_le_bytes());
+
+    message.push(instruction_data.len() as u8);
+    message.extend_from_slice(&instruction_data);
+
+    message
+}
+
+/// Sign a message with the Solana Ed25519 key
+fn sign_solana_message(message: &[u8]) -> Result<Vec<u8>, String> {
+    // Get and decrypt secret key
+    let (encrypted_secret, _public_key) = SOLANA_WALLET_STATE.with(|s| {
+        let state = s.borrow();
+        (
+            state.encrypted_secret_key.clone(),
+            state.public_key.clone(),
+        )
+    });
+
+    let encrypted_secret = encrypted_secret
+        .ok_or_else(|| "Solana wallet not initialized".to_string())?;
+
+    let encryption_key = get_encryption_key();
+    let secret_bytes = xor_encrypt_decrypt(&encrypted_secret, &encryption_key);
+
+    if secret_bytes.len() != 32 {
+        return Err("Invalid secret key length".to_string());
+    }
+
+    let secret_array: [u8; 32] = secret_bytes.try_into()
+        .map_err(|_| "Failed to convert secret key")?;
+
+    let signing_key = SigningKey::from_bytes(&secret_array);
+    let signature: Signature = signing_key.sign(message);
+
+    // Clear secret from memory (Rust will drop, but explicit for clarity)
+    drop(signing_key);
+
+    Ok(signature.to_bytes().to_vec())
+}
+
+/// Send SOL to another address (Admin only)
+#[update]
+async fn send_solana(
+    network_name: String,
+    to_address: String,
+    amount_lamports: u64,
+) -> Result<String, String> {
+    // ========== ADMIN ONLY ==========
+    require_admin()?;
+
+    // Validate amount
+    if amount_lamports < 5000 {
+        return Err("Amount too small. Minimum is 5000 lamports (for rent exemption)".to_string());
+    }
+
+    // Get network config
+    let network_config = SOLANA_WALLET_STATE.with(|s| {
+        s.borrow().configured_networks.iter()
+            .find(|n| n.network_name == network_name)
+            .cloned()
+    }).ok_or_else(|| format!("Network '{}' not configured", network_name))?;
+
+    // Get our public key
+    let from_pubkey = SOLANA_WALLET_STATE.with(|s| {
+        s.borrow().public_key.clone()
+    }).ok_or_else(|| "Solana wallet not initialized".to_string())?;
+
+    let from_pubkey_array: [u8; 32] = from_pubkey.try_into()
+        .map_err(|_| "Invalid public key")?;
+
+    // Parse destination address
+    let to_pubkey_bytes = bs58::decode(&to_address)
+        .into_vec()
+        .map_err(|e| format!("Invalid destination address: {:?}", e))?;
+
+    if to_pubkey_bytes.len() != 32 {
+        return Err("Invalid destination address length".to_string());
+    }
+    let to_pubkey_array: [u8; 32] = to_pubkey_bytes.try_into()
+        .map_err(|_| "Invalid destination address")?;
+
+    // Get recent blockhash
+    let blockhash_str = get_recent_blockhash(&network_config.rpc_url).await?;
+    let blockhash_bytes = bs58::decode(&blockhash_str)
+        .into_vec()
+        .map_err(|e| format!("Invalid blockhash: {:?}", e))?;
+    let blockhash_array: [u8; 32] = blockhash_bytes.try_into()
+        .map_err(|_| "Invalid blockhash length")?;
+
+    // Build transaction message
+    let message = build_solana_transfer_tx(
+        &from_pubkey_array,
+        &to_pubkey_array,
+        amount_lamports,
+        &blockhash_array,
+    );
+
+    // Sign the message
+    let signature = sign_solana_message(&message)?;
+
+    // Build full transaction (signatures + message)
+    let mut transaction = Vec::new();
+    transaction.push(1u8); // Number of signatures
+    transaction.extend_from_slice(&signature);
+    transaction.extend_from_slice(&message);
+
+    // Encode transaction for RPC
+    let tx_base64 = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        &transaction
+    );
+
+    // Send transaction
+    let request_body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "sendTransaction",
+        "params": [
+            tx_base64,
+            {
+                "encoding": "base64",
+                "skipPreflight": false,
+                "preflightCommitment": "confirmed"
+            }
+        ]
+    });
+
+    let request = CanisterHttpRequestArgument {
+        url: network_config.rpc_url.clone(),
+        max_response_bytes: Some(2_000),
+        method: HttpMethod::POST,
+        headers: vec![
+            HttpHeader {
+                name: "Content-Type".to_string(),
+                value: "application/json".to_string(),
+            },
+        ],
+        body: Some(request_body.to_string().into_bytes()),
+        transform: Some(TransformContext {
+            function: TransformFunc(candid::Func {
+                principal: ic_cdk::id(),
+                method: "transform_solana_response".to_string(),
+            }),
+            context: vec![],
+        }),
+    };
+
+    let cycles = 50_000_000_000u128;
+
+    let tx_signature = match http_request(request, cycles).await {
+        Ok((response,)) => {
+            let body = String::from_utf8(response.body)
+                .map_err(|e| format!("UTF-8 error: {}", e))?;
+
+            let json: serde_json::Value = serde_json::from_str(&body)
+                .map_err(|e| format!("JSON error: {} - Body: {}", e, body))?;
+
+            if let Some(error) = json.get("error") {
+                return Err(format!("Solana RPC error: {}", error));
+            }
+
+            json["result"]
+                .as_str()
+                .map(|s| s.to_string())
+                .ok_or_else(|| format!("No signature in response: {}", body))?
+        }
+        Err((code, msg)) => return Err(format!("HTTP error: {:?} - {}", code, msg)),
+    };
+
+    // Record transaction
+    SOLANA_WALLET_STATE.with(|state| {
+        let mut s = state.borrow_mut();
+        s.tx_counter += 1;
+        let tx_record = SolanaTransactionRecord {
+            id: s.tx_counter,
+            signature: Some(tx_signature.clone()),
+            to: to_address.clone(),
+            amount_lamports,
+            timestamp: ic_cdk::api::time(),
+            status: SolanaTransactionStatus::Submitted(tx_signature.clone()),
+        };
+        s.transaction_history.push(tx_record);
+
+        // Limit history to 500
+        if s.transaction_history.len() > 500 {
+            s.transaction_history.remove(0);
+        }
+    });
+
+    ic_cdk::println!("Solana transfer submitted: {} lamports to {}, sig: {}",
+        amount_lamports, to_address, tx_signature);
+    Ok(tx_signature)
+}
+
+/// SPL Token Program ID
+const SPL_TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+/// Associated Token Program ID
+const SPL_ASSOCIATED_TOKEN_PROGRAM_ID: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
+
+/// Send SPL tokens (Admin only)
+/// Parameters: network_name, token_mint_address, to_address, amount (in smallest units)
+#[update]
+async fn send_spl_token(
+    network_name: String,
+    token_mint: String,
+    to_address: String,
+    amount: u64,
+) -> Result<String, String> {
+    // ========== ADMIN ONLY ==========
+    require_admin()?;
+
+    if amount == 0 {
+        return Err("Amount must be greater than 0".to_string());
+    }
+
+    // Get network config
+    let network_config = SOLANA_WALLET_STATE.with(|s| {
+        s.borrow().configured_networks.iter()
+            .find(|n| n.network_name == network_name)
+            .cloned()
+    }).ok_or_else(|| format!("Network '{}' not configured", network_name))?;
+
+    // Get our public key
+    let from_pubkey = SOLANA_WALLET_STATE.with(|s| {
+        s.borrow().public_key.clone()
+    }).ok_or_else(|| "Solana wallet not initialized".to_string())?;
+
+    let from_pubkey_array: [u8; 32] = from_pubkey.try_into()
+        .map_err(|_| "Invalid public key")?;
+
+    // Parse addresses
+    let mint_pubkey = decode_solana_pubkey(&token_mint)?;
+    let to_pubkey = decode_solana_pubkey(&to_address)?;
+    let token_program_id = decode_solana_pubkey(SPL_TOKEN_PROGRAM_ID)?;
+
+    // Derive Associated Token Accounts
+    let from_ata = derive_associated_token_account(&from_pubkey_array, &mint_pubkey)?;
+    let to_ata = derive_associated_token_account(&to_pubkey, &mint_pubkey)?;
+
+    // Get recent blockhash
+    let blockhash_str = get_recent_blockhash(&network_config.rpc_url).await?;
+    let blockhash = decode_solana_pubkey(&blockhash_str)?;
+
+    // Build SPL token transfer message
+    let message = build_spl_transfer_message(
+        &from_pubkey_array,
+        &from_ata,
+        &to_ata,
+        &token_program_id,
+        amount,
+        &blockhash,
+    );
+
+    // Sign the message
+    let signature = sign_solana_message(&message)?;
+
+    // Build full transaction
+    let mut transaction = Vec::new();
+    transaction.push(1u8); // Number of signatures
+    transaction.extend_from_slice(&signature);
+    transaction.extend_from_slice(&message);
+
+    // Encode and send
+    let tx_base64 = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        &transaction
+    );
+
+    let request_body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "sendTransaction",
+        "params": [
+            tx_base64,
+            {
+                "encoding": "base64",
+                "skipPreflight": false,
+                "preflightCommitment": "confirmed"
+            }
+        ]
+    });
+
+    let request = CanisterHttpRequestArgument {
+        url: network_config.rpc_url.clone(),
+        max_response_bytes: Some(2_000),
+        method: HttpMethod::POST,
+        headers: vec![
+            HttpHeader {
+                name: "Content-Type".to_string(),
+                value: "application/json".to_string(),
+            },
+        ],
+        body: Some(request_body.to_string().into_bytes()),
+        transform: Some(TransformContext {
+            function: TransformFunc(candid::Func {
+                principal: ic_cdk::id(),
+                method: "transform_solana_response".to_string(),
+            }),
+            context: vec![],
+        }),
+    };
+
+    let cycles = 50_000_000_000u128;
+
+    let tx_signature = match http_request(request, cycles).await {
+        Ok((response,)) => {
+            let body = String::from_utf8(response.body)
+                .map_err(|e| format!("UTF-8 error: {}", e))?;
+
+            let json: serde_json::Value = serde_json::from_str(&body)
+                .map_err(|e| format!("JSON error: {} - Body: {}", e, body))?;
+
+            if let Some(error) = json.get("error") {
+                return Err(format!("Solana RPC error: {}", error));
+            }
+
+            json["result"]
+                .as_str()
+                .map(|s| s.to_string())
+                .ok_or_else(|| format!("No signature in response: {}", body))?
+        }
+        Err((code, msg)) => return Err(format!("HTTP error: {:?} - {}", code, msg)),
+    };
+
+    // Record transaction (reusing SolanaTransactionRecord with SPL info in signature field)
+    SOLANA_WALLET_STATE.with(|state| {
+        let mut s = state.borrow_mut();
+        s.tx_counter += 1;
+        let tx_record = SolanaTransactionRecord {
+            id: s.tx_counter,
+            signature: Some(format!("SPL:{}:{}", token_mint, tx_signature)),
+            to: to_address.clone(),
+            amount_lamports: amount, // For SPL this is token amount, not lamports
+            timestamp: ic_cdk::api::time(),
+            status: SolanaTransactionStatus::Submitted(tx_signature.clone()),
+        };
+        s.transaction_history.push(tx_record);
+
+        if s.transaction_history.len() > 500 {
+            s.transaction_history.remove(0);
+        }
+    });
+
+    ic_cdk::println!("SPL transfer: {} {} to {}, sig: {}", amount, token_mint, to_address, tx_signature);
+    Ok(tx_signature)
+}
+
+/// Decode a base58-encoded Solana public key
+fn decode_solana_pubkey(address: &str) -> Result<[u8; 32], String> {
+    let bytes = bs58::decode(address)
+        .into_vec()
+        .map_err(|e| format!("Invalid address '{}': {:?}", address, e))?;
+
+    if bytes.len() != 32 {
+        return Err(format!("Invalid address length: {} (expected 32)", bytes.len()));
+    }
+
+    bytes.try_into().map_err(|_| "Address conversion error".to_string())
+}
+
+/// Derive Associated Token Account address
+fn derive_associated_token_account(wallet: &[u8; 32], mint: &[u8; 32]) -> Result<[u8; 32], String> {
+    // ATA = PDA of [wallet, token_program, mint] with associated_token_program
+    // Simplified derivation using SHA256 (note: actual Solana uses find_program_address)
+
+    let ata_program = decode_solana_pubkey(SPL_ASSOCIATED_TOKEN_PROGRAM_ID)?;
+    let token_program = decode_solana_pubkey(SPL_TOKEN_PROGRAM_ID)?;
+
+    // Seeds: [wallet_address, token_program_id, mint_address]
+    let mut hasher = Sha256::new();
+    hasher.update(wallet);
+    hasher.update(&token_program);
+    hasher.update(mint);
+    hasher.update(&ata_program);
+    hasher.update(b"ProgramDerivedAddress"); // Standard suffix
+
+    let hash = hasher.finalize();
+    let mut result = [0u8; 32];
+    result.copy_from_slice(&hash[..32]);
+
+    // Note: This is a simplified derivation. For production, use proper PDA derivation
+    // with bump seed finding
+    Ok(result)
+}
+
+/// Build SPL token transfer message
+fn build_spl_transfer_message(
+    owner: &[u8; 32],
+    from_ata: &[u8; 32],
+    to_ata: &[u8; 32],
+    token_program: &[u8; 32],
+    amount: u64,
+    recent_blockhash: &[u8; 32],
+) -> Vec<u8> {
+    let mut message = Vec::new();
+
+    // Message header
+    message.push(1); // num_required_signatures
+    message.push(0); // num_readonly_signed_accounts
+    message.push(1); // num_readonly_unsigned_accounts (token program)
+
+    // Account addresses (4 accounts)
+    message.push(4); // Number of accounts
+    message.extend_from_slice(owner);       // 0: owner (signer)
+    message.extend_from_slice(from_ata);    // 1: source ATA
+    message.extend_from_slice(to_ata);      // 2: destination ATA
+    message.extend_from_slice(token_program); // 3: token program (readonly)
+
+    // Recent blockhash
+    message.extend_from_slice(recent_blockhash);
+
+    // Instructions (1 instruction: SPL Token Transfer)
+    message.push(1); // Number of instructions
+
+    // SPL Token Transfer instruction
+    message.push(3); // program_id_index (token program)
+    message.push(3); // number of accounts for this instruction
+    message.push(1); // source ATA index
+    message.push(2); // destination ATA index
+    message.push(0); // owner index
+
+    // Instruction data: transfer instruction (3 = transfer, then u64 amount)
+    message.push(9); // data length
+    message.push(3); // Transfer instruction discriminator
+    message.extend_from_slice(&amount.to_le_bytes()); // amount as u64 little-endian
+
+    message
+}
+
+/// Get SPL token balance
+#[update]
+async fn get_spl_token_balance(
+    network_name: String,
+    token_mint: String,
+    wallet_address: Option<String>,
+) -> Result<String, String> {
+    let network_config = SOLANA_WALLET_STATE.with(|s| {
+        s.borrow().configured_networks.iter()
+            .find(|n| n.network_name == network_name)
+            .cloned()
+    }).ok_or_else(|| format!("Network '{}' not configured", network_name))?;
+
+    let wallet = match wallet_address {
+        Some(addr) => decode_solana_pubkey(&addr)?,
+        None => {
+            let pubkey = SOLANA_WALLET_STATE.with(|s| s.borrow().public_key.clone())
+                .ok_or("Wallet not initialized")?;
+            pubkey.try_into().map_err(|_| "Invalid public key")?
+        }
+    };
+
+    let mint = decode_solana_pubkey(&token_mint)?;
+    let ata = derive_associated_token_account(&wallet, &mint)?;
+    let ata_address = bs58::encode(&ata).into_string();
+
+    // Query token account balance
+    let request_body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getTokenAccountBalance",
+        "params": [ata_address]
+    });
+
+    let request = CanisterHttpRequestArgument {
+        url: network_config.rpc_url.clone(),
+        max_response_bytes: Some(2_000),
+        method: HttpMethod::POST,
+        headers: vec![
+            HttpHeader {
+                name: "Content-Type".to_string(),
+                value: "application/json".to_string(),
+            },
+        ],
+        body: Some(request_body.to_string().into_bytes()),
+        transform: Some(TransformContext {
+            function: TransformFunc(candid::Func {
+                principal: ic_cdk::id(),
+                method: "transform_solana_response".to_string(),
+            }),
+            context: vec![],
+        }),
+    };
+
+    let cycles = 30_000_000_000u128;
+
+    let (response,): (HttpResponse,) = http_request(request, cycles)
+        .await
+        .map_err(|(code, msg)| format!("HTTP error: {:?} - {}", code, msg))?;
+
+    let body = String::from_utf8(response.body)
+        .map_err(|e| format!("UTF-8 error: {}", e))?;
+
+    let json: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| format!("JSON error: {}", e))?;
+
+    if let Some(error) = json.get("error") {
+        // Account might not exist
+        if error.to_string().contains("could not find") {
+            return Ok("0".to_string());
+        }
+        return Err(format!("RPC error: {}", error));
+    }
+
+    json["result"]["value"]["amount"]
+        .as_str()
+        .map(|s| s.to_string())
+        .ok_or_else(|| format!("Failed to parse balance: {}", body))
+}
+
+// ========== Jupiter Swap Integration ==========
+
+/// Jupiter Quote API endpoint
+const JUPITER_QUOTE_API: &str = "https://quote-api.jup.ag/v6/quote";
+/// Jupiter Swap API endpoint
+const JUPITER_SWAP_API: &str = "https://quote-api.jup.ag/v6/swap";
+
+/// Jupiter swap quote response
+#[derive(CandidType, Deserialize, Serialize, Clone, Debug)]
+pub struct JupiterQuote {
+    pub input_mint: String,
+    pub output_mint: String,
+    pub in_amount: String,
+    pub out_amount: String,
+    pub price_impact_pct: String,
+    pub slippage_bps: u64,
+}
+
+/// Get Jupiter swap quote
+#[update]
+async fn get_jupiter_quote(
+    input_mint: String,
+    output_mint: String,
+    amount: u64,
+    slippage_bps: Option<u64>,
+) -> Result<JupiterQuote, String> {
+    let slippage = slippage_bps.unwrap_or(50); // Default 0.5% slippage
+
+    let url = format!(
+        "{}?inputMint={}&outputMint={}&amount={}&slippageBps={}",
+        JUPITER_QUOTE_API, input_mint, output_mint, amount, slippage
+    );
+
+    let request = CanisterHttpRequestArgument {
+        url,
+        max_response_bytes: Some(10_000),
+        method: HttpMethod::GET,
+        headers: vec![],
+        body: None,
+        transform: Some(TransformContext {
+            function: TransformFunc(candid::Func {
+                principal: ic_cdk::id(),
+                method: "transform_solana_response".to_string(),
+            }),
+            context: vec![],
+        }),
+    };
+
+    let cycles = 50_000_000_000u128;
+
+    let (response,): (HttpResponse,) = http_request(request, cycles)
+        .await
+        .map_err(|(code, msg)| format!("HTTP error: {:?} - {}", code, msg))?;
+
+    let body = String::from_utf8(response.body)
+        .map_err(|e| format!("UTF-8 error: {}", e))?;
+
+    let json: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| format!("JSON error: {} - Body: {}", e, body))?;
+
+    if let Some(error) = json.get("error") {
+        return Err(format!("Jupiter API error: {}", error));
+    }
+
+    let out_amount = json["outAmount"]
+        .as_str()
+        .unwrap_or("0")
+        .to_string();
+
+    let price_impact = json["priceImpactPct"]
+        .as_str()
+        .unwrap_or("0")
+        .to_string();
+
+    Ok(JupiterQuote {
+        input_mint,
+        output_mint,
+        in_amount: amount.to_string(),
+        out_amount,
+        price_impact_pct: price_impact,
+        slippage_bps: slippage,
+    })
+}
+
+/// Execute Jupiter swap (Admin only)
+/// Parameters: network_name, input_mint, output_mint, amount, slippage_bps
+#[update]
+async fn execute_jupiter_swap(
+    network_name: String,
+    input_mint: String,
+    output_mint: String,
+    amount: u64,
+    slippage_bps: Option<u64>,
+) -> Result<String, String> {
+    // ========== ADMIN ONLY ==========
+    require_admin()?;
+
+    // Get network config
+    let network_config = SOLANA_WALLET_STATE.with(|s| {
+        s.borrow().configured_networks.iter()
+            .find(|n| n.network_name == network_name)
+            .cloned()
+    }).ok_or_else(|| format!("Network '{}' not configured", network_name))?;
+
+    // Only allow mainnet for Jupiter
+    if network_name != "mainnet" {
+        return Err("Jupiter swaps only available on mainnet".to_string());
+    }
+
+    // Get our wallet address
+    let wallet_address = get_solana_address()?;
+
+    let slippage = slippage_bps.unwrap_or(50);
+
+    // Step 1: Get quote
+    let quote_url = format!(
+        "{}?inputMint={}&outputMint={}&amount={}&slippageBps={}",
+        JUPITER_QUOTE_API, input_mint, output_mint, amount, slippage
+    );
+
+    let quote_request = CanisterHttpRequestArgument {
+        url: quote_url,
+        max_response_bytes: Some(20_000),
+        method: HttpMethod::GET,
+        headers: vec![],
+        body: None,
+        transform: Some(TransformContext {
+            function: TransformFunc(candid::Func {
+                principal: ic_cdk::id(),
+                method: "transform_solana_response".to_string(),
+            }),
+            context: vec![],
+        }),
+    };
+
+    let cycles = 50_000_000_000u128;
+
+    let (quote_response,): (HttpResponse,) = http_request(quote_request, cycles)
+        .await
+        .map_err(|(code, msg)| format!("Quote HTTP error: {:?} - {}", code, msg))?;
+
+    let quote_body = String::from_utf8(quote_response.body)
+        .map_err(|e| format!("Quote UTF-8 error: {}", e))?;
+
+    let quote_json: serde_json::Value = serde_json::from_str(&quote_body)
+        .map_err(|e| format!("Quote JSON error: {}", e))?;
+
+    if let Some(error) = quote_json.get("error") {
+        return Err(format!("Jupiter quote error: {}", error));
+    }
+
+    // Step 2: Get swap transaction
+    let swap_request_body = serde_json::json!({
+        "quoteResponse": quote_json,
+        "userPublicKey": wallet_address,
+        "wrapAndUnwrapSol": true,
+        "dynamicComputeUnitLimit": true,
+        "prioritizationFeeLamports": "auto"
+    });
+
+    let swap_request = CanisterHttpRequestArgument {
+        url: JUPITER_SWAP_API.to_string(),
+        max_response_bytes: Some(50_000),
+        method: HttpMethod::POST,
+        headers: vec![
+            HttpHeader {
+                name: "Content-Type".to_string(),
+                value: "application/json".to_string(),
+            },
+        ],
+        body: Some(swap_request_body.to_string().into_bytes()),
+        transform: Some(TransformContext {
+            function: TransformFunc(candid::Func {
+                principal: ic_cdk::id(),
+                method: "transform_solana_response".to_string(),
+            }),
+            context: vec![],
+        }),
+    };
+
+    let (swap_response,): (HttpResponse,) = http_request(swap_request, cycles)
+        .await
+        .map_err(|(code, msg)| format!("Swap HTTP error: {:?} - {}", code, msg))?;
+
+    let swap_body = String::from_utf8(swap_response.body)
+        .map_err(|e| format!("Swap UTF-8 error: {}", e))?;
+
+    let swap_json: serde_json::Value = serde_json::from_str(&swap_body)
+        .map_err(|e| format!("Swap JSON error: {}", e))?;
+
+    if let Some(error) = swap_json.get("error") {
+        return Err(format!("Jupiter swap error: {}", error));
+    }
+
+    // Get the serialized transaction
+    let swap_tx_base64 = swap_json["swapTransaction"]
+        .as_str()
+        .ok_or("No swap transaction in response")?;
+
+    // Decode the transaction
+    let tx_bytes = base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        swap_tx_base64
+    ).map_err(|e| format!("Base64 decode error: {}", e))?;
+
+    // Jupiter returns a versioned transaction that needs to be signed
+    // The transaction message is after the signatures section
+    // For versioned transactions: [num_signatures][signatures...][message]
+
+    if tx_bytes.is_empty() {
+        return Err("Empty transaction".to_string());
+    }
+
+    let num_signatures = tx_bytes[0] as usize;
+    let signature_section_len = 1 + (num_signatures * 64);
+
+    if tx_bytes.len() < signature_section_len {
+        return Err("Transaction too short".to_string());
+    }
+
+    // Extract the message portion (everything after signatures)
+    let message = &tx_bytes[signature_section_len..];
+
+    // Sign the message with our key
+    let signature = sign_solana_message(message)?;
+
+    // Reconstruct the transaction with our signature
+    let mut signed_tx = Vec::new();
+    signed_tx.push(1u8); // We're the only signer needed
+    signed_tx.extend_from_slice(&signature);
+    signed_tx.extend_from_slice(message);
+
+    // Encode and send
+    let signed_tx_base64 = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        &signed_tx
+    );
+
+    let send_request_body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "sendTransaction",
+        "params": [
+            signed_tx_base64,
+            {
+                "encoding": "base64",
+                "skipPreflight": false,
+                "preflightCommitment": "confirmed",
+                "maxRetries": 3
+            }
+        ]
+    });
+
+    let send_request = CanisterHttpRequestArgument {
+        url: network_config.rpc_url.clone(),
+        max_response_bytes: Some(2_000),
+        method: HttpMethod::POST,
+        headers: vec![
+            HttpHeader {
+                name: "Content-Type".to_string(),
+                value: "application/json".to_string(),
+            },
+        ],
+        body: Some(send_request_body.to_string().into_bytes()),
+        transform: Some(TransformContext {
+            function: TransformFunc(candid::Func {
+                principal: ic_cdk::id(),
+                method: "transform_solana_response".to_string(),
+            }),
+            context: vec![],
+        }),
+    };
+
+    let tx_signature = match http_request(send_request, cycles).await {
+        Ok((response,)) => {
+            let body = String::from_utf8(response.body)
+                .map_err(|e| format!("UTF-8 error: {}", e))?;
+
+            let json: serde_json::Value = serde_json::from_str(&body)
+                .map_err(|e| format!("JSON error: {} - Body: {}", e, body))?;
+
+            if let Some(error) = json.get("error") {
+                return Err(format!("Solana RPC error: {}", error));
+            }
+
+            json["result"]
+                .as_str()
+                .map(|s| s.to_string())
+                .ok_or_else(|| format!("No signature in response: {}", body))?
+        }
+        Err((code, msg)) => return Err(format!("HTTP error: {:?} - {}", code, msg)),
+    };
+
+    // Record transaction
+    let out_amount = quote_json["outAmount"].as_str().unwrap_or("0").to_string();
+
+    SOLANA_WALLET_STATE.with(|state| {
+        let mut s = state.borrow_mut();
+        s.tx_counter += 1;
+        let tx_record = SolanaTransactionRecord {
+            id: s.tx_counter,
+            signature: Some(format!("SWAP:{}->{}:{}", input_mint, output_mint, tx_signature)),
+            to: format!("Jupiter:{}->{}", input_mint, output_mint),
+            amount_lamports: amount,
+            timestamp: ic_cdk::api::time(),
+            status: SolanaTransactionStatus::Submitted(tx_signature.clone()),
+        };
+        s.transaction_history.push(tx_record);
+
+        if s.transaction_history.len() > 500 {
+            s.transaction_history.remove(0);
+        }
+    });
+
+    ic_cdk::println!("Jupiter swap: {} {} -> {} {}, sig: {}",
+        amount, input_mint, out_amount, output_mint, tx_signature);
+
+    Ok(tx_signature)
+}
+
+/// Get Solana transaction history
+#[query]
+fn get_solana_transaction_history(limit: Option<u32>) -> Vec<SolanaTransactionRecord> {
+    let limit = limit.unwrap_or(50) as usize;
+
+    SOLANA_WALLET_STATE.with(|state| {
+        let s = state.borrow();
+        s.transaction_history
+            .iter()
+            .rev()
+            .take(limit)
+            .cloned()
+            .collect()
+    })
+}
+
+/// Reset Solana wallet (Admin only) - WARNING: This destroys the current wallet
+#[update]
+fn reset_solana_wallet() -> Result<(), String> {
+    require_admin()?;
+
+    SOLANA_WALLET_STATE.with(|s| {
+        let mut state = s.borrow_mut();
+        state.initialized = false;
+        state.public_key = None;
+        state.encrypted_secret_key = None;
+        state.cached_address = None;
+        // Keep transaction history and networks
+    });
+
+    Ok(())
+}
+
+// ========== Portfolio Analysis ==========
+
+/// Asset information for portfolio
+#[derive(CandidType, Deserialize, Serialize, Clone, Debug)]
+pub struct PortfolioAsset {
+    pub chain: String,
+    pub symbol: String,
+    pub address: String,
+    pub balance: String,
+    pub token_address: Option<String>,
+}
+
+/// Full portfolio overview
+#[derive(CandidType, Deserialize, Serialize, Clone, Debug)]
+pub struct Portfolio {
+    pub icp: PortfolioAsset,
+    pub evm_assets: Vec<PortfolioAsset>,
+    pub solana_assets: Vec<PortfolioAsset>,
+    pub total_chains: u32,
+    pub last_updated: u64,
+}
+
+/// Get complete portfolio overview
+#[update]
+async fn get_portfolio() -> Result<Portfolio, String> {
+    let now = ic_cdk::api::time();
+
+    // ICP Balance
+    let icp_address = get_wallet_address();
+    let icp_balance = match check_icp_balance().await {
+        Ok(balance) => balance.to_string(),
+        Err(_) => "0".to_string(),
+    };
+
+    let icp_asset = PortfolioAsset {
+        chain: "ICP".to_string(),
+        symbol: "ICP".to_string(),
+        address: icp_address,
+        balance: icp_balance,
+        token_address: None,
+    };
+
+    // EVM Balances
+    let mut evm_assets = Vec::new();
+    let evm_address = match get_evm_address().await {
+        Ok(addr) => addr,
+        Err(_) => String::new(),
+    };
+
+    if !evm_address.is_empty() {
+        let configured_chains: Vec<EvmChainConfig> = EVM_WALLET_STATE.with(|s| {
+            s.borrow().configured_chains.clone()
+        });
+
+        for chain in configured_chains.iter() {
+            let balance = match get_evm_balance(chain.chain_id).await {
+                Ok(b) => b,
+                Err(_) => "0".to_string(),
+            };
+
+            evm_assets.push(PortfolioAsset {
+                chain: chain.chain_name.clone(),
+                symbol: chain.native_symbol.clone(),
+                address: evm_address.clone(),
+                balance,
+                token_address: None,
+            });
+        }
+    }
+
+    // Solana Balance
+    let mut solana_assets = Vec::new();
+    let solana_address = match get_solana_address() {
+        Ok(addr) => addr,
+        Err(_) => String::new(),
+    };
+
+    if !solana_address.is_empty() {
+        let configured_networks: Vec<SolanaNetworkConfig> = SOLANA_WALLET_STATE.with(|s| {
+            s.borrow().configured_networks.clone()
+        });
+
+        for network in configured_networks.iter() {
+            if network.network_name == "mainnet" {
+                let balance = match get_solana_balance(network.network_name.clone()).await {
+                    Ok(b) => b.to_string(),
+                    Err(_) => "0".to_string(),
+                };
+
+                solana_assets.push(PortfolioAsset {
+                    chain: "Solana".to_string(),
+                    symbol: "SOL".to_string(),
+                    address: solana_address.clone(),
+                    balance,
+                    token_address: None,
+                });
+                break;
+            }
+        }
+    }
+
+    let total_chains = 1 + evm_assets.len() as u32 + if solana_assets.is_empty() { 0 } else { 1 };
+
+    Ok(Portfolio {
+        icp: icp_asset,
+        evm_assets,
+        solana_assets,
+        total_chains,
+        last_updated: now,
+    })
+}
+
+/// Get wallet addresses summary
+#[query]
+fn get_wallet_addresses() -> Vec<(String, String)> {
+    let mut addresses = Vec::new();
+
+    // ICP
+    let icp_address = get_wallet_address();
+    addresses.push(("ICP".to_string(), icp_address));
+
+    // EVM
+    if let Some(evm_address) = EVM_WALLET_STATE.with(|s| s.borrow().cached_address.clone()) {
+        addresses.push(("EVM".to_string(), evm_address));
+    }
+
+    // Solana
+    if let Some(sol_address) = SOLANA_WALLET_STATE.with(|s| s.borrow().cached_address.clone()) {
+        addresses.push(("Solana".to_string(), sol_address));
+    }
+
+    addresses
 }
 
 // Candid export
