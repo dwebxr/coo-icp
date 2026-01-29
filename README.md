@@ -1,6 +1,11 @@
 # Coo - Fully On-Chain AI Agent
 
-A fully decentralized AI agent running on the Internet Computer blockchain, powered by the elizaOS framework and IC LLM Canister (Llama 3.1 8B).
+<div align="center">
+  <img src="overview.png" alt="Hyperfy Ecosystem" width="100%" />
+  <p>
+    <strong>A fully decentralized AI agent running on the Internet Computer blockchain, powered by the elizaOS framework and IC LLM Canister (Llama 3.1 8B).</strong>
+  </p>
+</div>
 
 ## Live Demo
 
@@ -155,7 +160,7 @@ dfx canister call eliza_backend get_config --network ic
 ## Project Structure
 
 ```
-coo-icp/
+eliza-icp/
 ├── dfx.json                          # IC project configuration
 ├── Cargo.toml                        # Rust workspace
 ├── canister_ids.json                 # Mainnet canister IDs
