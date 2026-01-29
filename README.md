@@ -1,7 +1,7 @@
 # Coo - Fully On-Chain AI Agent
 
 <div align="center">
-  <img src="overview.png" alt="Hyperfy Ecosystem" width="100%" />
+  <img src="overview.png" alt="Coo ICP" width="100%" />
   <p>
     <strong>A fully decentralized AI agent running on the Internet Computer blockchain, powered by the elizaOS framework and IC LLM Canister (Llama 3.1 8B).</strong>
   </p>
@@ -26,6 +26,7 @@
 - **Solana Wallet**: Ed25519-based Solana wallet with SOL and SPL token support
 - **Cross-Chain DeFi**: Jupiter swap (Solana), Uniswap swap (EVM), LiFi bridge
 - **Portfolio Analysis**: Unified view of assets across all chains
+- **ERC-8004 Trustless Agents**: On-chain identity, reputation, and validation
 - **elizaOS Framework**: Built on the leading open-source AI agent framework
 
 ## Architecture
@@ -59,6 +60,11 @@
 │                                                                  │
 │  ┌─────────────────┐    ┌──────────────────────────────────┐   │
 │  │  Solana RPC     │◄──►│   Jupiter API / LiFi API         │   │
+│  └─────────────────┘    └──────────────────────────────────┘   │
+│                                                                  │
+│  ┌─────────────────┐    ┌──────────────────────────────────┐   │
+│  │  ERC-8004       │◄──►│   Identity / Reputation /         │   │
+│  │  Registries     │    │   Validation Registries           │   │
 │  └─────────────────┘    └──────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -998,6 +1004,245 @@ dfx canister call eliza_backend get_wallet_addresses --network ic
 
 ---
 
+## ERC-8004 Trustless Agents
+
+Coo implements the **ERC-8004 Trustless Agents** standard (August 2025), enabling decentralized agent identity, reputation, and validation on EVM chains.
+
+### What is ERC-8004?
+
+ERC-8004 is a standard for trustless AI agents on Ethereum and EVM-compatible chains. It provides:
+
+- **Identity Registry**: Register agents with unique IDs and metadata
+- **Reputation Registry**: On-chain feedback and reputation scoring
+- **Validation Registry**: Third-party validation of agent capabilities
+
+### Configure ERC-8004 Registry (Admin Only)
+
+```bash
+# Configure an ERC-8004 registry (e.g., on Base)
+dfx canister call eliza_backend configure_erc8004_registry '(record {
+  registry_id = "base-main";
+  name = "Base ERC-8004 Registry";
+  chain_id = 8453: nat64;
+  identity_registry = "0x...IDENTITY_REGISTRY_ADDRESS";
+  reputation_registry = "0x...REPUTATION_REGISTRY_ADDRESS";
+  validation_registry = "0x...VALIDATION_REGISTRY_ADDRESS";
+  is_default = true;
+})' --network ic
+```
+
+### Check ERC-8004 Status
+
+```bash
+# Get ERC-8004 status
+dfx canister call eliza_backend get_erc8004_status --network ic
+
+# Returns:
+# record {
+#   registered = true;
+#   agent_id = opt 12345;
+#   agent_uri = opt "https://coo.icp";
+#   default_registry = opt "0x...";
+#   configured_registries = 1;
+# }
+
+# Get all configured registries
+dfx canister call eliza_backend get_erc8004_registries --network ic
+```
+
+### Identity Registry Functions
+
+#### Register Agent (Admin Only)
+
+```bash
+# Register this agent in the ERC-8004 Identity Registry
+dfx canister call eliza_backend erc8004_register_agent '(
+  "https://coo.icp",
+  vec {
+    record { key = "name"; value = blob "Coo"; };
+    record { key = "version"; value = blob "1.0"; };
+  }
+)' --network ic
+
+# Returns: agent_id (nat64)
+```
+
+#### Get Agent Info
+
+```bash
+# Get agent information by ID
+dfx canister call eliza_backend erc8004_get_agent_info '(12345: nat64)' --network ic
+```
+
+#### Update Agent URI (Admin Only)
+
+```bash
+# Update the agent URI
+dfx canister call eliza_backend erc8004_set_agent_uri '(12345: nat64, "https://new-uri.com")' --network ic
+```
+
+#### Get/Set Metadata
+
+```bash
+# Get metadata
+dfx canister call eliza_backend erc8004_get_metadata '(12345: nat64, "name")' --network ic
+
+# Set metadata (Admin only)
+dfx canister call eliza_backend erc8004_set_metadata '(12345: nat64, "name", blob "Coo v2")' --network ic
+```
+
+### Reputation Registry Functions
+
+#### Give Feedback
+
+```bash
+# Give feedback to an agent
+# Parameters: agent_id, value, decimals, tag1, tag2, registry_id, comment
+dfx canister call eliza_backend erc8004_give_feedback '(
+  12345: nat64,
+  100: int64,
+  2: nat8,
+  "quality",
+  "response",
+  "",
+  "Great responses!"
+)' --network ic
+```
+
+#### Revoke Feedback
+
+```bash
+# Revoke previously given feedback
+dfx canister call eliza_backend erc8004_revoke_feedback '(12345: nat64, 0: nat64)' --network ic
+```
+
+#### Get Reputation Summary
+
+```bash
+# Get reputation summary for an agent
+dfx canister call eliza_backend erc8004_get_reputation_summary '(12345: nat64, "quality", "")' --network ic
+
+# Returns:
+# record {
+#   agent_id = 12345;
+#   count = 42;
+#   summary_value = 8500;
+#   summary_value_decimals = 2;
+#   tag1 = "quality";
+#   tag2 = "";
+# }
+```
+
+#### Read Specific Feedback
+
+```bash
+# Read a specific feedback entry
+dfx canister call eliza_backend erc8004_read_feedback '(
+  12345: nat64,
+  "0xCLIENT_ADDRESS",
+  0: nat64
+)' --network ic
+```
+
+### Validation Registry Functions
+
+#### Request Validation
+
+```bash
+# Request validation from a validator
+dfx canister call eliza_backend erc8004_request_validation '(
+  "0xVALIDATOR_ADDRESS",
+  12345: nat64,
+  "capability-check"
+)' --network ic
+
+# Returns: request_hash (text)
+```
+
+#### Respond to Validation (For Validators)
+
+```bash
+# Respond to a validation request
+# response: 0=pending, 1=approved, 2=rejected
+dfx canister call eliza_backend erc8004_respond_validation '(
+  "0xREQUEST_HASH",
+  1: nat8,
+  "0xRESPONSE_HASH",
+  "capability-check"
+)' --network ic
+```
+
+#### Get Validation Status
+
+```bash
+# Check validation status
+dfx canister call eliza_backend erc8004_get_validation_status '("0xREQUEST_HASH")' --network ic
+
+# Returns:
+# record {
+#   request_hash = "0x...";
+#   validator_address = "0x...";
+#   agent_id = 12345;
+#   response = 1;  // 0=pending, 1=approved, 2=rejected
+#   response_hash = "0x...";
+#   tag = "capability-check";
+#   last_update = 1234567890000000000;
+# }
+```
+
+### ERC-8004 Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     ICP Canister (Coo)                          │
+│                                                                  │
+│  ┌─────────────────┐    ┌──────────────────────────────────┐   │
+│  │   ERC-8004      │    │        Chain-Key ECDSA           │   │
+│  │   State         │───►│        (Sign Transactions)        │   │
+│  └─────────────────┘    └──────────────────────────────────┘   │
+│                                    │                            │
+└────────────────────────────────────┼────────────────────────────┘
+                                     │
+                            HTTP Outcalls
+                                     │
+                                     ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                     EVM Chain (Base, Polygon, etc.)             │
+│                                                                  │
+│  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐ │
+│  │    Identity     │  │   Reputation    │  │   Validation    │ │
+│  │    Registry     │  │    Registry     │  │    Registry     │ │
+│  │                 │  │                 │  │                 │ │
+│  │  - register()   │  │  - giveFeedback │  │  - request()    │ │
+│  │  - getAgent()   │  │  - revoke()     │  │  - respond()    │ │
+│  │  - setMetadata()│  │  - getSummary() │  │  - getStatus()  │ │
+│  └─────────────────┘  └─────────────────┘  └─────────────────┘ │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### ERC-8004 API Reference
+
+| Function | Access | Description |
+|----------|--------|-------------|
+| `configure_erc8004_registry` | Admin | Configure registry addresses |
+| `get_erc8004_registries` | Public | List configured registries |
+| `get_erc8004_status` | Public | Get registration status |
+| `erc8004_register_agent` | Admin | Register as agent |
+| `erc8004_get_agent_info` | Public | Get agent details |
+| `erc8004_set_agent_uri` | Admin | Update agent URI |
+| `erc8004_get_metadata` | Public | Read agent metadata |
+| `erc8004_set_metadata` | Admin | Write agent metadata |
+| `erc8004_give_feedback` | Public | Submit feedback |
+| `erc8004_revoke_feedback` | Caller | Revoke own feedback |
+| `erc8004_get_reputation_summary` | Public | Get reputation score |
+| `erc8004_read_feedback` | Public | Read specific feedback |
+| `erc8004_request_validation` | Public | Request validation |
+| `erc8004_respond_validation` | Validator | Respond to request |
+| `erc8004_get_validation_status` | Public | Check validation status |
+
+---
+
 ## Wallet Security Summary
 
 | Function | Access | Chain |
@@ -1026,6 +1271,7 @@ dfx canister call eliza_backend get_wallet_addresses --network ic
 - **EVM Wallet**: Chain-Key ECDSA (threshold signatures)
 - **Solana Wallet**: Ed25519 with on-chain key storage
 - **DeFi**: Jupiter (Solana), Uniswap V3 (EVM), LiFi (cross-chain)
+- **Agent Standard**: ERC-8004 Trustless Agents (Identity, Reputation, Validation)
 - **Framework**: elizaOS
 
 ## Security

@@ -237,6 +237,69 @@ type Portfolio = record {
     last_updated: nat64;
 };
 
+// ========== ERC-8004 Trustless Agents Types ==========
+
+type Erc8004RegistryConfig = record {
+    registry_id: text;
+    name: text;
+    chain_id: nat64;
+    identity_registry: text;
+    reputation_registry: text;
+    validation_registry: text;
+    is_default: bool;
+};
+
+type Erc8004AgentInfo = record {
+    agent_id: nat64;
+    agent_uri: text;
+    owner: text;
+    wallet: opt text;
+    chain_id: nat64;
+    registry: text;
+};
+
+type Erc8004MetadataEntry = record {
+    key: text;
+    value: vec nat8;
+};
+
+type Erc8004Feedback = record {
+    client_address: text;
+    feedback_index: nat64;
+    value: int64;
+    value_decimals: nat8;
+    tag1: text;
+    tag2: text;
+    is_revoked: bool;
+};
+
+type Erc8004ReputationSummary = record {
+    agent_id: nat64;
+    count: nat64;
+    summary_value: int64;
+    summary_value_decimals: nat8;
+    tag1: text;
+    tag2: text;
+};
+
+type Erc8004ValidationStatus = record {
+    request_hash: text;
+    validator_address: text;
+    agent_id: nat64;
+    response: nat8;
+    response_hash: text;
+    tag: text;
+    last_update: nat64;
+};
+
+type Erc8004Status = record {
+    registered: bool;
+    agent_id: opt nat64;
+    agent_uri: opt text;
+    default_registry: opt text;
+    configured_registries: nat32;
+};
+
 service : {
     // Chat
     chat: (text) -> (variant { Ok: text; Err: text });
@@ -349,6 +412,31 @@ service : {
     // ========== Portfolio Analysis ==========
     get_portfolio: () -> (variant { Ok: Portfolio; Err: text });
     get_wallet_addresses: () -> (vec record { text; text }) query;
+
+    // ========== ERC-8004 Trustless Agents ==========
+
+    // Registry Configuration
+    configure_erc8004_registry: (Erc8004RegistryConfig) -> (variant { Ok; Err: text });
+    get_erc8004_registries: () -> (vec Erc8004RegistryConfig) query;
+    get_erc8004_status: () -> (Erc8004Status) query;
+
+    // Identity Registry
+    erc8004_register_agent: (text, vec Erc8004MetadataEntry) -> (variant { Ok: nat64; Err: text });
+    erc8004_get_agent_info: (nat64) -> (variant { Ok: Erc8004AgentInfo; Err: text });
+    erc8004_set_agent_uri: (nat64, text) -> (variant { Ok; Err: text });
+    erc8004_get_metadata: (nat64, text) -> (variant { Ok: vec nat8; Err: text });
+    erc8004_set_metadata: (nat64, text, vec nat8) -> (variant { Ok; Err: text });
+
+    // Reputation Registry
+    erc8004_give_feedback: (nat64, int64, nat8, text, text, text, text) -> (variant { Ok; Err: text });
+    erc8004_revoke_feedback: (nat64, nat64) -> (variant { Ok; Err: text });
+    erc8004_get_reputation_summary: (nat64, text, text) -> (variant { Ok: Erc8004ReputationSummary; Err: text });
+    erc8004_read_feedback: (nat64, text, nat64) -> (variant { Ok: Erc8004Feedback; Err: text });
+
+    // Validation Registry
+    erc8004_request_validation: (text, nat64, text) -> (variant { Ok: text; Err: text });
+    erc8004_respond_validation: (text, nat8, text, text) -> (variant { Ok; Err: text });
+    erc8004_get_validation_status: (text) -> (variant { Ok: Erc8004ValidationStatus; Err: text });
 
     // Transform functions (internal)
     transform_openai_response: (record { response: record { status: nat; body: vec nat8; headers: vec record { name: text; value: text } }; context: vec nat8 }) -> (record { status: nat; body: vec nat8; headers: vec record { name: text; value: text } }) query;

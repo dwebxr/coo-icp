@@ -295,6 +295,96 @@ pub struct SolanaWalletState {
     pub configured_networks: Vec<SolanaNetworkConfig>,
 }
 
+// ========== ERC-8004 Trustless Agents Data Structures ==========
+
+/// ERC-8004 Registry Configuration
+#[derive(CandidType, Deserialize, Serialize, Clone, Debug)]
+pub struct Erc8004RegistryConfig {
+    pub registry_id: String,              // Unique identifier for this registry configuration
+    pub name: String,                      // Human readable name
+    pub chain_id: u64,                     // EVM chain ID where contracts are deployed
+    pub identity_registry: String,         // Contract address for AgentIdentityRegistry
+    pub reputation_registry: String,       // Contract address for ReputationRegistry
+    pub validation_registry: String,       // Contract address for ValidationRegistry
+    pub is_default: bool,                  // Whether this is the default registry
+}
+
+/// ERC-8004 Agent Information
+#[derive(CandidType, Deserialize, Serialize, Clone, Debug)]
+pub struct Erc8004AgentInfo {
+    pub agent_id: u64,                     // Agent ID in the registry
+    pub agent_uri: String,                 // URI for the agent
+    pub owner: String,                     // Owner address
+    pub wallet: Option<String>,            // Optional linked wallet address
+    pub chain_id: u64,                     // Chain ID where registered
+    pub registry: String,                  // Registry address
+}
+
+/// Metadata entry for ERC-8004 agents
+#[derive(CandidType, Deserialize, Serialize, Clone, Debug)]
+pub struct Erc8004MetadataEntry {
+    pub key: String,
+    pub value: Vec<u8>,
+}
+
+/// Feedback entry in ERC-8004 Reputation Registry
+#[derive(CandidType, Deserialize, Serialize, Clone, Debug)]
+pub struct Erc8004Feedback {
+    pub client_address: String,            // Address that gave the feedback
+    pub feedback_index: u64,               // Index of this feedback
+    pub value: i64,                         // Feedback value (can be negative)
+    pub value_decimals: u8,                // Decimal precision
+    pub tag1: String,                       // Primary categorization tag
+    pub tag2: String,                       // Secondary categorization tag
+    pub is_revoked: bool,                   // Whether this feedback has been revoked
+}
+
+/// Reputation summary for an agent
+#[derive(CandidType, Deserialize, Serialize, Clone, Debug)]
+pub struct Erc8004ReputationSummary {
+    pub agent_id: u64,
+    pub count: u64,                         // Number of feedbacks
+    pub summary_value: i64,                 // Aggregated value
+    pub summary_value_decimals: u8,
+    pub tag1: String,
+    pub tag2: String,
+}
+
+/// Validation status from ValidationRegistry
+#[derive(CandidType, Deserialize, Serialize, Clone, Debug)]
+pub struct Erc8004ValidationStatus {
+    pub request_hash: String,               // Hash of the validation request
+    pub validator_address: String,          // Address of the validator
+    pub agent_id: u64,                      // Agent being validated
+    pub response: u8,                        // 0=pending, 1=approved, 2=rejected, etc.
+    pub response_hash: String,              // Hash of the response
+    pub tag: String,                         // Validation tag/category
+    pub last_update: u64,                    // Timestamp of last update
+}
+
+/// ERC-8004 status overview
+#[derive(CandidType, Deserialize, Serialize, Clone, Debug)]
+pub struct Erc8004Status {
+    pub registered: bool,                   // Whether this agent is registered
+    pub agent_id: Option<u64>,              // Agent ID if registered
+    pub agent_uri: Option<String>,          // Agent URI if registered
+    pub default_registry: Option<String>,   // Default registry address
+    pub configured_registries: u32,         // Number of configured registries
+}
+
+/// Internal state for ERC-8004 integration
+#[derive(CandidType, Deserialize, Serialize, Clone, Debug, Default)]
+pub struct Erc8004State {
+    pub registries: Vec<Erc8004RegistryConfig>,
+    pub registered_agent_id: Option<u64>,
+    pub registered_agent_uri: Option<String>,
+    pub registered_chain_id: Option<u64>,
+    pub registered_registry: Option<String>,
+    pub local_metadata: HashMap<String, Vec<u8>>,  // Cached metadata
+    pub feedback_cache: Vec<Erc8004Feedback>,       // Recent feedback received
+    pub validation_requests: HashMap<String, Erc8004ValidationStatus>, // Pending validations
+}
+
 // ========== State Management ==========
 
 thread_local! {
@@ -338,6 +428,18 @@ thread_local! {
         tx_counter: 0,
         configured_networks: Vec::new(),
     });
+
+    // ERC-8004 Trustless Agents State
+    static ERC8004_STATE: RefCell<Erc8004State> = RefCell::new(Erc8004State {
+        registries: Vec::new(),
+        registered_agent_id: None,
+        registered_agent_uri: None,
+        registered_chain_id: None,
+        registered_registry: None,
+        local_metadata: HashMap::new(),
+        feedback_cache: Vec::new(),
+        validation_requests: HashMap::new(),
+    });
 }
 
 // ========== Stable Memory for Upgrades ==========
@@ -363,6 +465,9 @@ struct StableState {
     wallet_state: WalletState,
     evm_wallet_state: EvmWalletState,
     solana_wallet_state: SolanaWalletState,
+
+    // ERC-8004 state
+    erc8004_state: Erc8004State,
 }
 
 impl Default for WalletState {
@@ -451,6 +556,7 @@ fn pre_upgrade() {
         wallet_state: WALLET_STATE.with(|w| w.borrow().clone()),
         evm_wallet_state: EVM_WALLET_STATE.with(|w| w.borrow().clone()),
         solana_wallet_state: SOLANA_WALLET_STATE.with(|w| w.borrow().clone()),
+        erc8004_state: ERC8004_STATE.with(|s| s.borrow().clone()),
     };
 
     // Serialize to stable memory
@@ -507,6 +613,7 @@ fn post_upgrade() {
                 WALLET_STATE.with(|w| *w.borrow_mut() = state.wallet_state);
                 EVM_WALLET_STATE.with(|w| *w.borrow_mut() = state.evm_wallet_state);
                 SOLANA_WALLET_STATE.with(|w| *w.borrow_mut() = state.solana_wallet_state);
+                ERC8004_STATE.with(|s| *s.borrow_mut() = state.erc8004_state);
 
                 ic_cdk::println!("State restored from stable memory successfully");
                 return;
@@ -3045,6 +3152,303 @@ async fn get_gas_price(rpc_url: &str) -> Result<u64, String> {
     }
 }
 
+/// Estimate gas for a contract call
+async fn estimate_gas(
+    rpc_url: &str,
+    from: &str,
+    to: &str,
+    data: &str,
+) -> Result<u64, String> {
+    let request_body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "eth_estimateGas",
+        "params": [{
+            "from": from,
+            "to": to,
+            "data": data
+        }],
+        "id": 1
+    });
+
+    let request = CanisterHttpRequestArgument {
+        url: rpc_url.to_string(),
+        max_response_bytes: Some(2_000),
+        method: HttpMethod::POST,
+        headers: vec![
+            HttpHeader {
+                name: "Content-Type".to_string(),
+                value: "application/json".to_string(),
+            },
+        ],
+        body: Some(request_body.to_string().into_bytes()),
+        transform: Some(TransformContext {
+            function: TransformFunc(candid::Func {
+                principal: ic_cdk::id(),
+                method: "transform_evm_response".to_string(),
+            }),
+            context: vec![],
+        }),
+    };
+
+    let cycles = 30_000_000_000u128;
+
+    match http_request(request, cycles).await {
+        Ok((response,)) => {
+            let body = String::from_utf8(response.body)
+                .map_err(|e| format!("UTF-8 error: {}", e))?;
+
+            let json: serde_json::Value = serde_json::from_str(&body)
+                .map_err(|e| format!("JSON error: {}", e))?;
+
+            // Check for RPC error
+            if let Some(error) = json.get("error") {
+                return Err(format!("RPC error: {}", error));
+            }
+
+            let gas_hex = json["result"]
+                .as_str()
+                .ok_or_else(|| "No gas estimate in response".to_string())?;
+
+            let gas_str = gas_hex.strip_prefix("0x").unwrap_or(gas_hex);
+            let gas = u64::from_str_radix(gas_str, 16)
+                .map_err(|e| format!("Invalid gas estimate: {:?}", e))?;
+
+            // Add 20% buffer for safety
+            Ok(gas.saturating_mul(120) / 100)
+        }
+        Err((code, msg)) => Err(format!("HTTP error: {:?} - {}", code, msg)),
+    }
+}
+
+/// Transaction receipt structure
+#[derive(Debug, Clone)]
+struct TransactionReceipt {
+    pub status: bool,
+    pub block_number: u64,
+    pub logs: Vec<EvmLog>,
+}
+
+/// EVM log entry
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct EvmLog {
+    pub address: String,
+    pub topics: Vec<String>,
+    pub data: String,  // Reserved for future event data parsing
+}
+
+/// Get transaction receipt from EVM RPC
+async fn get_transaction_receipt(
+    rpc_url: &str,
+    tx_hash: &str,
+) -> Result<TransactionReceipt, String> {
+    let request_body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "eth_getTransactionReceipt",
+        "params": [tx_hash],
+        "id": 1
+    });
+
+    let request = CanisterHttpRequestArgument {
+        url: rpc_url.to_string(),
+        max_response_bytes: Some(50_000), // Larger for receipts with logs
+        method: HttpMethod::POST,
+        headers: vec![
+            HttpHeader {
+                name: "Content-Type".to_string(),
+                value: "application/json".to_string(),
+            },
+        ],
+        body: Some(request_body.to_string().into_bytes()),
+        transform: Some(TransformContext {
+            function: TransformFunc(candid::Func {
+                principal: ic_cdk::id(),
+                method: "transform_evm_response".to_string(),
+            }),
+            context: vec![],
+        }),
+    };
+
+    let cycles = 50_000_000_000u128;
+
+    match http_request(request, cycles).await {
+        Ok((response,)) => {
+            let body = String::from_utf8(response.body)
+                .map_err(|e| format!("UTF-8 error: {}", e))?;
+
+            let json: serde_json::Value = serde_json::from_str(&body)
+                .map_err(|e| format!("JSON error: {}", e))?;
+
+            // Check for RPC error
+            if let Some(error) = json.get("error") {
+                return Err(format!("RPC error: {}", error));
+            }
+
+            let result = json.get("result")
+                .ok_or_else(|| "No result in response".to_string())?;
+
+            // Check if result is null (transaction not yet mined)
+            if result.is_null() {
+                return Err("Transaction not yet mined".to_string());
+            }
+
+            // Parse status
+            let status_hex = result.get("status")
+                .and_then(|s| s.as_str())
+                .unwrap_or("0x0");
+            let status = status_hex == "0x1";
+
+            // Parse block number
+            let block_hex = result.get("blockNumber")
+                .and_then(|s| s.as_str())
+                .unwrap_or("0x0");
+            let block_str = block_hex.strip_prefix("0x").unwrap_or(block_hex);
+            let block_number = u64::from_str_radix(block_str, 16).unwrap_or(0);
+
+            // Parse logs
+            let mut logs = Vec::new();
+            if let Some(logs_array) = result.get("logs").and_then(|l| l.as_array()) {
+                for log in logs_array {
+                    let address = log.get("address")
+                        .and_then(|a| a.as_str())
+                        .unwrap_or("")
+                        .to_string();
+
+                    let topics: Vec<String> = log.get("topics")
+                        .and_then(|t| t.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|t| t.as_str())
+                                .map(|s| s.to_string())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+
+                    let data = log.get("data")
+                        .and_then(|d| d.as_str())
+                        .unwrap_or("0x")
+                        .to_string();
+
+                    logs.push(EvmLog { address, topics, data });
+                }
+            }
+
+            Ok(TransactionReceipt {
+                status,
+                block_number,
+                logs,
+            })
+        }
+        Err((code, msg)) => Err(format!("HTTP error: {:?} - {}", code, msg)),
+    }
+}
+
+/// Wait for transaction confirmation and get receipt
+/// Uses eth_blockNumber calls to create ~2-5 second delays between retries
+/// (ICP HTTP outcalls require consensus, creating implicit delays)
+async fn wait_for_transaction_receipt(
+    rpc_url: &str,
+    tx_hash: &str,
+    max_attempts: u32,
+) -> Result<TransactionReceipt, String> {
+    for attempt in 0..max_attempts {
+        match get_transaction_receipt(rpc_url, tx_hash).await {
+            Ok(receipt) => return Ok(receipt),
+            Err(e) if e.contains("not yet mined") => {
+                if attempt < max_attempts - 1 {
+                    ic_cdk::println!("Waiting for tx confirmation, attempt {}/{}", attempt + 1, max_attempts);
+                    // Create implicit delay by making a lightweight RPC call
+                    // ICP HTTP outcalls take ~2-5 seconds due to consensus
+                    let _ = rpc_delay_call(rpc_url).await;
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(format!("Transaction not confirmed after {} attempts", max_attempts))
+}
+
+/// Lightweight RPC call to create implicit delay via ICP consensus
+async fn rpc_delay_call(rpc_url: &str) -> Result<(), String> {
+    let request_body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "eth_blockNumber",
+        "params": [],
+        "id": 1
+    });
+
+    let request = CanisterHttpRequestArgument {
+        url: rpc_url.to_string(),
+        max_response_bytes: Some(500),
+        method: HttpMethod::POST,
+        headers: vec![
+            HttpHeader {
+                name: "Content-Type".to_string(),
+                value: "application/json".to_string(),
+            },
+        ],
+        body: Some(request_body.to_string().into_bytes()),
+        transform: Some(TransformContext {
+            function: TransformFunc(candid::Func {
+                principal: ic_cdk::id(),
+                method: "transform_evm_response".to_string(),
+            }),
+            context: vec![],
+        }),
+    };
+
+    // Use minimal cycles for this delay call
+    let cycles = 10_000_000_000u128;
+
+    match http_request(request, cycles).await {
+        Ok(_) => Ok(()),
+        Err(_) => Ok(()), // Ignore errors, this is just for delay
+    }
+}
+
+/// Parse AgentRegistered event from logs
+/// Event: AgentRegistered(uint256 indexed agentId, address indexed owner, string agentURI)
+/// Topic[0] = keccak256("AgentRegistered(uint256,address,string)")
+fn parse_agent_registered_event(logs: &[EvmLog], registry_address: &str) -> Option<u64> {
+    // Calculate event signature
+    use tiny_keccak::{Hasher, Keccak};
+    let mut hasher = Keccak::v256();
+    let mut event_sig = [0u8; 32];
+    hasher.update(b"AgentRegistered(uint256,address,string)");
+    hasher.finalize(&mut event_sig);
+    let event_topic = format!("0x{}", hex::encode(event_sig));
+
+    // Find the matching log
+    for log in logs {
+        // Check if log is from the registry contract
+        if !log.address.eq_ignore_ascii_case(registry_address) {
+            continue;
+        }
+
+        // Check if this is the AgentRegistered event
+        if log.topics.is_empty() || !log.topics[0].eq_ignore_ascii_case(&event_topic) {
+            continue;
+        }
+
+        // agentId is in topic[1] (indexed parameter)
+        if log.topics.len() >= 2 {
+            let agent_id_hex = log.topics[1].strip_prefix("0x").unwrap_or(&log.topics[1]);
+            if let Ok(bytes) = hex::decode(agent_id_hex) {
+                if bytes.len() == 32 {
+                    // Extract last 8 bytes as u64
+                    let agent_id = u64::from_be_bytes([
+                        bytes[24], bytes[25], bytes[26], bytes[27],
+                        bytes[28], bytes[29], bytes[30], bytes[31]
+                    ]);
+                    return Some(agent_id);
+                }
+            }
+        }
+    }
+
+    None
+}
+
 /// Transform function for EVM RPC responses
 #[query]
 fn transform_evm_response(raw: TransformArgs) -> HttpResponse {
@@ -5320,6 +5724,1332 @@ fn get_wallet_addresses() -> Vec<(String, String)> {
     }
 
     addresses
+}
+
+// ========== ERC-8004 Trustless Agents ==========
+
+/// Configure an ERC-8004 registry
+#[update]
+fn configure_erc8004_registry(config: Erc8004RegistryConfig) -> Result<(), String> {
+    let caller = ic_cdk::caller();
+
+    // Check admin permission
+    let is_admin = CONFIG.with(|c| {
+        c.borrow()
+            .as_ref()
+            .map(|cfg| cfg.admin == caller)
+            .unwrap_or(false)
+    });
+
+    if !is_admin {
+        return Err("Only admin can configure ERC-8004 registries".to_string());
+    }
+
+    ERC8004_STATE.with(|s| {
+        let mut state = s.borrow_mut();
+
+        // Check if registry with same ID already exists
+        if let Some(idx) = state.registries.iter().position(|r| r.registry_id == config.registry_id) {
+            // Update existing registry
+            state.registries[idx] = config;
+        } else {
+            // Add new registry
+            // If this is set as default, unset previous default
+            if config.is_default {
+                for r in state.registries.iter_mut() {
+                    r.is_default = false;
+                }
+            }
+            state.registries.push(config);
+        }
+    });
+
+    Ok(())
+}
+
+/// Get all configured ERC-8004 registries
+#[query]
+fn get_erc8004_registries() -> Vec<Erc8004RegistryConfig> {
+    ERC8004_STATE.with(|s| s.borrow().registries.clone())
+}
+
+/// Get ERC-8004 status overview
+#[query]
+fn get_erc8004_status() -> Erc8004Status {
+    ERC8004_STATE.with(|s| {
+        let state = s.borrow();
+        let default_registry = state.registries.iter()
+            .find(|r| r.is_default)
+            .map(|r| r.identity_registry.clone());
+
+        Erc8004Status {
+            registered: state.registered_agent_id.is_some(),
+            agent_id: state.registered_agent_id,
+            agent_uri: state.registered_agent_uri.clone(),
+            default_registry,
+            configured_registries: state.registries.len() as u32,
+        }
+    })
+}
+
+// ========== ERC-8004 Identity Registry Functions ==========
+
+/// Register this canister as an agent in the ERC-8004 Identity Registry
+/// This calls the AgentIdentityRegistry.register() function on-chain
+#[update]
+async fn erc8004_register_agent(
+    agent_uri: String,
+    metadata: Vec<Erc8004MetadataEntry>,
+) -> Result<u64, String> {
+    let caller = ic_cdk::caller();
+
+    // Check admin permission
+    let is_admin = CONFIG.with(|c| {
+        c.borrow()
+            .as_ref()
+            .map(|cfg| cfg.admin == caller)
+            .unwrap_or(false)
+    });
+
+    if !is_admin {
+        return Err("Only admin can register agent".to_string());
+    }
+
+    // Get default registry configuration
+    let registry_config = ERC8004_STATE.with(|s| {
+        s.borrow().registries.iter()
+            .find(|r| r.is_default)
+            .cloned()
+    }).ok_or("No default ERC-8004 registry configured")?;
+
+    // Verify EVM wallet is initialized
+    let _evm_address = EVM_WALLET_STATE.with(|s| s.borrow().cached_address.clone())
+        .ok_or("EVM wallet not initialized. Call get_evm_address first.")?;
+
+    // Get chain configuration (needed for RPC URL)
+    let chain_config = EVM_WALLET_STATE.with(|s| {
+        s.borrow().configured_chains.iter()
+            .find(|c| c.chain_id == registry_config.chain_id)
+            .cloned()
+    }).ok_or(format!("Chain {} not configured", registry_config.chain_id))?;
+
+    // Encode register function call
+    // register(string memory _agentURI, MetadataEntry[] memory _metadata)
+    // Function selector: keccak256("register(string,(string,bytes)[])")
+    let function_selector = {
+        use tiny_keccak::{Hasher, Keccak};
+        let mut hasher = Keccak::v256();
+        let mut output = [0u8; 32];
+        hasher.update(b"register(string,(string,bytes)[])");
+        hasher.finalize(&mut output);
+        [output[0], output[1], output[2], output[3]]
+    };
+
+    // Build ABI-encoded calldata
+    let mut calldata = Vec::new();
+    calldata.extend_from_slice(&function_selector);
+
+    // Encode parameters (simplified ABI encoding)
+    // For now, we'll encode with empty metadata since full ABI encoding is complex
+    // Offset for string (32 bytes)
+    let mut offset_string = [0u8; 32];
+    offset_string[31] = 64; // Offset to string data
+    calldata.extend_from_slice(&offset_string);
+
+    // Offset for metadata array
+    let uri_padded_len = ((agent_uri.len() + 31) / 32) * 32;
+    let metadata_offset = 64 + 32 + uri_padded_len;
+    let mut offset_metadata = [0u8; 32];
+    let offset_bytes = (metadata_offset as u64).to_be_bytes();
+    calldata[28..32].copy_from_slice(&offset_bytes[4..8]);
+    offset_metadata[28..32].copy_from_slice(&offset_bytes[4..8]);
+    // Re-calculate correct position
+    calldata.truncate(4);
+    calldata.extend_from_slice(&offset_string);
+    calldata.extend_from_slice(&offset_metadata);
+
+    // Encode string length and data
+    let mut string_len = [0u8; 32];
+    let len_bytes = (agent_uri.len() as u64).to_be_bytes();
+    string_len[24..32].copy_from_slice(&len_bytes);
+    calldata.extend_from_slice(&string_len);
+
+    // String data padded to 32 bytes
+    calldata.extend_from_slice(agent_uri.as_bytes());
+    let padding = (32 - (agent_uri.len() % 32)) % 32;
+    calldata.extend(vec![0u8; padding]);
+
+    // Empty metadata array (length = 0)
+    let array_len = [0u8; 32];
+    calldata.extend_from_slice(&array_len);
+
+    // Make the contract call
+    let calldata_hex = format!("0x{}", hex::encode(&calldata));
+
+    // Send transaction to register
+    match send_evm_contract_call(
+        registry_config.chain_id,
+        &registry_config.identity_registry,
+        &calldata_hex,
+        "0", // No value
+    ).await {
+        Ok(tx_hash) => {
+            ic_cdk::println!("Registration tx submitted: {}", tx_hash);
+
+            // Wait for transaction receipt and parse agent ID from event
+            let receipt = wait_for_transaction_receipt(
+                &chain_config.rpc_url,
+                &tx_hash,
+                30  // Max 30 attempts (~60 seconds with 2s interval)
+            ).await.map_err(|e| format!("Failed to get transaction receipt: {}", e))?;
+
+            // Check transaction status
+            if !receipt.status {
+                return Err("Transaction failed on-chain".to_string());
+            }
+
+            // Parse AgentRegistered event to get the real agent ID
+            let agent_id = parse_agent_registered_event(&receipt.logs, &registry_config.identity_registry)
+                .ok_or_else(|| {
+                    ic_cdk::println!("Could not parse AgentRegistered event from logs: {:?}", receipt.logs);
+                    "Failed to parse AgentRegistered event from transaction logs".to_string()
+                })?;
+
+            // Store registration info
+            ERC8004_STATE.with(|s| {
+                let mut state = s.borrow_mut();
+                state.registered_agent_id = Some(agent_id);
+                state.registered_agent_uri = Some(agent_uri.clone());
+                state.registered_chain_id = Some(registry_config.chain_id);
+                state.registered_registry = Some(registry_config.identity_registry.clone());
+
+                // Store metadata locally
+                for entry in metadata {
+                    state.local_metadata.insert(entry.key, entry.value);
+                }
+            });
+
+            ic_cdk::println!("Agent registered successfully! tx: {}, Agent ID: {}, block: {}",
+                tx_hash, agent_id, receipt.block_number);
+            Ok(agent_id)
+        }
+        Err(e) => Err(format!("Failed to register agent: {}", e))
+    }
+}
+
+/// Helper function to send EVM contract call
+async fn send_evm_contract_call(
+    chain_id: u64,
+    to: &str,
+    data: &str,
+    _value: &str,
+) -> Result<String, String> {
+    use tiny_keccak::{Hasher, Keccak};
+
+    // Get chain config
+    let chain_config = EVM_WALLET_STATE.with(|s| {
+        s.borrow().configured_chains.iter()
+            .find(|c| c.chain_id == chain_id)
+            .cloned()
+    }).ok_or(format!("Chain {} not configured", chain_id))?;
+
+    // Get our EVM address
+    let from_address = EVM_WALLET_STATE.with(|s| s.borrow().cached_address.clone())
+        .ok_or("EVM wallet not initialized. Call get_evm_address first.")?;
+
+    // Get nonce
+    let nonce = get_nonce(&chain_config.rpc_url, &from_address).await?;
+
+    // Get gas price
+    let gas_price = get_gas_price(&chain_config.rpc_url).await?;
+    let max_fee_per_gas = gas_price.saturating_mul(2); // 2x for safety
+    let max_priority_fee_per_gas = 1_500_000_000u64; // 1.5 gwei
+
+    // Estimate gas dynamically with fallback to fixed value
+    let gas_limit = estimate_gas(&chain_config.rpc_url, &from_address, to, data)
+        .await
+        .unwrap_or_else(|e| {
+            ic_cdk::println!("Gas estimation failed ({}), using default 300000", e);
+            300_000u64
+        });
+
+    // Parse to address
+    let to_bytes = hex_to_bytes(to)?;
+    if to_bytes.len() != 20 {
+        return Err("Invalid to address length".to_string());
+    }
+
+    // Parse calldata
+    let data_bytes = hex::decode(data.trim_start_matches("0x"))
+        .map_err(|e| format!("Invalid calldata: {}", e))?;
+
+    // Value is 0 for most contract calls
+    let value_bytes: Vec<u8> = vec![];
+
+    // Build transaction for signing (EIP-1559)
+    let tx_for_signing = build_eip1559_tx_for_signing(
+        chain_id,
+        nonce,
+        max_priority_fee_per_gas,
+        max_fee_per_gas,
+        gas_limit,
+        &to_bytes,
+        &value_bytes,
+        &data_bytes,
+    );
+
+    // Hash the transaction
+    let mut hasher = Keccak::v256();
+    let mut tx_hash = [0u8; 32];
+    hasher.update(&tx_for_signing);
+    hasher.finalize(&mut tx_hash);
+
+    // Sign with Chain-Key ECDSA
+    let signature = sign_with_chain_key_ecdsa(&tx_hash).await?;
+
+    // Parse signature (r, s)
+    if signature.len() != 64 {
+        return Err(format!("Invalid signature length: {}", signature.len()));
+    }
+    let r = &signature[..32];
+    let s = &signature[32..];
+
+    // Try both recovery IDs (0 and 1)
+    for v in [0u8, 1u8] {
+        // Build signed transaction
+        let signed_items = vec![
+            rlp_encode_u64(chain_id),
+            rlp_encode_u64(nonce),
+            rlp_encode_u64(max_priority_fee_per_gas),
+            rlp_encode_u64(max_fee_per_gas),
+            rlp_encode_u64(gas_limit),
+            rlp_encode_bytes(&to_bytes),
+            rlp_encode_bytes(&value_bytes),
+            rlp_encode_bytes(&data_bytes),
+            rlp_encode_bytes(&[]), // accessList
+            rlp_encode_bytes(&[v]),
+            rlp_encode_bytes(r),
+            rlp_encode_bytes(s),
+        ];
+
+        let signed_list = rlp_encode_list(&signed_items);
+        let mut signed_tx = vec![0x02u8]; // EIP-1559 type
+        signed_tx.extend(signed_list);
+
+        // Send transaction
+        match send_raw_transaction(&chain_config.rpc_url, &signed_tx).await {
+            Ok(hash) => return Ok(hash),
+            Err(e) => {
+                if v == 1 {
+                    return Err(format!("Transaction failed with both v values: {}", e));
+                }
+                // Try next v value
+            }
+        }
+    }
+
+    Err("Failed to send transaction".to_string())
+}
+
+/// Get agent info from the registry
+#[update]
+async fn erc8004_get_agent_info(agent_id: u64) -> Result<Erc8004AgentInfo, String> {
+    // Get default registry
+    let registry_config = ERC8004_STATE.with(|s| {
+        s.borrow().registries.iter()
+            .find(|r| r.is_default)
+            .cloned()
+    }).ok_or("No default ERC-8004 registry configured")?;
+
+    // Verify chain is configured
+    let _chain_config = EVM_WALLET_STATE.with(|s| {
+        s.borrow().configured_chains.iter()
+            .find(|c| c.chain_id == registry_config.chain_id)
+            .cloned()
+    }).ok_or(format!("Chain {} not configured", registry_config.chain_id))?;
+
+    // Encode getAgentInfo(uint256) call
+    let function_selector = {
+        use tiny_keccak::{Hasher, Keccak};
+        let mut hasher = Keccak::v256();
+        let mut output = [0u8; 32];
+        hasher.update(b"getAgentInfo(uint256)");
+        hasher.finalize(&mut output);
+        [output[0], output[1], output[2], output[3]]
+    };
+
+    let mut calldata = Vec::new();
+    calldata.extend_from_slice(&function_selector);
+
+    // Encode agent_id as uint256
+    let mut id_bytes = [0u8; 32];
+    let id_be = agent_id.to_be_bytes();
+    id_bytes[24..32].copy_from_slice(&id_be);
+    calldata.extend_from_slice(&id_bytes);
+
+    let calldata_hex = format!("0x{}", hex::encode(&calldata));
+
+    // Make eth_call
+    let _result = evm_eth_call(
+        registry_config.chain_id,
+        &registry_config.identity_registry,
+        &calldata_hex,
+    ).await?;
+
+    // For now, return locally cached info if available, or construct from response
+    // Full ABI decoding would be needed for production
+    let cached_info = ERC8004_STATE.with(|s| {
+        let state = s.borrow();
+        if state.registered_agent_id == Some(agent_id) {
+            Some(Erc8004AgentInfo {
+                agent_id,
+                agent_uri: state.registered_agent_uri.clone().unwrap_or_default(),
+                owner: EVM_WALLET_STATE.with(|e| e.borrow().cached_address.clone().unwrap_or_default()),
+                wallet: EVM_WALLET_STATE.with(|e| e.borrow().cached_address.clone()),
+                chain_id: registry_config.chain_id,
+                registry: registry_config.identity_registry.clone(),
+            })
+        } else {
+            None
+        }
+    });
+
+    cached_info.ok_or("Agent info not found in local cache. Full on-chain query pending.".to_string())
+}
+
+/// Set agent URI
+#[update]
+async fn erc8004_set_agent_uri(agent_id: u64, new_uri: String) -> Result<(), String> {
+    let caller = ic_cdk::caller();
+
+    // Check admin permission
+    let is_admin = CONFIG.with(|c| {
+        c.borrow()
+            .as_ref()
+            .map(|cfg| cfg.admin == caller)
+            .unwrap_or(false)
+    });
+
+    if !is_admin {
+        return Err("Only admin can update agent URI".to_string());
+    }
+
+    // Get default registry
+    let registry_config = ERC8004_STATE.with(|s| {
+        s.borrow().registries.iter()
+            .find(|r| r.is_default)
+            .cloned()
+    }).ok_or("No default ERC-8004 registry configured")?;
+
+    // Encode setAgentURI(uint256,string) call
+    let function_selector = {
+        use tiny_keccak::{Hasher, Keccak};
+        let mut hasher = Keccak::v256();
+        let mut output = [0u8; 32];
+        hasher.update(b"setAgentURI(uint256,string)");
+        hasher.finalize(&mut output);
+        [output[0], output[1], output[2], output[3]]
+    };
+
+    let mut calldata = Vec::new();
+    calldata.extend_from_slice(&function_selector);
+
+    // Encode agent_id
+    let mut id_bytes = [0u8; 32];
+    let id_be = agent_id.to_be_bytes();
+    id_bytes[24..32].copy_from_slice(&id_be);
+    calldata.extend_from_slice(&id_bytes);
+
+    // Offset for string
+    let mut offset = [0u8; 32];
+    offset[31] = 64;
+    calldata.extend_from_slice(&offset);
+
+    // String length
+    let mut len = [0u8; 32];
+    let len_be = (new_uri.len() as u64).to_be_bytes();
+    len[24..32].copy_from_slice(&len_be);
+    calldata.extend_from_slice(&len);
+
+    // String data
+    calldata.extend_from_slice(new_uri.as_bytes());
+    let padding = (32 - (new_uri.len() % 32)) % 32;
+    calldata.extend(vec![0u8; padding]);
+
+    let calldata_hex = format!("0x{}", hex::encode(&calldata));
+
+    send_evm_contract_call(
+        registry_config.chain_id,
+        &registry_config.identity_registry,
+        &calldata_hex,
+        "0",
+    ).await?;
+
+    // Update local cache
+    ERC8004_STATE.with(|s| {
+        let mut state = s.borrow_mut();
+        if state.registered_agent_id == Some(agent_id) {
+            state.registered_agent_uri = Some(new_uri);
+        }
+    });
+
+    Ok(())
+}
+
+/// Get metadata for an agent
+#[update]
+async fn erc8004_get_metadata(agent_id: u64, key: String) -> Result<Vec<u8>, String> {
+    // First check local cache
+    let cached = ERC8004_STATE.with(|s| {
+        let state = s.borrow();
+        if state.registered_agent_id == Some(agent_id) {
+            state.local_metadata.get(&key).cloned()
+        } else {
+            None
+        }
+    });
+
+    if let Some(value) = cached {
+        return Ok(value);
+    }
+
+    // Get from chain
+    let registry_config = ERC8004_STATE.with(|s| {
+        s.borrow().registries.iter()
+            .find(|r| r.is_default)
+            .cloned()
+    }).ok_or("No default ERC-8004 registry configured")?;
+
+    // Encode getMetadata(uint256,string) call
+    let function_selector = {
+        use tiny_keccak::{Hasher, Keccak};
+        let mut hasher = Keccak::v256();
+        let mut output = [0u8; 32];
+        hasher.update(b"getMetadata(uint256,string)");
+        hasher.finalize(&mut output);
+        [output[0], output[1], output[2], output[3]]
+    };
+
+    let mut calldata = Vec::new();
+    calldata.extend_from_slice(&function_selector);
+
+    // Encode agent_id
+    let mut id_bytes = [0u8; 32];
+    let id_be = agent_id.to_be_bytes();
+    id_bytes[24..32].copy_from_slice(&id_be);
+    calldata.extend_from_slice(&id_bytes);
+
+    // Offset for string
+    let mut offset = [0u8; 32];
+    offset[31] = 64;
+    calldata.extend_from_slice(&offset);
+
+    // String length and data
+    let mut len = [0u8; 32];
+    let len_be = (key.len() as u64).to_be_bytes();
+    len[24..32].copy_from_slice(&len_be);
+    calldata.extend_from_slice(&len);
+    calldata.extend_from_slice(key.as_bytes());
+    let padding = (32 - (key.len() % 32)) % 32;
+    calldata.extend(vec![0u8; padding]);
+
+    let calldata_hex = format!("0x{}", hex::encode(&calldata));
+
+    let result = evm_eth_call(
+        registry_config.chain_id,
+        &registry_config.identity_registry,
+        &calldata_hex,
+    ).await?;
+
+    // Parse bytes result (simplified - would need full ABI decoding)
+    let result_bytes = hex::decode(result.trim_start_matches("0x"))
+        .map_err(|e| format!("Failed to decode result: {}", e))?;
+
+    Ok(result_bytes)
+}
+
+/// Set metadata for an agent
+#[update]
+async fn erc8004_set_metadata(agent_id: u64, key: String, value: Vec<u8>) -> Result<(), String> {
+    let caller = ic_cdk::caller();
+
+    // Check admin permission
+    let is_admin = CONFIG.with(|c| {
+        c.borrow()
+            .as_ref()
+            .map(|cfg| cfg.admin == caller)
+            .unwrap_or(false)
+    });
+
+    if !is_admin {
+        return Err("Only admin can set metadata".to_string());
+    }
+
+    let registry_config = ERC8004_STATE.with(|s| {
+        s.borrow().registries.iter()
+            .find(|r| r.is_default)
+            .cloned()
+    }).ok_or("No default ERC-8004 registry configured")?;
+
+    // Encode setMetadata(uint256,string,bytes) call
+    let function_selector = {
+        use tiny_keccak::{Hasher, Keccak};
+        let mut hasher = Keccak::v256();
+        let mut output = [0u8; 32];
+        hasher.update(b"setMetadata(uint256,string,bytes)");
+        hasher.finalize(&mut output);
+        [output[0], output[1], output[2], output[3]]
+    };
+
+    let mut calldata = Vec::new();
+    calldata.extend_from_slice(&function_selector);
+
+    // Encode agent_id
+    let mut id_bytes = [0u8; 32];
+    let id_be = agent_id.to_be_bytes();
+    id_bytes[24..32].copy_from_slice(&id_be);
+    calldata.extend_from_slice(&id_bytes);
+
+    // Offsets for string and bytes (dynamic types)
+    let mut offset_key = [0u8; 32];
+    offset_key[31] = 96; // 3 * 32 bytes from start
+    calldata.extend_from_slice(&offset_key);
+
+    let key_padded_len = ((key.len() + 31) / 32) * 32;
+    let value_offset = 96 + 32 + key_padded_len;
+    let mut offset_value = [0u8; 32];
+    let offset_be = (value_offset as u64).to_be_bytes();
+    offset_value[24..32].copy_from_slice(&offset_be);
+    calldata.extend_from_slice(&offset_value);
+
+    // Encode key string
+    let mut len = [0u8; 32];
+    let len_be = (key.len() as u64).to_be_bytes();
+    len[24..32].copy_from_slice(&len_be);
+    calldata.extend_from_slice(&len);
+    calldata.extend_from_slice(key.as_bytes());
+    let padding = (32 - (key.len() % 32)) % 32;
+    calldata.extend(vec![0u8; padding]);
+
+    // Encode value bytes
+    let mut value_len = [0u8; 32];
+    let value_len_be = (value.len() as u64).to_be_bytes();
+    value_len[24..32].copy_from_slice(&value_len_be);
+    calldata.extend_from_slice(&value_len);
+    calldata.extend_from_slice(&value);
+    let value_padding = (32 - (value.len() % 32)) % 32;
+    calldata.extend(vec![0u8; value_padding]);
+
+    let calldata_hex = format!("0x{}", hex::encode(&calldata));
+
+    send_evm_contract_call(
+        registry_config.chain_id,
+        &registry_config.identity_registry,
+        &calldata_hex,
+        "0",
+    ).await?;
+
+    // Update local cache
+    ERC8004_STATE.with(|s| {
+        let mut state = s.borrow_mut();
+        if state.registered_agent_id == Some(agent_id) {
+            state.local_metadata.insert(key, value);
+        }
+    });
+
+    Ok(())
+}
+
+// ========== ERC-8004 Reputation Registry Functions ==========
+
+/// Give feedback to an agent
+/// Only admin can give feedback (as it uses the canister's EVM wallet)
+#[update]
+async fn erc8004_give_feedback(
+    agent_id: u64,
+    value: i64,
+    value_decimals: u8,
+    tag1: String,
+    tag2: String,
+    registry_id: String,
+    _comment: String, // Comment stored off-chain or in metadata
+) -> Result<(), String> {
+    let caller = ic_cdk::caller();
+
+    // Admin check - only admin can give feedback using canister's wallet
+    let is_admin = CONFIG.with(|c| {
+        c.borrow().as_ref().map(|cfg| cfg.admin == caller).unwrap_or(false)
+    });
+    if !is_admin {
+        return Err("Only admin can give feedback".to_string());
+    }
+
+    let registry_config = ERC8004_STATE.with(|s| {
+        s.borrow().registries.iter()
+            .find(|r| r.registry_id == registry_id || (registry_id.is_empty() && r.is_default))
+            .cloned()
+    }).ok_or("Registry not found")?;
+
+    // Encode giveFeedback(uint256,int256,uint8,bytes32,bytes32) call
+    let function_selector = {
+        use tiny_keccak::{Hasher, Keccak};
+        let mut hasher = Keccak::v256();
+        let mut output = [0u8; 32];
+        hasher.update(b"giveFeedback(uint256,int256,uint8,bytes32,bytes32)");
+        hasher.finalize(&mut output);
+        [output[0], output[1], output[2], output[3]]
+    };
+
+    let mut calldata = Vec::new();
+    calldata.extend_from_slice(&function_selector);
+
+    // agent_id (uint256)
+    let mut id_bytes = [0u8; 32];
+    let id_be = agent_id.to_be_bytes();
+    id_bytes[24..32].copy_from_slice(&id_be);
+    calldata.extend_from_slice(&id_bytes);
+
+    // value (int256) - handle negative values
+    let mut value_bytes = if value >= 0 {
+        [0u8; 32]
+    } else {
+        [0xffu8; 32] // Sign extension for negative
+    };
+    let value_be = value.to_be_bytes();
+    value_bytes[24..32].copy_from_slice(&value_be);
+    calldata.extend_from_slice(&value_bytes);
+
+    // value_decimals (uint8)
+    let mut decimals_bytes = [0u8; 32];
+    decimals_bytes[31] = value_decimals;
+    calldata.extend_from_slice(&decimals_bytes);
+
+    // tag1 (bytes32)
+    let mut tag1_bytes = [0u8; 32];
+    let tag1_slice = tag1.as_bytes();
+    let tag1_len = std::cmp::min(tag1_slice.len(), 32);
+    tag1_bytes[..tag1_len].copy_from_slice(&tag1_slice[..tag1_len]);
+    calldata.extend_from_slice(&tag1_bytes);
+
+    // tag2 (bytes32)
+    let mut tag2_bytes = [0u8; 32];
+    let tag2_slice = tag2.as_bytes();
+    let tag2_len = std::cmp::min(tag2_slice.len(), 32);
+    tag2_bytes[..tag2_len].copy_from_slice(&tag2_slice[..tag2_len]);
+    calldata.extend_from_slice(&tag2_bytes);
+
+    let calldata_hex = format!("0x{}", hex::encode(&calldata));
+
+    send_evm_contract_call(
+        registry_config.chain_id,
+        &registry_config.reputation_registry,
+        &calldata_hex,
+        "0",
+    ).await?;
+
+    Ok(())
+}
+
+/// Revoke previously given feedback
+/// Only admin can revoke feedback given by this canister's EVM wallet
+#[update]
+async fn erc8004_revoke_feedback(agent_id: u64, feedback_index: u64) -> Result<(), String> {
+    let caller = ic_cdk::caller();
+
+    // Admin check - only admin can revoke feedback
+    let is_admin = CONFIG.with(|c| {
+        c.borrow().as_ref().map(|cfg| cfg.admin == caller).unwrap_or(false)
+    });
+    if !is_admin {
+        return Err("Only admin can revoke feedback".to_string());
+    }
+
+    let registry_config = ERC8004_STATE.with(|s| {
+        s.borrow().registries.iter()
+            .find(|r| r.is_default)
+            .cloned()
+    }).ok_or("No default registry configured")?;
+
+    // Encode revokeFeedback(uint256,uint256)
+    let function_selector = {
+        use tiny_keccak::{Hasher, Keccak};
+        let mut hasher = Keccak::v256();
+        let mut output = [0u8; 32];
+        hasher.update(b"revokeFeedback(uint256,uint256)");
+        hasher.finalize(&mut output);
+        [output[0], output[1], output[2], output[3]]
+    };
+
+    let mut calldata = Vec::new();
+    calldata.extend_from_slice(&function_selector);
+
+    // agent_id
+    let mut id_bytes = [0u8; 32];
+    let id_be = agent_id.to_be_bytes();
+    id_bytes[24..32].copy_from_slice(&id_be);
+    calldata.extend_from_slice(&id_bytes);
+
+    // feedback_index
+    let mut index_bytes = [0u8; 32];
+    let index_be = feedback_index.to_be_bytes();
+    index_bytes[24..32].copy_from_slice(&index_be);
+    calldata.extend_from_slice(&index_bytes);
+
+    let calldata_hex = format!("0x{}", hex::encode(&calldata));
+
+    send_evm_contract_call(
+        registry_config.chain_id,
+        &registry_config.reputation_registry,
+        &calldata_hex,
+        "0",
+    ).await?;
+
+    Ok(())
+}
+
+/// Get reputation summary for an agent
+#[update]
+async fn erc8004_get_reputation_summary(
+    agent_id: u64,
+    tag1: String,
+    tag2: String,
+) -> Result<Erc8004ReputationSummary, String> {
+    let registry_config = ERC8004_STATE.with(|s| {
+        s.borrow().registries.iter()
+            .find(|r| r.is_default)
+            .cloned()
+    }).ok_or("No default registry configured")?;
+
+    // Encode getReputationSummary(uint256,bytes32,bytes32)
+    let function_selector = {
+        use tiny_keccak::{Hasher, Keccak};
+        let mut hasher = Keccak::v256();
+        let mut output = [0u8; 32];
+        hasher.update(b"getReputationSummary(uint256,bytes32,bytes32)");
+        hasher.finalize(&mut output);
+        [output[0], output[1], output[2], output[3]]
+    };
+
+    let mut calldata = Vec::new();
+    calldata.extend_from_slice(&function_selector);
+
+    // agent_id
+    let mut id_bytes = [0u8; 32];
+    let id_be = agent_id.to_be_bytes();
+    id_bytes[24..32].copy_from_slice(&id_be);
+    calldata.extend_from_slice(&id_bytes);
+
+    // tag1 (bytes32)
+    let mut tag1_bytes = [0u8; 32];
+    let tag1_slice = tag1.as_bytes();
+    let tag1_len = std::cmp::min(tag1_slice.len(), 32);
+    tag1_bytes[..tag1_len].copy_from_slice(&tag1_slice[..tag1_len]);
+    calldata.extend_from_slice(&tag1_bytes);
+
+    // tag2 (bytes32)
+    let mut tag2_bytes = [0u8; 32];
+    let tag2_slice = tag2.as_bytes();
+    let tag2_len = std::cmp::min(tag2_slice.len(), 32);
+    tag2_bytes[..tag2_len].copy_from_slice(&tag2_slice[..tag2_len]);
+    calldata.extend_from_slice(&tag2_bytes);
+
+    let calldata_hex = format!("0x{}", hex::encode(&calldata));
+
+    let result = evm_eth_call(
+        registry_config.chain_id,
+        &registry_config.reputation_registry,
+        &calldata_hex,
+    ).await?;
+
+    // Parse result (simplified)
+    let result_bytes = hex::decode(result.trim_start_matches("0x"))
+        .map_err(|e| format!("Failed to decode result: {}", e))?;
+
+    // Extract count and summary_value from result
+    // Returns (uint256 count, int256 summaryValue, uint8 summaryValueDecimals)
+    let count = if result_bytes.len() >= 32 {
+        u64::from_be_bytes([
+            result_bytes[24], result_bytes[25], result_bytes[26], result_bytes[27],
+            result_bytes[28], result_bytes[29], result_bytes[30], result_bytes[31]
+        ])
+    } else { 0 };
+
+    let summary_value = if result_bytes.len() >= 64 {
+        i64::from_be_bytes([
+            result_bytes[56], result_bytes[57], result_bytes[58], result_bytes[59],
+            result_bytes[60], result_bytes[61], result_bytes[62], result_bytes[63]
+        ])
+    } else { 0 };
+
+    let summary_value_decimals = if result_bytes.len() >= 96 {
+        result_bytes[95]
+    } else { 0 };
+
+    Ok(Erc8004ReputationSummary {
+        agent_id,
+        count,
+        summary_value,
+        summary_value_decimals,
+        tag1,
+        tag2,
+    })
+}
+
+/// Read specific feedback entry
+#[update]
+async fn erc8004_read_feedback(
+    agent_id: u64,
+    client_address: String,
+    feedback_index: u64,
+) -> Result<Erc8004Feedback, String> {
+    let registry_config = ERC8004_STATE.with(|s| {
+        s.borrow().registries.iter()
+            .find(|r| r.is_default)
+            .cloned()
+    }).ok_or("No default registry configured")?;
+
+    // Encode readFeedback(uint256,address,uint256)
+    let function_selector = {
+        use tiny_keccak::{Hasher, Keccak};
+        let mut hasher = Keccak::v256();
+        let mut output = [0u8; 32];
+        hasher.update(b"readFeedback(uint256,address,uint256)");
+        hasher.finalize(&mut output);
+        [output[0], output[1], output[2], output[3]]
+    };
+
+    let mut calldata = Vec::new();
+    calldata.extend_from_slice(&function_selector);
+
+    // agent_id
+    let mut id_bytes = [0u8; 32];
+    let id_be = agent_id.to_be_bytes();
+    id_bytes[24..32].copy_from_slice(&id_be);
+    calldata.extend_from_slice(&id_bytes);
+
+    // client_address (address - 20 bytes, left-padded to 32)
+    let mut addr_bytes = [0u8; 32];
+    let addr_hex = client_address.trim_start_matches("0x");
+    if let Ok(addr) = hex::decode(addr_hex) {
+        if addr.len() == 20 {
+            addr_bytes[12..32].copy_from_slice(&addr);
+        }
+    }
+    calldata.extend_from_slice(&addr_bytes);
+
+    // feedback_index
+    let mut index_bytes = [0u8; 32];
+    let index_be = feedback_index.to_be_bytes();
+    index_bytes[24..32].copy_from_slice(&index_be);
+    calldata.extend_from_slice(&index_bytes);
+
+    let calldata_hex = format!("0x{}", hex::encode(&calldata));
+
+    let result = evm_eth_call(
+        registry_config.chain_id,
+        &registry_config.reputation_registry,
+        &calldata_hex,
+    ).await?;
+
+    // Parse result (simplified - assumes (int256 value, uint8 decimals, bytes32 tag1, bytes32 tag2, bool revoked))
+    let result_bytes = hex::decode(result.trim_start_matches("0x"))
+        .map_err(|e| format!("Failed to decode result: {}", e))?;
+
+    let value = if result_bytes.len() >= 32 {
+        i64::from_be_bytes([
+            result_bytes[24], result_bytes[25], result_bytes[26], result_bytes[27],
+            result_bytes[28], result_bytes[29], result_bytes[30], result_bytes[31]
+        ])
+    } else { 0 };
+
+    let value_decimals = if result_bytes.len() >= 64 {
+        result_bytes[63]
+    } else { 0 };
+
+    let tag1 = if result_bytes.len() >= 96 {
+        String::from_utf8_lossy(&result_bytes[64..96]).trim_end_matches('\0').to_string()
+    } else { String::new() };
+
+    let tag2 = if result_bytes.len() >= 128 {
+        String::from_utf8_lossy(&result_bytes[96..128]).trim_end_matches('\0').to_string()
+    } else { String::new() };
+
+    let is_revoked = if result_bytes.len() >= 160 {
+        result_bytes[159] != 0
+    } else { false };
+
+    Ok(Erc8004Feedback {
+        client_address,
+        feedback_index,
+        value,
+        value_decimals,
+        tag1,
+        tag2,
+        is_revoked,
+    })
+}
+
+// ========== ERC-8004 Validation Registry Functions ==========
+
+/// Request validation for an agent
+/// Only admin can request validations using this canister's EVM wallet
+#[update]
+async fn erc8004_request_validation(
+    validator_address: String,
+    agent_id: u64,
+    tag: String,
+) -> Result<String, String> {
+    let caller = ic_cdk::caller();
+
+    // Admin check - only admin can request validations
+    let is_admin = CONFIG.with(|c| {
+        c.borrow().as_ref().map(|cfg| cfg.admin == caller).unwrap_or(false)
+    });
+    if !is_admin {
+        return Err("Only admin can request validations".to_string());
+    }
+
+    let registry_config = ERC8004_STATE.with(|s| {
+        s.borrow().registries.iter()
+            .find(|r| r.is_default)
+            .cloned()
+    }).ok_or("No default registry configured")?;
+
+    // Encode requestValidation(address,uint256,bytes32)
+    let function_selector = {
+        use tiny_keccak::{Hasher, Keccak};
+        let mut hasher = Keccak::v256();
+        let mut output = [0u8; 32];
+        hasher.update(b"requestValidation(address,uint256,bytes32)");
+        hasher.finalize(&mut output);
+        [output[0], output[1], output[2], output[3]]
+    };
+
+    let mut calldata = Vec::new();
+    calldata.extend_from_slice(&function_selector);
+
+    // validator_address
+    let mut addr_bytes = [0u8; 32];
+    let addr_hex = validator_address.trim_start_matches("0x");
+    if let Ok(addr) = hex::decode(addr_hex) {
+        if addr.len() == 20 {
+            addr_bytes[12..32].copy_from_slice(&addr);
+        }
+    }
+    calldata.extend_from_slice(&addr_bytes);
+
+    // agent_id
+    let mut id_bytes = [0u8; 32];
+    let id_be = agent_id.to_be_bytes();
+    id_bytes[24..32].copy_from_slice(&id_be);
+    calldata.extend_from_slice(&id_bytes);
+
+    // tag (bytes32)
+    let mut tag_bytes = [0u8; 32];
+    let tag_slice = tag.as_bytes();
+    let tag_len = std::cmp::min(tag_slice.len(), 32);
+    tag_bytes[..tag_len].copy_from_slice(&tag_slice[..tag_len]);
+    calldata.extend_from_slice(&tag_bytes);
+
+    let calldata_hex = format!("0x{}", hex::encode(&calldata));
+
+    let _tx_hash = send_evm_contract_call(
+        registry_config.chain_id,
+        &registry_config.validation_registry,
+        &calldata_hex,
+        "0",
+    ).await?;
+
+    // Generate request hash (simplified - actual hash comes from event)
+    let request_hash = {
+        use tiny_keccak::{Hasher, Keccak};
+        let mut hasher = Keccak::v256();
+        let mut output = [0u8; 32];
+        hasher.update(validator_address.as_bytes());
+        hasher.update(&agent_id.to_be_bytes());
+        hasher.update(tag.as_bytes());
+        hasher.update(&ic_cdk::api::time().to_be_bytes());
+        hasher.finalize(&mut output);
+        format!("0x{}", hex::encode(output))
+    };
+
+    // Store validation request
+    ERC8004_STATE.with(|s| {
+        let mut state = s.borrow_mut();
+        state.validation_requests.insert(request_hash.clone(), Erc8004ValidationStatus {
+            request_hash: request_hash.clone(),
+            validator_address: validator_address.clone(),
+            agent_id,
+            response: 0, // Pending
+            response_hash: String::new(),
+            tag: tag.clone(),
+            last_update: ic_cdk::api::time(),
+        });
+    });
+
+    Ok(request_hash)
+}
+
+/// Respond to a validation request (for validators)
+/// Only admin can respond to validations using this canister's EVM wallet
+#[update]
+async fn erc8004_respond_validation(
+    request_hash: String,
+    response: u8,
+    response_hash: String,
+    tag: String,
+) -> Result<(), String> {
+    let caller = ic_cdk::caller();
+
+    // Admin check - only admin can respond to validations
+    let is_admin = CONFIG.with(|c| {
+        c.borrow().as_ref().map(|cfg| cfg.admin == caller).unwrap_or(false)
+    });
+    if !is_admin {
+        return Err("Only admin can respond to validations".to_string());
+    }
+
+    let registry_config = ERC8004_STATE.with(|s| {
+        s.borrow().registries.iter()
+            .find(|r| r.is_default)
+            .cloned()
+    }).ok_or("No default registry configured")?;
+
+    // Encode respondValidation(bytes32,uint8,bytes32,bytes32)
+    let function_selector = {
+        use tiny_keccak::{Hasher, Keccak};
+        let mut hasher = Keccak::v256();
+        let mut output = [0u8; 32];
+        hasher.update(b"respondValidation(bytes32,uint8,bytes32,bytes32)");
+        hasher.finalize(&mut output);
+        [output[0], output[1], output[2], output[3]]
+    };
+
+    let mut calldata = Vec::new();
+    calldata.extend_from_slice(&function_selector);
+
+    // request_hash (bytes32)
+    let hash_bytes = hex::decode(request_hash.trim_start_matches("0x"))
+        .map_err(|e| format!("Invalid request hash: {}", e))?;
+    let mut hash_padded = [0u8; 32];
+    let len = std::cmp::min(hash_bytes.len(), 32);
+    hash_padded[32-len..].copy_from_slice(&hash_bytes[..len]);
+    calldata.extend_from_slice(&hash_padded);
+
+    // response (uint8)
+    let mut response_bytes = [0u8; 32];
+    response_bytes[31] = response;
+    calldata.extend_from_slice(&response_bytes);
+
+    // response_hash (bytes32)
+    let resp_hash_bytes = hex::decode(response_hash.trim_start_matches("0x"))
+        .unwrap_or_default();
+    let mut resp_hash_padded = [0u8; 32];
+    let len = std::cmp::min(resp_hash_bytes.len(), 32);
+    resp_hash_padded[32-len..].copy_from_slice(&resp_hash_bytes[..len]);
+    calldata.extend_from_slice(&resp_hash_padded);
+
+    // tag (bytes32)
+    let mut tag_bytes = [0u8; 32];
+    let tag_slice = tag.as_bytes();
+    let tag_len = std::cmp::min(tag_slice.len(), 32);
+    tag_bytes[..tag_len].copy_from_slice(&tag_slice[..tag_len]);
+    calldata.extend_from_slice(&tag_bytes);
+
+    let calldata_hex = format!("0x{}", hex::encode(&calldata));
+
+    send_evm_contract_call(
+        registry_config.chain_id,
+        &registry_config.validation_registry,
+        &calldata_hex,
+        "0",
+    ).await?;
+
+    // Update local state
+    ERC8004_STATE.with(|s| {
+        let mut state = s.borrow_mut();
+        if let Some(status) = state.validation_requests.get_mut(&request_hash) {
+            status.response = response;
+            status.response_hash = response_hash;
+            status.last_update = ic_cdk::api::time();
+        }
+    });
+
+    Ok(())
+}
+
+/// Get validation status
+#[update]
+async fn erc8004_get_validation_status(request_hash: String) -> Result<Erc8004ValidationStatus, String> {
+    // Check local cache first
+    let cached = ERC8004_STATE.with(|s| {
+        s.borrow().validation_requests.get(&request_hash).cloned()
+    });
+
+    if let Some(status) = cached {
+        return Ok(status);
+    }
+
+    let registry_config = ERC8004_STATE.with(|s| {
+        s.borrow().registries.iter()
+            .find(|r| r.is_default)
+            .cloned()
+    }).ok_or("No default registry configured")?;
+
+    // Encode getValidationStatus(bytes32)
+    let function_selector = {
+        use tiny_keccak::{Hasher, Keccak};
+        let mut hasher = Keccak::v256();
+        let mut output = [0u8; 32];
+        hasher.update(b"getValidationStatus(bytes32)");
+        hasher.finalize(&mut output);
+        [output[0], output[1], output[2], output[3]]
+    };
+
+    let mut calldata = Vec::new();
+    calldata.extend_from_slice(&function_selector);
+
+    // request_hash
+    let hash_bytes = hex::decode(request_hash.trim_start_matches("0x"))
+        .map_err(|e| format!("Invalid request hash: {}", e))?;
+    let mut hash_padded = [0u8; 32];
+    let len = std::cmp::min(hash_bytes.len(), 32);
+    hash_padded[32-len..].copy_from_slice(&hash_bytes[..len]);
+    calldata.extend_from_slice(&hash_padded);
+
+    let calldata_hex = format!("0x{}", hex::encode(&calldata));
+
+    let result = evm_eth_call(
+        registry_config.chain_id,
+        &registry_config.validation_registry,
+        &calldata_hex,
+    ).await?;
+
+    // Parse result (simplified)
+    let result_bytes = hex::decode(result.trim_start_matches("0x"))
+        .map_err(|e| format!("Failed to decode result: {}", e))?;
+
+    // Extract fields from result
+    let validator_address = if result_bytes.len() >= 32 {
+        format!("0x{}", hex::encode(&result_bytes[12..32]))
+    } else { String::new() };
+
+    let agent_id = if result_bytes.len() >= 64 {
+        u64::from_be_bytes([
+            result_bytes[56], result_bytes[57], result_bytes[58], result_bytes[59],
+            result_bytes[60], result_bytes[61], result_bytes[62], result_bytes[63]
+        ])
+    } else { 0 };
+
+    let response = if result_bytes.len() >= 96 {
+        result_bytes[95]
+    } else { 0 };
+
+    let response_hash_val = if result_bytes.len() >= 128 {
+        format!("0x{}", hex::encode(&result_bytes[96..128]))
+    } else { String::new() };
+
+    let tag = if result_bytes.len() >= 160 {
+        String::from_utf8_lossy(&result_bytes[128..160]).trim_end_matches('\0').to_string()
+    } else { String::new() };
+
+    let last_update = if result_bytes.len() >= 192 {
+        u64::from_be_bytes([
+            result_bytes[184], result_bytes[185], result_bytes[186], result_bytes[187],
+            result_bytes[188], result_bytes[189], result_bytes[190], result_bytes[191]
+        ])
+    } else { 0 };
+
+    let status = Erc8004ValidationStatus {
+        request_hash: request_hash.clone(),
+        validator_address,
+        agent_id,
+        response,
+        response_hash: response_hash_val,
+        tag,
+        last_update,
+    };
+
+    // Cache the result
+    ERC8004_STATE.with(|s| {
+        s.borrow_mut().validation_requests.insert(request_hash, status.clone());
+    });
+
+    Ok(status)
+}
+
+/// Helper function for EVM eth_call (read-only calls)
+async fn evm_eth_call(
+    chain_id: u64,
+    to: &str,
+    data: &str,
+) -> Result<String, String> {
+    let chain_config = EVM_WALLET_STATE.with(|s| {
+        s.borrow().configured_chains.iter()
+            .find(|c| c.chain_id == chain_id)
+            .cloned()
+    }).ok_or(format!("Chain {} not configured", chain_id))?;
+
+    let from = EVM_WALLET_STATE.with(|s| s.borrow().cached_address.clone())
+        .unwrap_or_else(|| "0x0000000000000000000000000000000000000000".to_string());
+
+    // Build JSON-RPC request for eth_call
+    let request_body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "eth_call",
+        "params": [{
+            "from": from,
+            "to": to,
+            "data": data
+        }, "latest"],
+        "id": 1
+    }).to_string();
+
+    let request = CanisterHttpRequestArgument {
+        url: chain_config.rpc_url.clone(),
+        method: HttpMethod::POST,
+        headers: vec![
+            HttpHeader {
+                name: "Content-Type".to_string(),
+                value: "application/json".to_string(),
+            },
+        ],
+        body: Some(request_body.into_bytes()),
+        max_response_bytes: Some(10_000),
+        transform: Some(TransformContext {
+            function: TransformFunc(candid::Func {
+                principal: ic_cdk::id(),
+                method: "transform_evm_response".to_string(),
+            }),
+            context: vec![],
+        }),
+    };
+
+    let cycles: u128 = 50_000_000_000;
+
+    match http_request(request, cycles).await {
+        Ok((response,)) => {
+            if response.status != 200u64 {
+                return Err(format!("HTTP error: {}", response.status));
+            }
+
+            let body = String::from_utf8(response.body)
+                .map_err(|e| format!("Invalid response body: {}", e))?;
+
+            let json: serde_json::Value = serde_json::from_str(&body)
+                .map_err(|e| format!("Failed to parse JSON: {}", e))?;
+
+            if let Some(error) = json.get("error") {
+                return Err(format!("RPC error: {}", error));
+            }
+
+            json.get("result")
+                .and_then(|r| r.as_str())
+                .map(|s| s.to_string())
+                .ok_or_else(|| "No result in response".to_string())
+        }
+        Err((code, msg)) => Err(format!("HTTP request failed: {:?} - {}", code, msg))
+    }
 }
 
 // Candid export
