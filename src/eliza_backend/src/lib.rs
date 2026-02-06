@@ -385,6 +385,151 @@ pub struct Erc8004State {
     pub validation_requests: HashMap<String, Erc8004ValidationStatus>, // Pending validations
 }
 
+// ========== Governance Integration Data Structures ==========
+
+/// Chain type for whitelist entries
+#[derive(CandidType, Deserialize, Serialize, Clone, Debug, PartialEq)]
+pub enum ChainType {
+    ICP,
+    EVM { chain_id: u64 },
+    Solana { network: String },
+}
+
+/// Whitelist entry for approved withdrawal addresses
+#[derive(CandidType, Deserialize, Serialize, Clone, Debug)]
+pub struct WhitelistEntry {
+    pub id: u64,
+    pub address: String,
+    pub chain: ChainType,
+    pub label: Option<String>,
+    pub added_at: u64,
+    pub added_by: Principal,
+}
+
+/// Command types for execution tracking
+#[derive(CandidType, Deserialize, Serialize, Clone, Debug)]
+pub enum CommandType {
+    SendIcp,
+    SendEvmNative,
+    SendErc20,
+    ExecuteLifiBridge,
+    ExecuteUniswapSwap,
+    SendSolana,
+    SendSplToken,
+    ExecuteJupiterSwap,
+}
+
+/// Execution status (success or failure)
+#[derive(CandidType, Deserialize, Serialize, Clone, Debug)]
+pub enum ExecutionStatus {
+    Success,
+    Failed(String),
+}
+
+/// Execution record for audit trail
+#[derive(CandidType, Deserialize, Serialize, Clone, Debug)]
+pub struct ExecutionRecord {
+    pub id: u64,
+    pub command_type: CommandType,
+    pub timestamp: u64,
+    pub caller: Principal,
+    pub status: ExecutionStatus,
+    pub tx_hash: Option<String>,
+    pub params_json: String,
+    pub result: Option<String>,
+}
+
+/// Command parameters enum for execute_command dispatcher
+#[derive(CandidType, Deserialize, Serialize, Clone, Debug)]
+#[serde(tag = "command", content = "params")]
+pub enum CommandParams {
+    SendIcp {
+        to_address: String,
+        amount_e8s: u64,
+        memo: Option<u64>,
+    },
+    SendEvmNative {
+        chain_id: u64,
+        to_address: String,
+        amount_wei: String,
+    },
+    SendErc20 {
+        chain_id: u64,
+        token_address: String,
+        to_address: String,
+        amount: String,
+    },
+    ExecuteLifiBridge {
+        from_chain_id: u64,
+        to_chain_id: u64,
+        from_token: String,
+        to_token: String,
+        from_amount: String,
+    },
+    ExecuteUniswapSwap {
+        chain_id: u64,
+        token_in: String,
+        token_out: String,
+        amount_in: String,
+        min_amount_out: String,
+        fee: Option<u32>,
+    },
+    SendSolana {
+        network_name: String,
+        to_address: String,
+        amount_lamports: u64,
+    },
+    SendSplToken {
+        network_name: String,
+        token_mint: String,
+        to_address: String,
+        amount: u64,
+    },
+    ExecuteJupiterSwap {
+        network_name: String,
+        input_mint: String,
+        output_mint: String,
+        amount: u64,
+        slippage_bps: Option<u64>,
+    },
+}
+
+/// Governance state for whitelist and execution history
+#[derive(CandidType, Deserialize, Serialize, Clone, Debug, Default)]
+pub struct GovernanceState {
+    pub whitelist: Vec<WhitelistEntry>,
+    pub whitelist_counter: u64,
+    pub execution_history: Vec<ExecutionRecord>,
+    pub execution_counter: u64,
+    pub whitelist_enabled: bool,
+}
+
+/// EVM chain balance information
+#[derive(CandidType, Deserialize, Serialize, Clone, Debug)]
+pub struct EvmChainBalance {
+    pub chain_id: u64,
+    pub chain_name: String,
+    pub balance_wei: String,
+    pub address: String,
+}
+
+/// Solana network balance information
+#[derive(CandidType, Deserialize, Serialize, Clone, Debug)]
+pub struct SolanaNetworkBalance {
+    pub network_name: String,
+    pub balance_lamports: u64,
+    pub address: String,
+}
+
+/// Platform status overview (ICP, Cycles, EVM, Solana balances)
+#[derive(CandidType, Deserialize, Serialize, Clone, Debug)]
+pub struct PlatformStatus {
+    pub icp_balance: u64,
+    pub cycles_balance: u128,
+    pub evm_balances: Vec<EvmChainBalance>,
+    pub solana_balances: Vec<SolanaNetworkBalance>,
+}
+
 // ========== State Management ==========
 
 thread_local! {
@@ -440,6 +585,15 @@ thread_local! {
         feedback_cache: Vec::new(),
         validation_requests: HashMap::new(),
     });
+
+    // Governance State (Whitelist & Execution History)
+    static GOVERNANCE_STATE: RefCell<GovernanceState> = RefCell::new(GovernanceState {
+        whitelist: Vec::new(),
+        whitelist_counter: 0,
+        execution_history: Vec::new(),
+        execution_counter: 0,
+        whitelist_enabled: false,
+    });
 }
 
 // ========== Stable Memory for Upgrades ==========
@@ -468,6 +622,9 @@ struct StableState {
 
     // ERC-8004 state
     erc8004_state: Erc8004State,
+
+    // Governance state
+    governance_state: GovernanceState,
 }
 
 impl Default for WalletState {
@@ -531,8 +688,8 @@ fn init() {
 
     CONFIG.with(|cfg| {
         *cfg.borrow_mut() = Some(Config {
-            // Default to Fallback for local dev; change to OnChain for mainnet
-            llm_provider: LlmProvider::Fallback,
+            // Use IC LLM Canister (Llama 3.1 8B) for mainnet
+            llm_provider: LlmProvider::OnChain,
             max_conversation_length: 50,
             admin: caller,
         });
@@ -557,6 +714,7 @@ fn pre_upgrade() {
         evm_wallet_state: EVM_WALLET_STATE.with(|w| w.borrow().clone()),
         solana_wallet_state: SOLANA_WALLET_STATE.with(|w| w.borrow().clone()),
         erc8004_state: ERC8004_STATE.with(|s| s.borrow().clone()),
+        governance_state: GOVERNANCE_STATE.with(|gs| gs.borrow().clone()),
     };
 
     // Serialize to stable memory
@@ -614,8 +772,16 @@ fn post_upgrade() {
                 EVM_WALLET_STATE.with(|w| *w.borrow_mut() = state.evm_wallet_state);
                 SOLANA_WALLET_STATE.with(|w| *w.borrow_mut() = state.solana_wallet_state);
                 ERC8004_STATE.with(|s| *s.borrow_mut() = state.erc8004_state);
+                GOVERNANCE_STATE.with(|gs| *gs.borrow_mut() = state.governance_state);
 
-                ic_cdk::println!("State restored from stable memory successfully");
+                // Force LLM provider to OnChain for mainnet
+                CONFIG.with(|c| {
+                    if let Some(ref mut cfg) = *c.borrow_mut() {
+                        cfg.llm_provider = LlmProvider::OnChain;
+                    }
+                });
+
+                ic_cdk::println!("State restored from stable memory successfully (LLM: OnChain)");
                 return;
             }
         }
@@ -631,7 +797,7 @@ fn post_upgrade() {
     CONFIG.with(|cfg| {
         if cfg.borrow().is_none() {
             *cfg.borrow_mut() = Some(Config {
-                llm_provider: LlmProvider::Fallback,
+                llm_provider: LlmProvider::OnChain,
                 max_conversation_length: 50,
                 admin: ic_cdk::caller(),
             });
@@ -967,6 +1133,21 @@ fn set_llm_provider(provider: LlmProvider) -> Result<(), String> {
 #[query]
 fn get_config() -> Option<Config> {
     CONFIG.with(|cfg| cfg.borrow().clone())
+}
+
+/// Transfer admin rights to a new principal
+#[update]
+fn set_admin(new_admin: Principal) -> Result<(), String> {
+    require_admin()?;
+
+    CONFIG.with(|cfg| {
+        if let Some(config) = cfg.borrow_mut().as_mut() {
+            config.admin = new_admin;
+            Ok(())
+        } else {
+            Err("Config not initialized".to_string())
+        }
+    })
 }
 
 // ========== Conversation Management ==========
@@ -7050,6 +7231,377 @@ async fn evm_eth_call(
         }
         Err((code, msg)) => Err(format!("HTTP request failed: {:?} - {}", code, msg))
     }
+}
+
+// ========== GOVERNANCE INTEGRATION ==========
+
+// Maximum number of execution history records to retain
+const MAX_EXECUTION_HISTORY: usize = 10_000;
+
+/// Helper function to normalize EVM addresses (lowercase for case-insensitive comparison)
+fn normalize_evm_address(address: &str) -> String {
+    address.to_lowercase()
+}
+
+/// Helper function to validate address format based on chain type
+fn validate_address_format(address: &str, chain: &ChainType) -> Result<(), String> {
+    match chain {
+        ChainType::ICP => {
+            // ICP address validation (64 hex characters)
+            if address.len() != 64 {
+                return Err("ICP address must be 64 hex characters".to_string());
+            }
+            if !address.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err("ICP address must be valid hex".to_string());
+            }
+        },
+        ChainType::EVM { .. } => {
+            // EVM address validation (0x + 40 hex chars)
+            if !address.starts_with("0x") || address.len() != 42 {
+                return Err("EVM address must be in format 0x + 40 hex characters".to_string());
+            }
+            if !address[2..].chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err("EVM address must contain valid hex characters".to_string());
+            }
+        },
+        ChainType::Solana { .. } => {
+            // Solana address validation (base58, typically 32-44 chars)
+            if address.len() < 32 || address.len() > 44 {
+                return Err("Solana address length invalid".to_string());
+            }
+            // Basic base58 check (no 0, O, I, l)
+            if address.chars().any(|c| c == '0' || c == 'O' || c == 'I' || c == 'l') {
+                return Err("Solana address contains invalid base58 characters".to_string());
+            }
+        },
+    }
+    Ok(())
+}
+
+/// Helper function to validate against whitelist
+fn validate_against_whitelist(command: &CommandParams) -> Result<(), String> {
+    let (address, chain) = match command {
+        CommandParams::SendIcp { to_address, .. } => {
+            (to_address.clone(), ChainType::ICP)
+        },
+        CommandParams::SendEvmNative { chain_id, to_address, .. } |
+        CommandParams::SendErc20 { chain_id, to_address, .. } => {
+            (to_address.clone(), ChainType::EVM { chain_id: *chain_id })
+        },
+        CommandParams::SendSolana { network_name, to_address, .. } |
+        CommandParams::SendSplToken { network_name, to_address, .. } => {
+            (to_address.clone(), ChainType::Solana { network: network_name.clone() })
+        },
+        // Bridge and swap operations don't have simple "to" addresses, skip whitelist check
+        _ => return Ok(()),
+    };
+
+    // Normalize address for comparison (EVM addresses are case-insensitive)
+    let normalized_address = match &chain {
+        ChainType::EVM { .. } => normalize_evm_address(&address),
+        _ => address.clone(),
+    };
+
+    GOVERNANCE_STATE.with(|gs| {
+        let state = gs.borrow();
+        let is_whitelisted = state.whitelist.iter().any(|entry| {
+            // Normalize whitelist entry address for comparison
+            let entry_address = match &entry.chain {
+                ChainType::EVM { .. } => normalize_evm_address(&entry.address),
+                _ => entry.address.clone(),
+            };
+            entry_address == normalized_address && entry.chain == chain
+        });
+
+        if is_whitelisted {
+            Ok(())
+        } else {
+            Err(format!("Address {} is not whitelisted for chain {:?}", address, chain))
+        }
+    })
+}
+
+/// Unified command execution - Admin only
+#[update]
+async fn execute_command(params_json: String) -> Result<String, String> {
+    // Admin check
+    require_admin()?;
+
+    // Parse JSON to CommandParams enum
+    let command: CommandParams = serde_json::from_str(&params_json)
+        .map_err(|e| format!("Failed to parse command JSON: {}. Expected format: {{\"command\": \"CommandName\", \"params\": {{...}}}}", e))?;
+
+    // If whitelist enabled, validate destination address
+    if GOVERNANCE_STATE.with(|gs| gs.borrow().whitelist_enabled) {
+        validate_against_whitelist(&command)?;
+    }
+
+    // Execute the command
+    let timestamp = ic_cdk::api::time();
+    let caller = ic_cdk::caller();
+    let command_type = match &command {
+        CommandParams::SendIcp { .. } => CommandType::SendIcp,
+        CommandParams::SendEvmNative { .. } => CommandType::SendEvmNative,
+        CommandParams::SendErc20 { .. } => CommandType::SendErc20,
+        CommandParams::ExecuteLifiBridge { .. } => CommandType::ExecuteLifiBridge,
+        CommandParams::ExecuteUniswapSwap { .. } => CommandType::ExecuteUniswapSwap,
+        CommandParams::SendSolana { .. } => CommandType::SendSolana,
+        CommandParams::SendSplToken { .. } => CommandType::SendSplToken,
+        CommandParams::ExecuteJupiterSwap { .. } => CommandType::ExecuteJupiterSwap,
+    };
+
+    let result = match command {
+        CommandParams::SendIcp { to_address, amount_e8s, memo } => {
+            send_icp(to_address, amount_e8s, memo).await.map(|block| block.to_string())
+        },
+        CommandParams::SendEvmNative { chain_id, to_address, amount_wei } => {
+            send_evm_native(chain_id, to_address, amount_wei).await
+        },
+        CommandParams::SendErc20 { chain_id, token_address, to_address, amount } => {
+            send_erc20(chain_id, token_address, to_address, amount).await
+        },
+        CommandParams::ExecuteLifiBridge { from_chain_id, to_chain_id, from_token, to_token, from_amount } => {
+            execute_lifi_bridge(from_chain_id, to_chain_id, from_token, to_token, from_amount).await
+        },
+        CommandParams::ExecuteUniswapSwap { chain_id, token_in, token_out, amount_in, min_amount_out, fee } => {
+            execute_uniswap_swap(chain_id, token_in, token_out, amount_in, min_amount_out, fee).await
+        },
+        CommandParams::SendSolana { network_name, to_address, amount_lamports } => {
+            send_solana(network_name, to_address, amount_lamports).await
+        },
+        CommandParams::SendSplToken { network_name, token_mint, to_address, amount } => {
+            send_spl_token(network_name, token_mint, to_address, amount).await
+        },
+        CommandParams::ExecuteJupiterSwap { network_name, input_mint, output_mint, amount, slippage_bps } => {
+            execute_jupiter_swap(network_name, input_mint, output_mint, amount, slippage_bps).await
+        },
+    };
+
+    // Record execution
+    let (status, tx_hash, result_str) = match &result {
+        Ok(res) => (ExecutionStatus::Success, Some(res.clone()), Some(res.clone())),
+        Err(err) => (ExecutionStatus::Failed(err.clone()), None, None),
+    };
+
+    let record = ExecutionRecord {
+        id: GOVERNANCE_STATE.with(|gs| {
+            let mut state = gs.borrow_mut();
+            state.execution_counter += 1;
+            state.execution_counter
+        }),
+        command_type,
+        timestamp,
+        caller,
+        status,
+        tx_hash,
+        params_json,
+        result: result_str,
+    };
+
+    GOVERNANCE_STATE.with(|gs| {
+        let mut state = gs.borrow_mut();
+        state.execution_history.push(record);
+
+        // Enforce maximum history size (delete oldest records if exceeded)
+        if state.execution_history.len() > MAX_EXECUTION_HISTORY {
+            state.execution_history.remove(0);
+        }
+    });
+
+    // Return result
+    result
+}
+
+/// Get canister cycles balance - Query
+#[query]
+fn get_cycles_balance() -> u128 {
+    ic_cdk::api::canister_balance128()
+}
+
+/// Get execution history - Query
+#[query]
+fn get_execution_history(limit: Option<u32>) -> Vec<ExecutionRecord> {
+    GOVERNANCE_STATE.with(|gs| {
+        let state = gs.borrow();
+        let limit = limit.unwrap_or(100).min(1000) as usize;
+
+        // Return most recent records first
+        let total = state.execution_history.len();
+        if total <= limit {
+            state.execution_history.clone()
+        } else {
+            state.execution_history[total - limit..].to_vec()
+        }
+    })
+}
+
+/// Add address to whitelist - Admin only
+#[update]
+fn add_whitelist_address(
+    address: String,
+    chain: ChainType,
+    label: Option<String>,
+) -> Result<u64, String> {
+    require_admin()?;
+
+    // Validate address format based on chain type
+    validate_address_format(&address, &chain)?;
+
+    // Normalize EVM addresses to lowercase for consistent storage
+    let normalized_address = match &chain {
+        ChainType::EVM { .. } => normalize_evm_address(&address),
+        _ => address.clone(),
+    };
+
+    GOVERNANCE_STATE.with(|gs| {
+        let mut state = gs.borrow_mut();
+
+        // Check for duplicates (case-insensitive for EVM)
+        let exists = state.whitelist.iter().any(|entry| {
+            let entry_address = match &entry.chain {
+                ChainType::EVM { .. } => normalize_evm_address(&entry.address),
+                _ => entry.address.clone(),
+            };
+            entry_address == normalized_address && entry.chain == chain
+        });
+
+        if exists {
+            return Err(format!("Address {} already whitelisted for chain {:?}", address, chain));
+        }
+
+        state.whitelist_counter += 1;
+        let entry_id = state.whitelist_counter;
+
+        let entry = WhitelistEntry {
+            id: entry_id,
+            address: normalized_address,
+            chain,
+            label,
+            added_at: ic_cdk::api::time(),
+            added_by: ic_cdk::caller(),
+        };
+
+        state.whitelist.push(entry);
+        Ok(entry_id)
+    })
+}
+
+/// Remove address from whitelist - Admin only
+#[update]
+fn remove_whitelist_address(entry_id: u64) -> Result<(), String> {
+    require_admin()?;
+
+    GOVERNANCE_STATE.with(|gs| {
+        let mut state = gs.borrow_mut();
+
+        let index = state.whitelist.iter().position(|entry| entry.id == entry_id)
+            .ok_or_else(|| format!("Whitelist entry {} not found", entry_id))?;
+
+        state.whitelist.remove(index);
+        Ok(())
+    })
+}
+
+/// Get all whitelist entries - Query
+#[query]
+fn get_whitelist() -> Vec<WhitelistEntry> {
+    GOVERNANCE_STATE.with(|gs| gs.borrow().whitelist.clone())
+}
+
+/// Enable or disable whitelist enforcement - Admin only
+#[update]
+fn set_whitelist_enabled(enabled: bool) -> Result<(), String> {
+    require_admin()?;
+
+    GOVERNANCE_STATE.with(|gs| {
+        gs.borrow_mut().whitelist_enabled = enabled;
+    });
+
+    Ok(())
+}
+
+/// Get whitelist status (enabled, count) - Query
+#[query]
+fn get_whitelist_status() -> (bool, u64) {
+    GOVERNANCE_STATE.with(|gs| {
+        let state = gs.borrow();
+        (state.whitelist_enabled, state.whitelist.len() as u64)
+    })
+}
+
+// ========== PLATFORM STATUS ==========
+
+/// Get platform status (ICP balance, Cycles balance, EVM balances, Solana balances)
+#[update]
+async fn get_platform_status() -> Result<PlatformStatus, String> {
+    // Get ICP balance
+    let icp_balance = match check_icp_balance().await {
+        Ok(balance) => balance,
+        Err(_) => 0, // Return 0 if error (wallet not initialized, etc.)
+    };
+
+    // Get Cycles balance (always available)
+    let cycles_balance = ic_cdk::api::canister_balance128();
+
+    // Get configured EVM chains
+    let configured_chains = get_configured_chains();
+
+    // Get EVM address (if available)
+    let evm_address_result = get_evm_address().await;
+
+    // Get balances for all configured EVM chains
+    let mut evm_balances = Vec::new();
+    if let Ok(evm_address) = evm_address_result {
+        for chain in configured_chains {
+            match get_evm_balance(chain.chain_id).await {
+                Ok(balance) => {
+                    evm_balances.push(EvmChainBalance {
+                        chain_id: chain.chain_id,
+                        chain_name: chain.chain_name,
+                        balance_wei: balance,
+                        address: evm_address.clone(),
+                    });
+                },
+                Err(_) => {
+                    // Skip chains with errors (RPC issues, etc.)
+                    continue;
+                }
+            }
+        }
+    }
+
+    // Get configured Solana networks
+    let solana_networks = get_solana_networks();
+
+    // Get Solana address (if available)
+    let solana_address_result = get_solana_address();
+
+    // Get balances for all configured Solana networks
+    let mut solana_balances = Vec::new();
+    if let Ok(solana_address) = solana_address_result {
+        for network in solana_networks {
+            match get_solana_balance(network.network_name.clone()).await {
+                Ok(balance) => {
+                    solana_balances.push(SolanaNetworkBalance {
+                        network_name: network.network_name,
+                        balance_lamports: balance,
+                        address: solana_address.clone(),
+                    });
+                },
+                Err(_) => {
+                    // Skip networks with errors (RPC issues, etc.)
+                    continue;
+                }
+            }
+        }
+    }
+
+    Ok(PlatformStatus {
+        icp_balance,
+        cycles_balance,
+        evm_balances,
+        solana_balances,
+    })
 }
 
 // Candid export

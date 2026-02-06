@@ -27,6 +27,7 @@
 - **Cross-Chain DeFi**: Jupiter swap (Solana), Uniswap swap (EVM), LiFi bridge
 - **Portfolio Analysis**: Unified view of assets across all chains
 - **ERC-8004 Trustless Agents**: On-chain identity, reputation, and validation
+- **Governance Integration**: Unified command execution with whitelist, audit trails, and admin management
 - **elizaOS Framework**: Built on the leading open-source AI agent framework
 
 ## Architecture
@@ -1260,6 +1261,214 @@ dfx canister call eliza_backend erc8004_get_validation_status '("0xREQUEST_HASH"
 
 ---
 
+## Governance Integration
+
+Coo supports **governance integration** for external AI agents (like Dliza) to control wallet operations through a unified command interface with audit trails and optional whitelist protection.
+
+### Architecture
+
+```
+┌─────────────────┐                    ┌─────────────────┐
+│  Mac mini       │                    │  ICP Mainnet    │
+│                 │                    │                 │
+│  Dliza (AI)     │ ──execute_command─→│  Coo-ICP        │
+│  意思決定者      │    (dfx call)      │  実行者          │
+│                 │←─── 結果返却 ───────│                 │
+└─────────────────┘                    └─────────────────┘
+```
+
+### Unified Command Execution
+
+The `execute_command` function provides a single entry point for all wallet operations with type-safe JSON commands.
+
+#### Execute Command (Admin Only)
+
+```bash
+# Send ICP
+dfx canister call eliza_backend execute_command \
+  '("{\"command\":\"SendIcp\",\"params\":{\"to_address\":\"1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef\",\"amount_e8s\":100000000,\"memo\":null}}")' \
+  --network ic
+
+# Send ETH on Base
+dfx canister call eliza_backend execute_command \
+  '("{\"command\":\"SendEvmNative\",\"params\":{\"chain_id\":8453,\"to_address\":\"0x1234567890abcdef1234567890abcdef12345678\",\"amount_wei\":\"1000000000000000000\"}}")' \
+  --network ic
+
+# Execute Uniswap swap
+dfx canister call eliza_backend execute_command \
+  '("{\"command\":\"ExecuteUniswapSwap\",\"params\":{\"chain_id\":8453,\"token_in\":\"0x4200000000000000000000000000000000000006\",\"token_out\":\"0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913\",\"amount_in\":\"1000000000000000000\",\"min_amount_out\":\"1900000\",\"fee\":3000}}")' \
+  --network ic
+```
+
+#### Supported Commands
+
+| Command | Description | Parameters |
+|---------|-------------|------------|
+| `SendIcp` | Send ICP tokens | `to_address`, `amount_e8s`, `memo` |
+| `SendEvmNative` | Send native EVM tokens | `chain_id`, `to_address`, `amount_wei` |
+| `SendErc20` | Send ERC-20 tokens | `chain_id`, `token_address`, `to_address`, `amount` |
+| `SendSolana` | Send SOL | `network_name`, `to_address`, `amount_lamports` |
+| `SendSplToken` | Send SPL tokens | `network_name`, `token_mint`, `to_address`, `amount` |
+| `ExecuteUniswapSwap` | Uniswap V3 swap | `chain_id`, `token_in`, `token_out`, `amount_in`, `min_amount_out`, `fee` |
+| `ExecuteLifiBridge` | Cross-chain bridge | `from_chain_id`, `to_chain_id`, `from_token`, `to_token`, `from_amount` |
+| `ExecuteJupiterSwap` | Jupiter swap (Solana) | `network_name`, `input_mint`, `output_mint`, `amount`, `slippage_bps` |
+
+### Admin Management
+
+Transfer admin rights to another principal (e.g., Dliza).
+
+```bash
+# Transfer admin to another principal
+dfx canister call eliza_backend set_admin \
+  '(principal "aaaaa-bbbbb-ccccc-ddddd-eeeee-fffff-ggggg-hhhhh-iiiii-jjjjj-jae")' \
+  --network ic
+
+# Verify admin change
+dfx canister call eliza_backend get_config --network ic
+```
+
+> **Note:** You retain **Controller** rights for deployment and Cycles management even after transferring Admin rights.
+
+### Whitelist Management
+
+Restrict `execute_command` to approved addresses only.
+
+#### Add Whitelist Address (Admin Only)
+
+```bash
+# Add EVM address (case-insensitive)
+dfx canister call eliza_backend add_whitelist_address \
+  '("0x1234567890abcdef1234567890abcdef12345678", variant { EVM = record { chain_id = 8453 } }, opt "Treasury Wallet")' \
+  --network ic
+
+# Add ICP address
+dfx canister call eliza_backend add_whitelist_address \
+  '("abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890", variant { ICP }, opt "Cold Storage")' \
+  --network ic
+
+# Add Solana address
+dfx canister call eliza_backend add_whitelist_address \
+  '("ExampleSolanaAddress1234567890abcdefABCDEF", variant { Solana = record { network = "mainnet" } }, opt "Solana Wallet")' \
+  --network ic
+```
+
+#### Enable/Disable Whitelist (Admin Only)
+
+```bash
+# Enable whitelist enforcement
+dfx canister call eliza_backend set_whitelist_enabled '(true)' --network ic
+
+# Disable whitelist enforcement
+dfx canister call eliza_backend set_whitelist_enabled '(false)' --network ic
+
+# Check whitelist status
+dfx canister call eliza_backend get_whitelist_status --network ic
+# Returns: (true, 3)  <- (enabled, count)
+```
+
+#### View Whitelist
+
+```bash
+# Get all whitelist entries
+dfx canister call eliza_backend get_whitelist --network ic
+```
+
+#### Remove from Whitelist (Admin Only)
+
+```bash
+# Remove by entry ID
+dfx canister call eliza_backend remove_whitelist_address '(1: nat64)' --network ic
+```
+
+> **Important:** EVM addresses are case-insensitive. `0xAbC123...` and `0xabc123...` are treated as identical.
+
+### Execution History
+
+All `execute_command` calls are logged with full audit trail.
+
+```bash
+# Get last 100 executions (default)
+dfx canister call eliza_backend get_execution_history '(null)' --network ic
+
+# Get last 10 executions
+dfx canister call eliza_backend get_execution_history '(opt 10)' --network ic
+```
+
+**Execution Record:**
+```
+record {
+  id = 1;
+  command_type = variant { SendIcp };
+  timestamp = 1234567890000000000;
+  caller = principal "drtsd-u4ozp-...";
+  status = variant { Success };
+  tx_hash = opt "12345";
+  params_json = "{\"command\":\"SendIcp\",\"params\":{...}}";
+  result = opt "12345";
+}
+```
+
+> **Note:** History is limited to 10,000 records (oldest records auto-deleted).
+
+### Platform Status
+
+Get unified view of ICP, Cycles, and all chain balances.
+
+```bash
+# Get complete platform status
+dfx canister call eliza_backend get_platform_status --network ic
+
+# Returns:
+# record {
+#   icp_balance = 100000000;
+#   cycles_balance = 5000000000000;
+#   evm_balances = vec {
+#     record { chain_id = 8453; chain_name = "Base"; balance_wei = "1000000000000000000"; address = "0x38a..."; };
+#     record { chain_id = 137; chain_name = "Polygon"; balance_wei = "500000000000000000"; address = "0x38a..."; };
+#   };
+#   solana_balances = vec {
+#     record { network_name = "mainnet"; balance_lamports = 1000000000; address = "F6zG..."; };
+#   };
+# }
+```
+
+### Cycles Monitoring
+
+Check canister Cycles balance for maintenance.
+
+```bash
+# Get current Cycles balance
+dfx canister call eliza_backend get_cycles_balance --network ic
+# Returns: (5_000_000_000_000 : nat)
+```
+
+### Governance API Reference
+
+| Function | Access | Description |
+|----------|--------|-------------|
+| `execute_command` | Admin | Unified command execution (JSON) |
+| `set_admin` | Admin | Transfer admin rights |
+| `add_whitelist_address` | Admin | Add approved address |
+| `remove_whitelist_address` | Admin | Remove address from whitelist |
+| `get_whitelist` | Public | View all whitelist entries |
+| `set_whitelist_enabled` | Admin | Enable/disable whitelist |
+| `get_whitelist_status` | Public | Check whitelist status |
+| `get_execution_history` | Public | View command execution logs |
+| `get_platform_status` | Public | Get all balances (ICP, EVM, Solana) |
+| `get_cycles_balance` | Public | Check Cycles balance |
+
+### Governance Security
+
+- ✅ **Admin-only execution**: All write operations require admin authentication
+- ✅ **Type-safe JSON**: Commands validated with Rust enums + serde
+- ✅ **Complete audit trail**: Every execution logged (caller, timestamp, params, result)
+- ✅ **Optional whitelist**: Restrict destinations to approved addresses
+- ✅ **Address normalization**: EVM addresses case-insensitive (0xAbC == 0xabc)
+- ✅ **History limit**: Max 10,000 records to prevent memory bloat
+- ✅ **Persistent state**: All governance data survives canister upgrades
+
+---
+
 ## Tech Stack
 
 - **Backend**: Rust + ic-cdk + ic-llm
@@ -1272,6 +1481,7 @@ dfx canister call eliza_backend erc8004_get_validation_status '("0xREQUEST_HASH"
 - **Solana Wallet**: Ed25519 with on-chain key storage
 - **DeFi**: Jupiter (Solana), Uniswap V3 (EVM), LiFi (cross-chain)
 - **Agent Standard**: ERC-8004 Trustless Agents (Identity, Reputation, Validation)
+- **Governance**: Unified command execution, whitelist management, audit trails, multi-chain status monitoring
 - **Framework**: elizaOS
 
 ## Security
@@ -1286,6 +1496,8 @@ dfx canister call eliza_backend erc8004_get_validation_status '("0xREQUEST_HASH"
 - **DeFi protection**: All swap and bridge operations require admin authentication
 - **Chain-Key security**: No private keys stored for EVM; threshold ECDSA via ICP management canister
 - **Solana key security**: Ed25519 keys encrypted and stored on-chain (vetKeys integration recommended for production)
+- **Governance security**: Admin-only command execution with complete audit trails and optional whitelist protection
+- **Address validation**: Type-checked address formats (ICP: 64 hex, EVM: 0x+40 hex, Solana: base58)
 - **Stable memory**: All wallet states persist across canister upgrades
 - **Chat isolation**: Chat responses are text-only; users cannot trigger wallet operations through conversation
 

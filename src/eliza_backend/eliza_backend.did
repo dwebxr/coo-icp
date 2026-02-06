@@ -300,6 +300,70 @@ type Erc8004Status = record {
     configured_registries: nat32;
 };
 
+// ========== Governance Types ==========
+
+type ChainType = variant {
+    ICP;
+    EVM: record { chain_id: nat64 };
+    Solana: record { network: text };
+};
+
+type WhitelistEntry = record {
+    id: nat64;
+    address: text;
+    chain: ChainType;
+    label: opt text;
+    added_at: nat64;
+    added_by: principal;
+};
+
+type CommandType = variant {
+    SendIcp;
+    SendEvmNative;
+    SendErc20;
+    ExecuteLifiBridge;
+    ExecuteUniswapSwap;
+    SendSolana;
+    SendSplToken;
+    ExecuteJupiterSwap;
+};
+
+type ExecutionStatus = variant {
+    Success;
+    Failed: text;
+};
+
+type ExecutionRecord = record {
+    id: nat64;
+    command_type: CommandType;
+    timestamp: nat64;
+    caller: principal;
+    status: ExecutionStatus;
+    tx_hash: opt text;
+    params_json: text;
+    result: opt text;
+};
+
+type EvmChainBalance = record {
+    chain_id: nat64;
+    chain_name: text;
+    balance_wei: text;
+    address: text;
+};
+
+type SolanaNetworkBalance = record {
+    network_name: text;
+    balance_lamports: nat64;
+    address: text;
+};
+
+type PlatformStatus = record {
+    icp_balance: nat64;
+    cycles_balance: nat;
+    evm_balances: vec EvmChainBalance;
+    solana_balances: vec SolanaNetworkBalance;
+};
+
 service : {
     // Chat
     chat: (text) -> (variant { Ok: text; Err: text });
@@ -311,6 +375,7 @@ service : {
     // Configuration
     set_llm_provider: (LlmProvider) -> (variant { Ok; Err: text });
     get_config: () -> (opt Config) query;
+    set_admin: (principal) -> (variant { Ok; Err: text });
 
     // Conversation management
     get_conversation_history: () -> (vec Message) query;
@@ -437,6 +502,29 @@ service : {
     erc8004_request_validation: (text, nat64, text) -> (variant { Ok: text; Err: text });
     erc8004_respond_validation: (text, nat8, text, text) -> (variant { Ok; Err: text });
     erc8004_get_validation_status: (text) -> (variant { Ok: Erc8004ValidationStatus; Err: text });
+
+    // ========== Governance Integration ==========
+
+    // Unified Command Execution
+    execute_command: (text) -> (variant { Ok: text; Err: text });
+
+    // Cycles Monitoring
+    get_cycles_balance: () -> (nat) query;
+
+    // Execution History
+    get_execution_history: (opt nat32) -> (vec ExecutionRecord) query;
+
+    // Whitelist Management
+    add_whitelist_address: (text, ChainType, opt text) -> (variant { Ok: nat64; Err: text });
+    remove_whitelist_address: (nat64) -> (variant { Ok; Err: text });
+    get_whitelist: () -> (vec WhitelistEntry) query;
+    set_whitelist_enabled: (bool) -> (variant { Ok; Err: text });
+    get_whitelist_status: () -> (bool, nat64) query;
+
+    // ========== Platform Status ==========
+
+    // Get platform status (ICP, Cycles, EVM balances)
+    get_platform_status: () -> (variant { Ok: PlatformStatus; Err: text });
 
     // Transform functions (internal)
     transform_openai_response: (record { response: record { status: nat; body: vec nat8; headers: vec record { name: text; value: text } }; context: vec nat8 }) -> (record { status: nat; body: vec nat8; headers: vec record { name: text; value: text } }) query;
