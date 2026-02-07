@@ -1269,7 +1269,7 @@ Coo supports **governance integration** for external AI agents (like Dliza) to c
 
 ```
 ┌─────────────────┐                    ┌─────────────────┐
-│  Mac mini       │                    │  ICP Mainnet    │
+│  Mac mini, etc. │                    │  ICP Mainnet    │
 │                 │                    │                 │
 │  Dliza (AI)     │ ──execute_command─→│  Coo-ICP        │
 │  意思決定者      │    (dfx call)      │  実行者          │
