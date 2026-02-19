@@ -1,11 +1,9 @@
-import { Actor, HttpAgent } from '@dfinity/agent';
 import type { Principal } from '@dfinity/principal';
-import type { ActorMethod, ActorSubclass } from '@dfinity/agent';
+import type { ActorMethod } from '@dfinity/agent';
 
-// Canister ID - mainnet deployment
 export const canisterId: string = (import.meta as any).env?.CANISTER_ID_ELIZA_BACKEND ||
   (import.meta as any).env?.VITE_CANISTER_ID_ELIZA_BACKEND ||
-  '4wfup-gqaaa-aaaas-qdqca-cai'; // Mainnet canister ID
+  '4wfup-gqaaa-aaaas-qdqca-cai';
 
 export interface Message {
   role: string;
@@ -71,6 +69,20 @@ export const idlFactory = ({ IDL }: any) => {
 
   const Result = (ok: any, err: any) => IDL.Variant({ Ok: ok, Err: err });
 
+  const CanisterMetrics = IDL.Record({
+    version: IDL.Text,
+    conversations: IDL.Nat64,
+    scheduled_posts: IDL.Nat64,
+    incoming_messages: IDL.Nat64,
+    post_counter: IDL.Nat64,
+    evm_chains: IDL.Nat64,
+    solana_networks: IDL.Nat64,
+    erc8004_registered: IDL.Bool,
+    governance_whitelist_enabled: IDL.Bool,
+    stable_memory_pages: IDL.Nat64,
+    heap_memory_bytes: IDL.Nat64,
+  });
+
   return IDL.Service({
     chat: IDL.Func([IDL.Text], [Result(IDL.Text, IDL.Text)], []),
     update_character: IDL.Func([Character], [Result(IDL.Null, IDL.Text)], []),
@@ -83,27 +95,6 @@ export const idlFactory = ({ IDL }: any) => {
     store_encrypted_api_key: IDL.Func([IDL.Vec(IDL.Nat8)], [Result(IDL.Null, IDL.Text)], []),
     health: IDL.Func([], [IDL.Text], ['query']),
     version: IDL.Func([], [IDL.Text], ['query']),
-  });
-};
-
-export const createActor = (
-  cid: string | Principal,
-  options?: {
-    agentOptions?: { host?: string };
-    actorOptions?: Record<string, unknown>;
-  }
-): ActorSubclass<_SERVICE> => {
-  const agent = HttpAgent.createSync(options?.agentOptions);
-
-  // Fetch root key for local development
-  const network = (import.meta as any).env?.DFX_NETWORK;
-  if (network !== 'ic') {
-    agent.fetchRootKey().catch(console.error);
-  }
-
-  return Actor.createActor(idlFactory, {
-    agent,
-    canisterId: cid,
-    ...options?.actorOptions,
+    get_metrics: IDL.Func([], [CanisterMetrics], ['query']),
   });
 };

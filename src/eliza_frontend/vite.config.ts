@@ -16,12 +16,12 @@ export default defineConfig({
     },
   },
   define: {
-    'process.env': process.env,
+    'process.env.DFX_NETWORK': JSON.stringify(process.env.DFX_NETWORK ?? 'local'),
   },
   server: {
     proxy: {
       '/api': {
-        target: 'http://127.0.0.1:8080',
+        target: 'http://127.0.0.1:4943',
         changeOrigin: true,
       },
     },

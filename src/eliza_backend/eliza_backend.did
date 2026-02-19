@@ -22,6 +22,20 @@ type Config = record {
     admin: principal;
 };
 
+type CanisterMetrics = record {
+    version: text;
+    conversations: nat64;
+    scheduled_posts: nat64;
+    incoming_messages: nat64;
+    post_counter: nat64;
+    evm_chains: nat64;
+    solana_networks: nat64;
+    erc8004_registered: bool;
+    governance_whitelist_enabled: bool;
+    stable_memory_pages: nat64;
+    heap_memory_bytes: nat64;
+};
+
 // Social Integration Types
 type SocialPlatform = variant {
     Twitter;
@@ -364,6 +378,67 @@ type PlatformStatus = record {
     solana_balances: vec SolanaNetworkBalance;
 };
 
+// D2A Briefing API Types
+type BriefingScores = record {
+    originality: float64;
+    insight: float64;
+    credibility: float64;
+    composite: float64;
+    v_signal: float64;
+    c_context: float64;
+    l_slop: float64;
+};
+
+type D2ABriefingItem = record {
+    title: text;
+    content: text;
+    source: text;
+    source_url: text;
+    scores: BriefingScores;
+    verdict: text;
+    reason: text;
+    topics: vec text;
+    briefing_score: float64;
+};
+
+type D2ABriefingSummary = record {
+    total_evaluated: nat64;
+    total_burned: nat64;
+    quality_rate: float64;
+};
+
+type D2ABriefingResponse = record {
+    version: text;
+    generated_at: text;
+    items: vec D2ABriefingItem;
+    serendipity_pick: opt D2ABriefingItem;
+    summary: D2ABriefingSummary;
+};
+
+type D2AConfig = record {
+    enabled: bool;
+    aegis_url: text;
+    fetch_interval_seconds: nat64;
+    cache_ttl_seconds: nat64;
+    min_composite_score: float64;
+    max_context_items: nat64;
+    x402_enabled: bool;
+    x402_network: text;
+    x402_usdc_contract: text;
+};
+
+type D2AStatus = record {
+    enabled: bool;
+    aegis_url: text;
+    cache_item_count: nat64;
+    cache_age_seconds: nat64;
+    last_fetch_time: nat64;
+    last_error: opt text;
+    total_fetches: nat64;
+    x402_enabled: bool;
+    polling_active: bool;
+};
+
 service : {
     // Chat
     chat: (text) -> (variant { Ok: text; Err: text });
@@ -385,9 +460,10 @@ service : {
     // API Key management (vetKeys)
     store_encrypted_api_key: (vec nat8) -> (variant { Ok; Err: text });
 
-    // Health
+    // Health & Monitoring
     health: () -> (text) query;
     version: () -> (text) query;
+    get_metrics: () -> (CanisterMetrics) query;
 
     // ========== Social Integration ==========
 
@@ -526,9 +602,19 @@ service : {
     // Get platform status (ICP, Cycles, EVM balances)
     get_platform_status: () -> (variant { Ok: PlatformStatus; Err: text });
 
+    // D2A Briefing API
+    configure_d2a: (D2AConfig) -> (variant { Ok; Err: text });
+    get_d2a_config: () -> (opt D2AConfig) query;
+    get_d2a_status: () -> (D2AStatus) query;
+    get_cached_briefing: () -> (opt D2ABriefingResponse) query;
+    trigger_d2a_fetch: () -> (variant { Ok: text; Err: text });
+    start_d2a_polling: (nat64) -> (variant { Ok; Err: text });
+    stop_d2a_polling: () -> (variant { Ok; Err: text });
+
     // Transform functions (internal)
     transform_openai_response: (record { response: record { status: nat; body: vec nat8; headers: vec record { name: text; value: text } }; context: vec nat8 }) -> (record { status: nat; body: vec nat8; headers: vec record { name: text; value: text } }) query;
     transform_social_response: (record { response: record { status: nat; body: vec nat8; headers: vec record { name: text; value: text } }; context: vec nat8 }) -> (record { status: nat; body: vec nat8; headers: vec record { name: text; value: text } }) query;
     transform_evm_response: (record { response: record { status: nat; body: vec nat8; headers: vec record { name: text; value: text } }; context: vec nat8 }) -> (record { status: nat; body: vec nat8; headers: vec record { name: text; value: text } }) query;
     transform_solana_response: (record { response: record { status: nat; body: vec nat8; headers: vec record { name: text; value: text } }; context: vec nat8 }) -> (record { status: nat; body: vec nat8; headers: vec record { name: text; value: text } }) query;
+    transform_d2a_response: (record { response: record { status: nat; body: vec nat8; headers: vec record { name: text; value: text } }; context: vec nat8 }) -> (record { status: nat; body: vec nat8; headers: vec record { name: text; value: text } }) query;
 }

@@ -90,6 +90,15 @@ header a.subtitle:hover {
   50% { opacity: 0.5; }
 }
 
+.status-disconnected {
+  color: var(--text-secondary);
+}
+
+.dot-disconnected {
+  background: var(--text-secondary);
+  animation: none;
+}
+
 .login-container {
   flex: 1;
   display: flex;
@@ -139,7 +148,7 @@ header a.subtitle:hover {
   font-weight: 600;
 }
 
-.clear-btn {
+.header-btn {
   background: transparent;
   color: var(--text-secondary);
   border: 1px solid var(--border);
@@ -150,7 +159,7 @@ header a.subtitle:hover {
   transition: all 0.2s;
 }
 
-.clear-btn:hover {
+.header-btn.clear:hover {
   color: var(--error);
   border-color: var(--error);
 }
@@ -160,18 +169,7 @@ header a.subtitle:hover {
   gap: 0.5rem;
 }
 
-.logout-btn {
-  background: transparent;
-  color: var(--text-secondary);
-  border: 1px solid var(--border);
-  padding: 0.5rem 1rem;
-  font-size: 0.8rem;
-  border-radius: 8px;
-  cursor: pointer;
-  transition: all 0.2s;
-}
-
-.logout-btn:hover {
+.header-btn.logout:hover {
   color: var(--text-primary);
   border-color: var(--text-primary);
 }

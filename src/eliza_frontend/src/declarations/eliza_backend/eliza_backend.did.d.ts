@@ -21,6 +21,20 @@ export interface Config {
   admin: Principal;
 }
 
+export interface CanisterMetrics {
+  version: string;
+  conversations: bigint;
+  scheduled_posts: bigint;
+  incoming_messages: bigint;
+  post_counter: bigint;
+  evm_chains: bigint;
+  solana_networks: bigint;
+  erc8004_registered: boolean;
+  governance_whitelist_enabled: boolean;
+  stable_memory_pages: bigint;
+  heap_memory_bytes: bigint;
+}
+
 export type Result<T, E> = { Ok: T } | { Err: E };
 
 export interface _SERVICE {
@@ -35,4 +49,5 @@ export interface _SERVICE {
   store_encrypted_api_key: ActorMethod<[Uint8Array], Result<null, string>>;
   health: ActorMethod<[], string>;
   version: ActorMethod<[], string>;
+  get_metrics: ActorMethod<[], CanisterMetrics>;
 }

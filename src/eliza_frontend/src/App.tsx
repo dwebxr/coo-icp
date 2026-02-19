@@ -3,12 +3,10 @@ import { Actor, HttpAgent, Identity } from '@dfinity/agent';
 import { AuthClient } from '@dfinity/auth-client';
 import { idlFactory, canisterId, type _SERVICE, type Message } from './declarations/eliza_backend';
 
-// Environment helpers
 const getEnv = (key: string): string | undefined => {
   return (import.meta as any).env?.[key];
 };
 
-// Detect mainnet by checking hostname (icp0.io or ic0.app are mainnet domains)
 const isMainnet = typeof window !== 'undefined' &&
   (window.location.hostname.endsWith('.icp0.io') ||
    window.location.hostname.endsWith('.ic0.app') ||
@@ -58,8 +56,8 @@ function App() {
 
     try {
       const identityProvider = isMainnet
-        ? 'https://identity.ic0.app'
-        : `http://${iiCanisterId}.localhost:8080`;
+        ? 'https://identity.internetcomputer.org'
+        : `http://${iiCanisterId}.localhost:4943`;
 
       await authClient.login({
         identityProvider,
@@ -69,7 +67,11 @@ function App() {
         },
         onError: (err) => {
           console.error('Login error:', err);
-          setError('Login failed. Please try again.');
+          if (err === 'UserInterrupt') {
+            setError('Login was cancelled.');
+          } else {
+            setError(`Login failed: ${err || 'Unknown error'}. Please try again.`);
+          }
         },
       });
     } catch (err) {
@@ -85,7 +87,6 @@ function App() {
         host: isMainnet ? 'https://icp-api.io' : undefined,
       });
 
-      // Fetch root key for local development only
       if (!isMainnet) {
         await agent.fetchRootKey();
       }
@@ -97,7 +98,6 @@ function App() {
 
       setActor(elizaActor);
 
-      // Load conversation history
       const history = await elizaActor.get_conversation_history();
       const filteredHistory = history.filter((m: Message) => m.role !== 'system');
       setMessages(filteredHistory);
@@ -126,7 +126,6 @@ function App() {
         setMessages(prev => [...prev, { role: 'assistant', content: result.Ok }]);
       } else {
         setError(`Error: ${result.Err}`);
-        // Remove the optimistic user message on error
         setMessages(prev => prev.slice(0, -1));
       }
     } catch (err) {
@@ -174,9 +173,9 @@ function App() {
         <h1>Coo</h1>
         <p>Fully On-Chain AI Agent</p>
         <a href="https://github.com/dwebxr/coo-icp" target="_blank" rel="noopener noreferrer" className="subtitle">Powered by elizaOS framework on Internet Computer</a>
-        <div className="status">
-          <span className="status-dot"></span>
-          Running on-chain
+        <div className={`status ${isAuthenticated && actor ? '' : 'status-disconnected'}`}>
+          <span className={`status-dot ${isAuthenticated && actor ? '' : 'dot-disconnected'}`}></span>
+          {isAuthenticated && actor ? 'Connected on-chain' : 'Not connected'}
         </div>
       </header>
 
@@ -193,10 +192,10 @@ function App() {
           <div className="chat-header">
             <h2>Chat with Coo</h2>
             <div className="header-buttons">
-              <button onClick={clearConversation} className="clear-btn">
+              <button onClick={clearConversation} className="header-btn clear">
                 Clear Chat
               </button>
-              <button onClick={logout} className="logout-btn">
+              <button onClick={logout} className="header-btn logout">
                 Logout
               </button>
             </div>
@@ -211,7 +210,7 @@ function App() {
             )}
 
             {messages.map((msg, i) => (
-              <div key={i} className={`message ${msg.role}`}>
+              <div key={`${msg.role}-${i}-${msg.content.length}`} className={`message ${msg.role}`}>
                 <strong>{msg.role === 'user' ? 'You' : 'Coo'}</strong>
                 <p>{msg.content}</p>
               </div>

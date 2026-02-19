@@ -116,11 +116,14 @@ echo "Frontend: http://$(dfx canister id eliza_frontend).localhost:8080"
 ### 3. Test the Backend
 
 ```bash
-# Health check
+# Health check (returns dynamic status: ok/degraded + version + conversation count)
 dfx canister call eliza_backend health
 
 # Get version
 dfx canister call eliza_backend version
+
+# Get canister metrics (conversations, memory, chains, ERC-8004 status)
+dfx canister call eliza_backend get_metrics
 
 # Chat with Coo
 dfx canister call eliza_backend chat '("Hello!")'
@@ -1469,6 +1472,51 @@ dfx canister call eliza_backend get_cycles_balance --network ic
 
 ---
 
+## Monitoring
+
+### Health Check
+
+```bash
+# Dynamic health status (returns config/character state + version + conversation count)
+dfx canister call eliza_backend health --network ic
+# "ok | v0.5.0 | 42 conversations"  or  "degraded | config=false character=true"
+```
+
+### Canister Metrics
+
+```bash
+# Get comprehensive canister metrics
+dfx canister call eliza_backend get_metrics --network ic
+```
+
+Returns:
+```
+record {
+  version = "0.5.0";
+  conversations = 42;
+  scheduled_posts = 3;
+  incoming_messages = 10;
+  post_counter = 15;
+  evm_chains = 2;
+  solana_networks = 1;
+  erc8004_registered = true;
+  governance_whitelist_enabled = false;
+  stable_memory_pages = 128;
+  heap_memory_bytes = 8388608;
+}
+```
+
+### Metrics API Reference
+
+| Function | Access | Description |
+|----------|--------|-------------|
+| `health` | Public | Dynamic health status |
+| `version` | Public | Canister version string |
+| `get_metrics` | Public | Comprehensive canister metrics |
+| `get_cycles_balance` | Public | Current Cycles balance |
+
+---
+
 ## Tech Stack
 
 - **Backend**: Rust + ic-cdk + ic-llm
@@ -1498,8 +1546,72 @@ dfx canister call eliza_backend get_cycles_balance --network ic
 - **Solana key security**: Ed25519 keys encrypted and stored on-chain (vetKeys integration recommended for production)
 - **Governance security**: Admin-only command execution with complete audit trails and optional whitelist protection
 - **Address validation**: Type-checked address formats (ICP: 64 hex, EVM: 0x+40 hex, Solana: base58)
-- **Stable memory**: All wallet states persist across canister upgrades
+- **Stable memory**: All wallet states persist across canister upgrades with schema versioning for forward compatibility
+- **Safe upgrades**: `pre_upgrade`/`post_upgrade` use graceful error handling with logging (no panics)
+- **Bounded collections**: Internal caches (validation requests, metadata) enforce size limits with automatic eviction
 - **Chat isolation**: Chat responses are text-only; users cannot trigger wallet operations through conversation
+
+## D2A Briefing API (x402 Integration)
+
+Coo integrates with the **Aegis D2A Briefing API** for RAG-enhanced chat responses powered by AI-curated, quality-scored content.
+
+### How It Works
+
+```
+User asks question → Coo checks briefing cache → Injects relevant scored content → LLM generates grounded answer
+```
+
+1. **Aegis** curates content from RSS, URLs, and Nostr relays using V/C/L scoring:
+   - **V-Signal**: Information density & novelty (0-10)
+   - **C-Context**: User interest relevance (0-10)
+   - **L-Slop**: Clickbait/engagement farming penalty (0-10)
+2. **Coo** periodically fetches briefings via HTTPS outcalls
+3. When users chat, relevant briefing items are injected as RAG context
+4. LLM generates responses grounded in high-quality, scored information
+
+### Configure D2A
+
+```bash
+# Interactive setup
+make set-d2a
+
+# Or manually
+dfx canister call eliza_backend configure_d2a '(record {
+  enabled = true;
+  aegis_url = "https://aegis.dwebxr.xyz";
+  fetch_interval_seconds = 3600;
+  cache_ttl_seconds = 3600;
+  min_composite_score = 4.0;
+  max_context_items = 3;
+  x402_enabled = false;
+  x402_network = "eip155:8453";
+  x402_usdc_contract = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
+})' --network ic
+```
+
+### D2A Commands
+
+```bash
+make d2a-fetch     # Manual fetch from Aegis
+make d2a-status    # Check cache status
+make d2a-start     # Start periodic polling (1 hour)
+make d2a-stop      # Stop polling
+```
+
+### x402 Micropayments
+
+When `x402_enabled = true`, Coo pays for briefings using Base USDC via Chain-Key ECDSA:
+
+```
+Coo requests briefing → Aegis returns 402 → Coo signs EIP-712 USDC authorization →
+Coo retries with payment → Aegis delivers scored content
+```
+
+**Cost**: ~$0.01/briefing + ~$0.03 tECDSA signing fee. At 1 fetch/hour = ~$0.80/day.
+
+> **Note**: Fund Coo's EVM wallet with USDC on Base before enabling x402.
+
+---
 
 ## About elizaOS
 

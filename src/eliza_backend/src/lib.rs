@@ -601,6 +601,9 @@ thread_local! {
 /// State that persists across canister upgrades
 #[derive(CandidType, Deserialize, Serialize, Clone, Default)]
 struct StableState {
+    #[serde(default)]
+    version: u32, // Schema version for forward compatibility
+
     // Core state
     conversations: HashMap<Principal, ConversationState>,
     encrypted_api_key: Option<Vec<u8>>,
@@ -698,8 +701,8 @@ fn init() {
 
 #[pre_upgrade]
 fn pre_upgrade() {
-    // Collect all state into StableState
     let state = StableState {
+        version: 1,
         conversations: CONVERSATIONS.with(|c| c.borrow().clone()),
         encrypted_api_key: ENCRYPTED_API_KEY.with(|k| k.borrow().clone()),
         character: CHARACTER.with(|c| c.borrow().clone()),
@@ -717,25 +720,39 @@ fn pre_upgrade() {
         governance_state: GOVERNANCE_STATE.with(|gs| gs.borrow().clone()),
     };
 
-    // Serialize to stable memory
-    let serialized = candid::encode_one(&state).expect("Failed to serialize state");
+    let serialized = match candid::encode_one(&state) {
+        Ok(data) => data,
+        Err(e) => {
+            ic_cdk::println!("CRITICAL: Failed to serialize state during pre_upgrade: {}", e);
+            if ic_cdk::api::stable::stable_size() > 0 {
+                ic_cdk::api::stable::stable_write(0, &0u64.to_le_bytes());
+            }
+            return;
+        }
+    };
 
-    // Write length prefix + data to stable memory
     let len = serialized.len() as u64;
     let len_bytes = len.to_le_bytes();
 
-    // Grow stable memory if needed (1 page = 64KB)
+    // 1 page = 64KB
     let needed_pages = ((8 + serialized.len()) as u64 + 65535) / 65536;
     let current_pages = ic_cdk::api::stable::stable_size();
     if current_pages < needed_pages {
-        ic_cdk::api::stable::stable_grow(needed_pages - current_pages)
-            .expect("Failed to grow stable memory");
+        match ic_cdk::api::stable::stable_grow(needed_pages - current_pages) {
+            Ok(_) => {}
+            Err(_) => {
+                ic_cdk::println!(
+                    "CRITICAL: Failed to grow stable memory ({} -> {} pages). State may be lost.",
+                    current_pages, needed_pages
+                );
+                return;
+            }
+        }
     }
 
-    // Write length prefix
     ic_cdk::api::stable::stable_write(0, &len_bytes);
-    // Write serialized data
     ic_cdk::api::stable::stable_write(8, &serialized);
+    ic_cdk::println!("pre_upgrade: {} bytes serialized to stable memory", serialized.len());
 }
 
 #[post_upgrade]
@@ -750,14 +767,12 @@ fn post_upgrade() {
         let len = u64::from_le_bytes(len_bytes) as usize;
 
         if len > 0 && len < 100_000_000 {
-            // Sanity check: max 100MB
-            // Read serialized data
             let mut serialized = vec![0u8; len];
             ic_cdk::api::stable::stable_read(8, &mut serialized);
 
-            // Deserialize state
-            if let Ok(state) = candid::decode_one::<StableState>(&serialized) {
-                // Restore all state
+            match candid::decode_one::<StableState>(&serialized) {
+            Ok(state) => {
+                ic_cdk::println!("Restoring state (schema version {})", state.version);
                 CONVERSATIONS.with(|c| *c.borrow_mut() = state.conversations);
                 ENCRYPTED_API_KEY.with(|k| *k.borrow_mut() = state.encrypted_api_key);
                 CHARACTER.with(|c| *c.borrow_mut() = state.character);
@@ -781,9 +796,21 @@ fn post_upgrade() {
                     }
                 });
 
-                ic_cdk::println!("State restored from stable memory successfully (LLM: OnChain)");
+                ic_cdk::println!("State restored from stable memory successfully ({} bytes, LLM: OnChain)", len);
                 return;
             }
+            Err(e) => {
+                ic_cdk::println!(
+                    "CRITICAL: Failed to deserialize state ({} bytes): {}. Falling back to defaults.",
+                    len, e
+                );
+            }
+            }
+        } else {
+            ic_cdk::println!(
+                "WARNING: Invalid stable memory length: {} bytes. Falling back to defaults.",
+                len
+            );
         }
     }
 
@@ -1180,12 +1207,61 @@ fn get_conversation_count() -> u64 {
 
 #[query]
 fn health() -> String {
-    "Coo is running on-chain with stable memory!".to_string()
+    let has_config = CONFIG.with(|c| c.borrow().is_some());
+    let has_character = CHARACTER.with(|c| c.borrow().is_some());
+    let conversation_count = CONVERSATIONS.with(|c| c.borrow().len());
+    if has_config && has_character {
+        format!("ok | v{} | {} conversations", VERSION, conversation_count)
+    } else {
+        format!("degraded | config={} character={}", has_config, has_character)
+    }
 }
+
+const VERSION: &str = "0.5.0";
 
 #[query]
 fn version() -> String {
-    "0.4.0-wallet".to_string()
+    VERSION.to_string()
+}
+
+#[derive(CandidType, Serialize)]
+struct CanisterMetrics {
+    version: String,
+    conversations: u64,
+    scheduled_posts: u64,
+    incoming_messages: u64,
+    post_counter: u64,
+    evm_chains: u64,
+    solana_networks: u64,
+    erc8004_registered: bool,
+    governance_whitelist_enabled: bool,
+    stable_memory_pages: u64,
+    heap_memory_bytes: u64,
+}
+
+#[cfg(target_arch = "wasm32")]
+fn get_heap_memory_bytes() -> u64 {
+    (core::arch::wasm32::memory_size(0) as u64) * 65536
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn get_heap_memory_bytes() -> u64 { 0 }
+
+#[query]
+fn get_metrics() -> CanisterMetrics {
+    CanisterMetrics {
+        version: VERSION.to_string(),
+        conversations: CONVERSATIONS.with(|c| c.borrow().len() as u64),
+        scheduled_posts: SCHEDULED_POSTS.with(|p| p.borrow().len() as u64),
+        incoming_messages: INCOMING_MESSAGES.with(|m| m.borrow().len() as u64),
+        post_counter: POST_COUNTER.with(|c| *c.borrow()),
+        evm_chains: EVM_WALLET_STATE.with(|w| w.borrow().configured_chains.len() as u64),
+        solana_networks: SOLANA_WALLET_STATE.with(|w| w.borrow().configured_networks.len() as u64),
+        erc8004_registered: ERC8004_STATE.with(|s| s.borrow().registered_agent_id.is_some()),
+        governance_whitelist_enabled: GOVERNANCE_STATE.with(|gs| gs.borrow().whitelist_enabled),
+        stable_memory_pages: ic_cdk::api::stable::stable_size(),
+        heap_memory_bytes: get_heap_memory_bytes(),
+    }
 }
 
 // ========== Social Integration: OAuth 1.0a ==========
@@ -2274,12 +2350,14 @@ async fn process_incoming_messages() -> Result<(), String> {
                     }),
                 };
 
-                let _ = schedule_post_internal(
+                if let Err(e) = schedule_post_internal(
                     msg.platform.clone(),
                     reply_content,
                     ic_cdk::api::time(),
                     metadata,
-                );
+                ) {
+                    ic_cdk::println!("Failed to schedule reply for message {}: {}", msg.id, e);
+                }
 
                 mark_message_replied(&msg.id);
             }
@@ -2293,10 +2371,11 @@ async fn process_incoming_messages() -> Result<(), String> {
 }
 
 fn truncate_text(text: &str, max_len: usize) -> String {
-    if text.len() <= max_len {
+    if text.chars().count() <= max_len {
         text.to_string()
     } else {
-        format!("{}...", &text[..max_len - 3])
+        let truncated: String = text.chars().take(max_len.saturating_sub(3)).collect();
+        format!("{}...", truncated)
     }
 }
 
@@ -2887,7 +2966,7 @@ fn decompress_pubkey(compressed: &[u8]) -> Result<Vec<u8>, String> {
     let p = BigUint::parse_bytes(
         b"FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F",
         16,
-    ).unwrap();
+    ).ok_or_else(|| "Failed to parse secp256k1 prime".to_string())?;
 
     // x coordinate
     let x = BigUint::from_bytes_be(&compressed[1..]);
@@ -2964,6 +3043,15 @@ fn derive_eth_address(public_key: &[u8]) -> Result<String, String> {
     Ok(format!("0x{}", hex::encode(&hash[12..])))
 }
 
+#[cfg(test)]
+fn keccak256_selector(data: &[u8]) -> [u8; 4] {
+    let mut hasher = Keccak::v256();
+    let mut hash = [0u8; 32];
+    hasher.update(data);
+    hasher.finalize(&mut hash);
+    [hash[0], hash[1], hash[2], hash[3]]
+}
+
 /// Get the canister's EVM wallet address (derived from Chain-Key ECDSA)
 #[update]
 async fn get_evm_address() -> Result<String, String> {
@@ -3019,6 +3107,18 @@ async fn get_evm_wallet_info(chain_id: u64) -> Result<EvmWalletInfo, String> {
         address,
         chain_id,
         chain_name,
+    })
+}
+
+#[cfg(test)]
+fn get_chain_config(chain_id: u64) -> Result<EvmChainConfig, String> {
+    EVM_WALLET_STATE.with(|s| {
+        s.borrow()
+            .configured_chains
+            .iter()
+            .find(|c| c.chain_id == chain_id)
+            .cloned()
+            .ok_or_else(|| format!("Chain {} not configured. Use configure_evm_chain first.", chain_id))
     })
 }
 
@@ -4737,6 +4837,18 @@ fn configure_solana_network(config: SolanaNetworkConfig) -> Result<(), String> {
     })
 }
 
+#[cfg(test)]
+fn get_solana_network(network_name: &str) -> Result<SolanaNetworkConfig, String> {
+    SOLANA_WALLET_STATE.with(|s| {
+        s.borrow()
+            .configured_networks
+            .iter()
+            .find(|n| n.network_name == network_name)
+            .cloned()
+            .ok_or_else(|| format!("Network '{}' not configured. Use configure_solana_network first.", network_name))
+    })
+}
+
 /// Get configured Solana networks
 #[query]
 fn get_solana_networks() -> Vec<SolanaNetworkConfig> {
@@ -5000,7 +5112,6 @@ async fn send_solana(
     let blockhash_array: [u8; 32] = blockhash_bytes.try_into()
         .map_err(|_| "Invalid blockhash length")?;
 
-    // Build transaction message
     let message = build_solana_transfer_tx(
         &from_pubkey_array,
         &to_pubkey_array,
@@ -5008,7 +5119,6 @@ async fn send_solana(
         &blockhash_array,
     );
 
-    // Sign the message
     let signature = sign_solana_message(&message)?;
 
     // Build full transaction (signatures + message)
@@ -5017,13 +5127,11 @@ async fn send_solana(
     transaction.extend_from_slice(&signature);
     transaction.extend_from_slice(&message);
 
-    // Encode transaction for RPC
     let tx_base64 = base64::Engine::encode(
         &base64::engine::general_purpose::STANDARD,
         &transaction
     );
 
-    // Send transaction
     let request_body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -5080,7 +5188,6 @@ async fn send_solana(
         Err((code, msg)) => return Err(format!("HTTP error: {:?} - {}", code, msg)),
     };
 
-    // Record transaction
     SOLANA_WALLET_STATE.with(|state| {
         let mut s = state.borrow_mut();
         s.tx_counter += 1;
@@ -5126,14 +5233,12 @@ async fn send_spl_token(
         return Err("Amount must be greater than 0".to_string());
     }
 
-    // Get network config
     let network_config = SOLANA_WALLET_STATE.with(|s| {
         s.borrow().configured_networks.iter()
             .find(|n| n.network_name == network_name)
             .cloned()
     }).ok_or_else(|| format!("Network '{}' not configured", network_name))?;
 
-    // Get our public key
     let from_pubkey = SOLANA_WALLET_STATE.with(|s| {
         s.borrow().public_key.clone()
     }).ok_or_else(|| "Solana wallet not initialized".to_string())?;
@@ -5141,20 +5246,16 @@ async fn send_spl_token(
     let from_pubkey_array: [u8; 32] = from_pubkey.try_into()
         .map_err(|_| "Invalid public key")?;
 
-    // Parse addresses
     let mint_pubkey = decode_solana_pubkey(&token_mint)?;
     let to_pubkey = decode_solana_pubkey(&to_address)?;
     let token_program_id = decode_solana_pubkey(SPL_TOKEN_PROGRAM_ID)?;
 
-    // Derive Associated Token Accounts
     let from_ata = derive_associated_token_account(&from_pubkey_array, &mint_pubkey)?;
     let to_ata = derive_associated_token_account(&to_pubkey, &mint_pubkey)?;
 
-    // Get recent blockhash
     let blockhash_str = get_recent_blockhash(&network_config.rpc_url).await?;
     let blockhash = decode_solana_pubkey(&blockhash_str)?;
 
-    // Build SPL token transfer message
     let message = build_spl_transfer_message(
         &from_pubkey_array,
         &from_ata,
@@ -5164,16 +5265,13 @@ async fn send_spl_token(
         &blockhash,
     );
 
-    // Sign the message
     let signature = sign_solana_message(&message)?;
 
-    // Build full transaction
     let mut transaction = Vec::new();
     transaction.push(1u8); // Number of signatures
     transaction.extend_from_slice(&signature);
     transaction.extend_from_slice(&message);
 
-    // Encode and send
     let tx_base64 = base64::Engine::encode(
         &base64::engine::general_purpose::STANDARD,
         &transaction
@@ -5366,7 +5464,6 @@ async fn get_spl_token_balance(
     let ata = derive_associated_token_account(&wallet, &mint)?;
     let ata_address = bs58::encode(&ata).into_string();
 
-    // Query token account balance
     let request_body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -5517,24 +5614,20 @@ async fn execute_jupiter_swap(
     // ========== ADMIN ONLY ==========
     require_admin()?;
 
-    // Get network config
     let network_config = SOLANA_WALLET_STATE.with(|s| {
         s.borrow().configured_networks.iter()
             .find(|n| n.network_name == network_name)
             .cloned()
     }).ok_or_else(|| format!("Network '{}' not configured", network_name))?;
 
-    // Only allow mainnet for Jupiter
     if network_name != "mainnet" {
         return Err("Jupiter swaps only available on mainnet".to_string());
     }
 
-    // Get our wallet address
     let wallet_address = get_solana_address()?;
 
     let slippage = slippage_bps.unwrap_or(50);
 
-    // Step 1: Get quote
     let quote_url = format!(
         "{}?inputMint={}&outputMint={}&amount={}&slippageBps={}",
         JUPITER_QUOTE_API, input_mint, output_mint, amount, slippage
@@ -5571,7 +5664,6 @@ async fn execute_jupiter_swap(
         return Err(format!("Jupiter quote error: {}", error));
     }
 
-    // Step 2: Get swap transaction
     let swap_request_body = serde_json::json!({
         "quoteResponse": quote_json,
         "userPublicKey": wallet_address,
@@ -5614,12 +5706,10 @@ async fn execute_jupiter_swap(
         return Err(format!("Jupiter swap error: {}", error));
     }
 
-    // Get the serialized transaction
     let swap_tx_base64 = swap_json["swapTransaction"]
         .as_str()
         .ok_or("No swap transaction in response")?;
 
-    // Decode the transaction
     let tx_bytes = base64::Engine::decode(
         &base64::engine::general_purpose::STANDARD,
         swap_tx_base64
@@ -5640,19 +5730,15 @@ async fn execute_jupiter_swap(
         return Err("Transaction too short".to_string());
     }
 
-    // Extract the message portion (everything after signatures)
     let message = &tx_bytes[signature_section_len..];
 
-    // Sign the message with our key
     let signature = sign_solana_message(message)?;
 
-    // Reconstruct the transaction with our signature
     let mut signed_tx = Vec::new();
     signed_tx.push(1u8); // We're the only signer needed
     signed_tx.extend_from_slice(&signature);
     signed_tx.extend_from_slice(message);
 
-    // Encode and send
     let signed_tx_base64 = base64::Engine::encode(
         &base64::engine::general_purpose::STANDARD,
         &signed_tx
@@ -5713,7 +5799,6 @@ async fn execute_jupiter_swap(
         Err((code, msg)) => return Err(format!("HTTP error: {:?} - {}", code, msg)),
     };
 
-    // Record transaction
     let out_amount = quote_json["outAmount"].as_str().unwrap_or("0").to_string();
 
     SOLANA_WALLET_STATE.with(|state| {
@@ -5800,7 +5885,6 @@ pub struct Portfolio {
 async fn get_portfolio() -> Result<Portfolio, String> {
     let now = ic_cdk::api::time();
 
-    // ICP Balance
     let icp_address = get_wallet_address();
     let icp_balance = match check_icp_balance().await {
         Ok(balance) => balance.to_string(),
@@ -5815,7 +5899,6 @@ async fn get_portfolio() -> Result<Portfolio, String> {
         token_address: None,
     };
 
-    // EVM Balances
     let mut evm_assets = Vec::new();
     let evm_address = match get_evm_address().await {
         Ok(addr) => addr,
@@ -5843,7 +5926,6 @@ async fn get_portfolio() -> Result<Portfolio, String> {
         }
     }
 
-    // Solana Balance
     let mut solana_assets = Vec::new();
     let solana_address = match get_solana_address() {
         Ok(addr) => addr,
@@ -5890,16 +5972,13 @@ async fn get_portfolio() -> Result<Portfolio, String> {
 fn get_wallet_addresses() -> Vec<(String, String)> {
     let mut addresses = Vec::new();
 
-    // ICP
     let icp_address = get_wallet_address();
     addresses.push(("ICP".to_string(), icp_address));
 
-    // EVM
     if let Some(evm_address) = EVM_WALLET_STATE.with(|s| s.borrow().cached_address.clone()) {
         addresses.push(("EVM".to_string(), evm_address));
     }
 
-    // Solana
     if let Some(sol_address) = SOLANA_WALLET_STATE.with(|s| s.borrow().cached_address.clone()) {
         addresses.push(("Solana".to_string(), sol_address));
     }
@@ -5973,6 +6052,31 @@ fn get_erc8004_status() -> Erc8004Status {
     })
 }
 
+const MAX_VALIDATION_REQUESTS: usize = 1000;
+
+fn evict_validation_requests_if_full(requests: &mut HashMap<String, Erc8004ValidationStatus>) {
+    if requests.len() < MAX_VALIDATION_REQUESTS {
+        return;
+    }
+    // First pass: remove resolved entries
+    let resolved: Vec<String> = requests.iter()
+        .filter(|(_, v)| v.response != 0)
+        .map(|(k, _)| k.clone())
+        .collect();
+    for key in resolved.iter().take(100) {
+        requests.remove(key);
+    }
+    // Hard cap: if still full after evicting resolved, remove oldest by last_update
+    if requests.len() >= MAX_VALIDATION_REQUESTS {
+        if let Some(oldest_key) = requests.iter()
+            .min_by_key(|(_, v)| v.last_update)
+            .map(|(k, _)| k.clone())
+        {
+            requests.remove(&oldest_key);
+        }
+    }
+}
+
 // ========== ERC-8004 Identity Registry Functions ==========
 
 /// Register this canister as an agent in the ERC-8004 Identity Registry
@@ -5996,25 +6100,21 @@ async fn erc8004_register_agent(
         return Err("Only admin can register agent".to_string());
     }
 
-    // Get default registry configuration
     let registry_config = ERC8004_STATE.with(|s| {
         s.borrow().registries.iter()
             .find(|r| r.is_default)
             .cloned()
     }).ok_or("No default ERC-8004 registry configured")?;
 
-    // Verify EVM wallet is initialized
     let _evm_address = EVM_WALLET_STATE.with(|s| s.borrow().cached_address.clone())
         .ok_or("EVM wallet not initialized. Call get_evm_address first.")?;
 
-    // Get chain configuration (needed for RPC URL)
     let chain_config = EVM_WALLET_STATE.with(|s| {
         s.borrow().configured_chains.iter()
             .find(|c| c.chain_id == registry_config.chain_id)
             .cloned()
     }).ok_or(format!("Chain {} not configured", registry_config.chain_id))?;
 
-    // Encode register function call
     // register(string memory _agentURI, MetadataEntry[] memory _metadata)
     // Function selector: keccak256("register(string,(string,bytes)[])")
     let function_selector = {
@@ -6026,7 +6126,6 @@ async fn erc8004_register_agent(
         [output[0], output[1], output[2], output[3]]
     };
 
-    // Build ABI-encoded calldata
     let mut calldata = Vec::new();
     calldata.extend_from_slice(&function_selector);
 
@@ -6064,10 +6163,8 @@ async fn erc8004_register_agent(
     let array_len = [0u8; 32];
     calldata.extend_from_slice(&array_len);
 
-    // Make the contract call
     let calldata_hex = format!("0x{}", hex::encode(&calldata));
 
-    // Send transaction to register
     match send_evm_contract_call(
         registry_config.chain_id,
         &registry_config.identity_registry,
@@ -6104,8 +6201,7 @@ async fn erc8004_register_agent(
                 state.registered_chain_id = Some(registry_config.chain_id);
                 state.registered_registry = Some(registry_config.identity_registry.clone());
 
-                // Store metadata locally
-                for entry in metadata {
+                for entry in metadata.into_iter().take(100) {
                     state.local_metadata.insert(entry.key, entry.value);
                 }
             });
@@ -6127,21 +6223,17 @@ async fn send_evm_contract_call(
 ) -> Result<String, String> {
     use tiny_keccak::{Hasher, Keccak};
 
-    // Get chain config
     let chain_config = EVM_WALLET_STATE.with(|s| {
         s.borrow().configured_chains.iter()
             .find(|c| c.chain_id == chain_id)
             .cloned()
     }).ok_or(format!("Chain {} not configured", chain_id))?;
 
-    // Get our EVM address
     let from_address = EVM_WALLET_STATE.with(|s| s.borrow().cached_address.clone())
         .ok_or("EVM wallet not initialized. Call get_evm_address first.")?;
 
-    // Get nonce
     let nonce = get_nonce(&chain_config.rpc_url, &from_address).await?;
 
-    // Get gas price
     let gas_price = get_gas_price(&chain_config.rpc_url).await?;
     let max_fee_per_gas = gas_price.saturating_mul(2); // 2x for safety
     let max_priority_fee_per_gas = 1_500_000_000u64; // 1.5 gwei
@@ -6154,13 +6246,11 @@ async fn send_evm_contract_call(
             300_000u64
         });
 
-    // Parse to address
     let to_bytes = hex_to_bytes(to)?;
     if to_bytes.len() != 20 {
         return Err("Invalid to address length".to_string());
     }
 
-    // Parse calldata
     let data_bytes = hex::decode(data.trim_start_matches("0x"))
         .map_err(|e| format!("Invalid calldata: {}", e))?;
 
@@ -6179,7 +6269,6 @@ async fn send_evm_contract_call(
         &data_bytes,
     );
 
-    // Hash the transaction
     let mut hasher = Keccak::v256();
     let mut tx_hash = [0u8; 32];
     hasher.update(&tx_for_signing);
@@ -6188,7 +6277,6 @@ async fn send_evm_contract_call(
     // Sign with Chain-Key ECDSA
     let signature = sign_with_chain_key_ecdsa(&tx_hash).await?;
 
-    // Parse signature (r, s)
     if signature.len() != 64 {
         return Err(format!("Invalid signature length: {}", signature.len()));
     }
@@ -6197,7 +6285,6 @@ async fn send_evm_contract_call(
 
     // Try both recovery IDs (0 and 1)
     for v in [0u8, 1u8] {
-        // Build signed transaction
         let signed_items = vec![
             rlp_encode_u64(chain_id),
             rlp_encode_u64(nonce),
@@ -6217,7 +6304,6 @@ async fn send_evm_contract_call(
         let mut signed_tx = vec![0x02u8]; // EIP-1559 type
         signed_tx.extend(signed_list);
 
-        // Send transaction
         match send_raw_transaction(&chain_config.rpc_url, &signed_tx).await {
             Ok(hash) => return Ok(hash),
             Err(e) => {
@@ -6235,7 +6321,6 @@ async fn send_evm_contract_call(
 /// Get agent info from the registry
 #[update]
 async fn erc8004_get_agent_info(agent_id: u64) -> Result<Erc8004AgentInfo, String> {
-    // Get default registry
     let registry_config = ERC8004_STATE.with(|s| {
         s.borrow().registries.iter()
             .find(|r| r.is_default)
@@ -6249,7 +6334,6 @@ async fn erc8004_get_agent_info(agent_id: u64) -> Result<Erc8004AgentInfo, Strin
             .cloned()
     }).ok_or(format!("Chain {} not configured", registry_config.chain_id))?;
 
-    // Encode getAgentInfo(uint256) call
     let function_selector = {
         use tiny_keccak::{Hasher, Keccak};
         let mut hasher = Keccak::v256();
@@ -6270,7 +6354,6 @@ async fn erc8004_get_agent_info(agent_id: u64) -> Result<Erc8004AgentInfo, Strin
 
     let calldata_hex = format!("0x{}", hex::encode(&calldata));
 
-    // Make eth_call
     let _result = evm_eth_call(
         registry_config.chain_id,
         &registry_config.identity_registry,
@@ -6315,14 +6398,12 @@ async fn erc8004_set_agent_uri(agent_id: u64, new_uri: String) -> Result<(), Str
         return Err("Only admin can update agent URI".to_string());
     }
 
-    // Get default registry
     let registry_config = ERC8004_STATE.with(|s| {
         s.borrow().registries.iter()
             .find(|r| r.is_default)
             .cloned()
     }).ok_or("No default ERC-8004 registry configured")?;
 
-    // Encode setAgentURI(uint256,string) call
     let function_selector = {
         use tiny_keccak::{Hasher, Keccak};
         let mut hasher = Keccak::v256();
@@ -6335,7 +6416,6 @@ async fn erc8004_set_agent_uri(agent_id: u64, new_uri: String) -> Result<(), Str
     let mut calldata = Vec::new();
     calldata.extend_from_slice(&function_selector);
 
-    // Encode agent_id
     let mut id_bytes = [0u8; 32];
     let id_be = agent_id.to_be_bytes();
     id_bytes[24..32].copy_from_slice(&id_be);
@@ -6366,7 +6446,6 @@ async fn erc8004_set_agent_uri(agent_id: u64, new_uri: String) -> Result<(), Str
         "0",
     ).await?;
 
-    // Update local cache
     ERC8004_STATE.with(|s| {
         let mut state = s.borrow_mut();
         if state.registered_agent_id == Some(agent_id) {
@@ -6394,14 +6473,12 @@ async fn erc8004_get_metadata(agent_id: u64, key: String) -> Result<Vec<u8>, Str
         return Ok(value);
     }
 
-    // Get from chain
     let registry_config = ERC8004_STATE.with(|s| {
         s.borrow().registries.iter()
             .find(|r| r.is_default)
             .cloned()
     }).ok_or("No default ERC-8004 registry configured")?;
 
-    // Encode getMetadata(uint256,string) call
     let function_selector = {
         use tiny_keccak::{Hasher, Keccak};
         let mut hasher = Keccak::v256();
@@ -6414,7 +6491,6 @@ async fn erc8004_get_metadata(agent_id: u64, key: String) -> Result<Vec<u8>, Str
     let mut calldata = Vec::new();
     calldata.extend_from_slice(&function_selector);
 
-    // Encode agent_id
     let mut id_bytes = [0u8; 32];
     let id_be = agent_id.to_be_bytes();
     id_bytes[24..32].copy_from_slice(&id_be);
@@ -6472,7 +6548,6 @@ async fn erc8004_set_metadata(agent_id: u64, key: String, value: Vec<u8>) -> Res
             .cloned()
     }).ok_or("No default ERC-8004 registry configured")?;
 
-    // Encode setMetadata(uint256,string,bytes) call
     let function_selector = {
         use tiny_keccak::{Hasher, Keccak};
         let mut hasher = Keccak::v256();
@@ -6485,7 +6560,6 @@ async fn erc8004_set_metadata(agent_id: u64, key: String, value: Vec<u8>) -> Res
     let mut calldata = Vec::new();
     calldata.extend_from_slice(&function_selector);
 
-    // Encode agent_id
     let mut id_bytes = [0u8; 32];
     let id_be = agent_id.to_be_bytes();
     id_bytes[24..32].copy_from_slice(&id_be);
@@ -6521,6 +6595,17 @@ async fn erc8004_set_metadata(agent_id: u64, key: String, value: Vec<u8>) -> Res
     let value_padding = (32 - (value.len() % 32)) % 32;
     calldata.extend(vec![0u8; value_padding]);
 
+    // Check local metadata limit BEFORE sending on-chain TX to avoid inconsistency
+    let at_capacity = ERC8004_STATE.with(|s| {
+        let state = s.borrow();
+        state.registered_agent_id == Some(agent_id)
+            && state.local_metadata.len() >= 100
+            && !state.local_metadata.contains_key(&key)
+    });
+    if at_capacity {
+        return Err("Local metadata cache full (max 100 entries). Remove entries before adding new ones.".to_string());
+    }
+
     let calldata_hex = format!("0x{}", hex::encode(&calldata));
 
     send_evm_contract_call(
@@ -6530,7 +6615,6 @@ async fn erc8004_set_metadata(agent_id: u64, key: String, value: Vec<u8>) -> Res
         "0",
     ).await?;
 
-    // Update local cache
     ERC8004_STATE.with(|s| {
         let mut state = s.borrow_mut();
         if state.registered_agent_id == Some(agent_id) {
@@ -6571,7 +6655,6 @@ async fn erc8004_give_feedback(
             .cloned()
     }).ok_or("Registry not found")?;
 
-    // Encode giveFeedback(uint256,int256,uint8,bytes32,bytes32) call
     let function_selector = {
         use tiny_keccak::{Hasher, Keccak};
         let mut hasher = Keccak::v256();
@@ -6651,7 +6734,6 @@ async fn erc8004_revoke_feedback(agent_id: u64, feedback_index: u64) -> Result<(
             .cloned()
     }).ok_or("No default registry configured")?;
 
-    // Encode revokeFeedback(uint256,uint256)
     let function_selector = {
         use tiny_keccak::{Hasher, Keccak};
         let mut hasher = Keccak::v256();
@@ -6701,7 +6783,6 @@ async fn erc8004_get_reputation_summary(
             .cloned()
     }).ok_or("No default registry configured")?;
 
-    // Encode getReputationSummary(uint256,bytes32,bytes32)
     let function_selector = {
         use tiny_keccak::{Hasher, Keccak};
         let mut hasher = Keccak::v256();
@@ -6742,7 +6823,6 @@ async fn erc8004_get_reputation_summary(
         &calldata_hex,
     ).await?;
 
-    // Parse result (simplified)
     let result_bytes = hex::decode(result.trim_start_matches("0x"))
         .map_err(|e| format!("Failed to decode result: {}", e))?;
 
@@ -6789,7 +6869,6 @@ async fn erc8004_read_feedback(
             .cloned()
     }).ok_or("No default registry configured")?;
 
-    // Encode readFeedback(uint256,address,uint256)
     let function_selector = {
         use tiny_keccak::{Hasher, Keccak};
         let mut hasher = Keccak::v256();
@@ -6896,7 +6975,6 @@ async fn erc8004_request_validation(
             .cloned()
     }).ok_or("No default registry configured")?;
 
-    // Encode requestValidation(address,uint256,bytes32)
     let function_selector = {
         use tiny_keccak::{Hasher, Keccak};
         let mut hasher = Keccak::v256();
@@ -6954,9 +7032,9 @@ async fn erc8004_request_validation(
         format!("0x{}", hex::encode(output))
     };
 
-    // Store validation request
     ERC8004_STATE.with(|s| {
         let mut state = s.borrow_mut();
+        evict_validation_requests_if_full(&mut state.validation_requests);
         state.validation_requests.insert(request_hash.clone(), Erc8004ValidationStatus {
             request_hash: request_hash.clone(),
             validator_address: validator_address.clone(),
@@ -6996,7 +7074,6 @@ async fn erc8004_respond_validation(
             .cloned()
     }).ok_or("No default registry configured")?;
 
-    // Encode respondValidation(bytes32,uint8,bytes32,bytes32)
     let function_selector = {
         use tiny_keccak::{Hasher, Keccak};
         let mut hasher = Keccak::v256();
@@ -7024,7 +7101,7 @@ async fn erc8004_respond_validation(
 
     // response_hash (bytes32)
     let resp_hash_bytes = hex::decode(response_hash.trim_start_matches("0x"))
-        .unwrap_or_default();
+        .map_err(|e| format!("Invalid response hash hex: {}", e))?;
     let mut resp_hash_padded = [0u8; 32];
     let len = std::cmp::min(resp_hash_bytes.len(), 32);
     resp_hash_padded[32-len..].copy_from_slice(&resp_hash_bytes[..len]);
@@ -7046,7 +7123,6 @@ async fn erc8004_respond_validation(
         "0",
     ).await?;
 
-    // Update local state
     ERC8004_STATE.with(|s| {
         let mut state = s.borrow_mut();
         if let Some(status) = state.validation_requests.get_mut(&request_hash) {
@@ -7062,7 +7138,6 @@ async fn erc8004_respond_validation(
 /// Get validation status
 #[update]
 async fn erc8004_get_validation_status(request_hash: String) -> Result<Erc8004ValidationStatus, String> {
-    // Check local cache first
     let cached = ERC8004_STATE.with(|s| {
         s.borrow().validation_requests.get(&request_hash).cloned()
     });
@@ -7077,7 +7152,6 @@ async fn erc8004_get_validation_status(request_hash: String) -> Result<Erc8004Va
             .cloned()
     }).ok_or("No default registry configured")?;
 
-    // Encode getValidationStatus(bytes32)
     let function_selector = {
         use tiny_keccak::{Hasher, Keccak};
         let mut hasher = Keccak::v256();
@@ -7106,11 +7180,9 @@ async fn erc8004_get_validation_status(request_hash: String) -> Result<Erc8004Va
         &calldata_hex,
     ).await?;
 
-    // Parse result (simplified)
     let result_bytes = hex::decode(result.trim_start_matches("0x"))
         .map_err(|e| format!("Failed to decode result: {}", e))?;
 
-    // Extract fields from result
     let validator_address = if result_bytes.len() >= 32 {
         format!("0x{}", hex::encode(&result_bytes[12..32]))
     } else { String::new() };
@@ -7151,9 +7223,10 @@ async fn erc8004_get_validation_status(request_hash: String) -> Result<Erc8004Va
         last_update,
     };
 
-    // Cache the result
     ERC8004_STATE.with(|s| {
-        s.borrow_mut().validation_requests.insert(request_hash, status.clone());
+        let mut state = s.borrow_mut();
+        evict_validation_requests_if_full(&mut state.validation_requests);
+        state.validation_requests.insert(request_hash, status.clone());
     });
 
     Ok(status)
@@ -7174,7 +7247,6 @@ async fn evm_eth_call(
     let from = EVM_WALLET_STATE.with(|s| s.borrow().cached_address.clone())
         .unwrap_or_else(|| "0x0000000000000000000000000000000000000000".to_string());
 
-    // Build JSON-RPC request for eth_call
     let request_body = serde_json::json!({
         "jsonrpc": "2.0",
         "method": "eth_call",
@@ -7377,7 +7449,6 @@ async fn execute_command(params_json: String) -> Result<String, String> {
         },
     };
 
-    // Record execution
     let (status, tx_hash, result_str) = match &result {
         Ok(res) => (ExecutionStatus::Success, Some(res.clone()), Some(res.clone())),
         Err(err) => (ExecutionStatus::Failed(err.clone()), None, None),
@@ -7534,7 +7605,6 @@ fn get_whitelist_status() -> (bool, u64) {
 /// Get platform status (ICP balance, Cycles balance, EVM balances, Solana balances)
 #[update]
 async fn get_platform_status() -> Result<PlatformStatus, String> {
-    // Get ICP balance
     let icp_balance = match check_icp_balance().await {
         Ok(balance) => balance,
         Err(_) => 0, // Return 0 if error (wallet not initialized, etc.)
@@ -7543,13 +7613,10 @@ async fn get_platform_status() -> Result<PlatformStatus, String> {
     // Get Cycles balance (always available)
     let cycles_balance = ic_cdk::api::canister_balance128();
 
-    // Get configured EVM chains
     let configured_chains = get_configured_chains();
 
-    // Get EVM address (if available)
     let evm_address_result = get_evm_address().await;
 
-    // Get balances for all configured EVM chains
     let mut evm_balances = Vec::new();
     if let Ok(evm_address) = evm_address_result {
         for chain in configured_chains {
@@ -7570,13 +7637,10 @@ async fn get_platform_status() -> Result<PlatformStatus, String> {
         }
     }
 
-    // Get configured Solana networks
     let solana_networks = get_solana_networks();
 
-    // Get Solana address (if available)
     let solana_address_result = get_solana_address();
 
-    // Get balances for all configured Solana networks
     let mut solana_balances = Vec::new();
     if let Ok(solana_address) = solana_address_result {
         for network in solana_networks {
@@ -7602,6 +7666,955 @@ async fn get_platform_status() -> Result<PlatformStatus, String> {
         evm_balances,
         solana_balances,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- truncate_text tests ---
+
+    #[test]
+    fn truncate_text_short_string_unchanged() {
+        assert_eq!(truncate_text("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_text_exact_max_unchanged() {
+        assert_eq!(truncate_text("hello", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_text_longer_than_max() {
+        let result = truncate_text("hello world", 8);
+        assert_eq!(result, "hello...");
+        assert_eq!(result.chars().count(), 8);
+    }
+
+    #[test]
+    fn truncate_text_japanese_utf8() {
+        let result = truncate_text("こんにちは世界", 5);
+        assert_eq!(result, "こん...");
+        assert_eq!(result.chars().count(), 5);
+    }
+
+    #[test]
+    fn truncate_text_empty_string() {
+        assert_eq!(truncate_text("", 5), "");
+    }
+
+    #[test]
+    fn truncate_text_max_len_zero() {
+        assert_eq!(truncate_text("hello", 0), "...");
+    }
+
+    #[test]
+    fn truncate_text_max_len_three() {
+        assert_eq!(truncate_text("hello", 3), "...");
+    }
+
+    #[test]
+    fn truncate_text_emoji() {
+        assert_eq!(truncate_text("🎉🎊🎈🎁🎂", 3), "...");
+        assert_eq!(truncate_text("🎉🎊🎈🎁🎂", 4), "🎉...");
+        assert_eq!(truncate_text("🎉🎊🎈🎁🎂", 5), "🎉🎊🎈🎁🎂");
+    }
+
+    // --- keccak256_selector tests ---
+
+    #[test]
+    fn keccak_selector_erc20_transfer() {
+        assert_eq!(keccak256_selector(b"transfer(address,uint256)"), [0xa9, 0x05, 0x9c, 0xbb]);
+    }
+
+    #[test]
+    fn keccak_selector_erc20_balance_of() {
+        assert_eq!(keccak256_selector(b"balanceOf(address)"), [0x70, 0xa0, 0x82, 0x31]);
+    }
+
+    #[test]
+    fn keccak_selector_erc20_approve() {
+        assert_eq!(keccak256_selector(b"approve(address,uint256)"), [0x09, 0x5e, 0xa7, 0xb3]);
+    }
+
+    #[test]
+    fn keccak_selector_empty_input() {
+        let result = keccak256_selector(b"");
+        assert_eq!(result.len(), 4);
+    }
+
+    #[test]
+    fn keccak_selector_deterministic() {
+        let a = keccak256_selector(b"transfer(address,uint256)");
+        let b = keccak256_selector(b"transfer(address,uint256)");
+        assert_eq!(a, b);
+    }
+
+    // --- crc32 tests ---
+
+    #[test]
+    fn crc32_empty_data() {
+        assert_eq!(crc32(&[]), 0x00000000);
+    }
+
+    #[test]
+    fn crc32_ieee_standard_vector() {
+        assert_eq!(crc32(b"123456789"), 0xCBF43926);
+    }
+
+    #[test]
+    fn crc32_single_zero_byte() {
+        let result = crc32(&[0x00]);
+        assert_ne!(result, 0);
+    }
+
+    #[test]
+    fn crc32_all_ff() {
+        let result = crc32(&[0xFF; 4]);
+        assert_ne!(result, 0);
+    }
+
+    // --- decompress_pubkey tests ---
+
+    #[test]
+    fn decompress_pubkey_known_02_prefix() {
+        let g_compressed = hex::decode("0279BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798").unwrap();
+        let result = decompress_pubkey(&g_compressed).unwrap();
+        assert_eq!(result.len(), 65);
+        assert_eq!(result[0], 0x04);
+    }
+
+    #[test]
+    fn decompress_pubkey_known_03_prefix() {
+        let compressed = hex::decode("0379BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798").unwrap();
+        let result = decompress_pubkey(&compressed).unwrap();
+        assert_eq!(result.len(), 65);
+        assert_eq!(result[0], 0x04);
+    }
+
+    #[test]
+    fn decompress_pubkey_invalid_length_short() {
+        let result = decompress_pubkey(&[0x02; 20]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn decompress_pubkey_invalid_prefix() {
+        let mut key = vec![0x05; 33];
+        key[1..].copy_from_slice(&[0xAA; 32]);
+        assert!(decompress_pubkey(&key).is_err());
+    }
+
+    #[test]
+    fn decompress_pubkey_empty_input() {
+        assert!(decompress_pubkey(&[]).is_err());
+    }
+
+    #[test]
+    fn decompress_pubkey_output_format() {
+        let g = hex::decode("0279BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798").unwrap();
+        let result = decompress_pubkey(&g).unwrap();
+        assert_eq!(result[0], 0x04);
+        assert_eq!(result.len(), 65);
+    }
+
+    // --- derive_eth_address tests ---
+
+    #[test]
+    fn derive_eth_address_uncompressed_key() {
+        let g = hex::decode("0279BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798").unwrap();
+        let uncompressed = decompress_pubkey(&g).unwrap();
+        let addr = derive_eth_address(&uncompressed).unwrap();
+        assert_eq!(addr.to_lowercase(), "0x7e5f4552091a69125d5dfcb7b8c2659029395bdf");
+    }
+
+    #[test]
+    fn derive_eth_address_compressed_key() {
+        let compressed = hex::decode("0279BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798").unwrap();
+        let addr = derive_eth_address(&compressed).unwrap();
+        assert_eq!(addr.to_lowercase(), "0x7e5f4552091a69125d5dfcb7b8c2659029395bdf");
+    }
+
+    #[test]
+    fn derive_eth_address_invalid_length() {
+        assert!(derive_eth_address(&[0x04; 20]).is_err());
+    }
+
+    #[test]
+    fn derive_eth_address_invalid_prefix() {
+        let mut key = vec![0x05; 65];
+        key[0] = 0x05;
+        assert!(derive_eth_address(&key).is_err());
+    }
+
+    #[test]
+    fn derive_eth_address_output_format() {
+        let g = hex::decode("0279BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798").unwrap();
+        let addr = derive_eth_address(&g).unwrap();
+        assert!(addr.starts_with("0x"));
+        assert_eq!(addr.len(), 42);
+    }
+
+    // --- normalize_evm_address tests ---
+
+    #[test]
+    fn normalize_evm_address_mixed_case() {
+        assert_eq!(normalize_evm_address("0xABCDEF1234567890"), "0xabcdef1234567890");
+    }
+
+    #[test]
+    fn normalize_evm_address_already_lowercase() {
+        assert_eq!(normalize_evm_address("0xabcdef"), "0xabcdef");
+    }
+
+    #[test]
+    fn normalize_evm_address_empty() {
+        assert_eq!(normalize_evm_address(""), "");
+    }
+
+    // --- validate_address_format tests ---
+
+    #[test]
+    fn validate_icp_address_valid() {
+        let addr = "a".repeat(64);
+        assert!(validate_address_format(&addr, &ChainType::ICP).is_ok());
+    }
+
+    #[test]
+    fn validate_icp_address_too_short() {
+        let addr = "a".repeat(63);
+        assert!(validate_address_format(&addr, &ChainType::ICP).is_err());
+    }
+
+    #[test]
+    fn validate_icp_address_invalid_hex() {
+        let addr = "z".repeat(64);
+        assert!(validate_address_format(&addr, &ChainType::ICP).is_err());
+    }
+
+    #[test]
+    fn validate_evm_address_valid() {
+        let addr = format!("0x{}", "a".repeat(40));
+        assert!(validate_address_format(&addr, &ChainType::EVM { chain_id: 1 }).is_ok());
+    }
+
+    #[test]
+    fn validate_evm_address_no_prefix() {
+        let addr = "a".repeat(42);
+        assert!(validate_address_format(&addr, &ChainType::EVM { chain_id: 1 }).is_err());
+    }
+
+    #[test]
+    fn validate_evm_address_too_short() {
+        assert!(validate_address_format("0x1234", &ChainType::EVM { chain_id: 1 }).is_err());
+    }
+
+    #[test]
+    fn validate_evm_address_invalid_hex() {
+        let addr = format!("0x{}", "g".repeat(40));
+        assert!(validate_address_format(&addr, &ChainType::EVM { chain_id: 1 }).is_err());
+    }
+
+    #[test]
+    fn validate_solana_address_valid() {
+        assert!(validate_address_format(
+            "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+            &ChainType::Solana { network: "mainnet".to_string() }
+        ).is_ok());
+    }
+
+    #[test]
+    fn validate_solana_address_too_short() {
+        assert!(validate_address_format(
+            "abc",
+            &ChainType::Solana { network: "mainnet".to_string() }
+        ).is_err());
+    }
+
+    #[test]
+    fn validate_solana_address_too_long() {
+        let addr = "A".repeat(50);
+        assert!(validate_address_format(
+            &addr,
+            &ChainType::Solana { network: "mainnet".to_string() }
+        ).is_err());
+    }
+
+    #[test]
+    fn validate_solana_address_invalid_char_zero() {
+        let mut addr = "1".repeat(43);
+        addr.push('0');
+        assert!(validate_address_format(
+            &addr,
+            &ChainType::Solana { network: "mainnet".to_string() }
+        ).is_err());
+    }
+
+    #[test]
+    fn validate_solana_address_invalid_char_capital_o() {
+        let mut addr = "1".repeat(43);
+        addr.push('O');
+        assert!(validate_address_format(
+            &addr,
+            &ChainType::Solana { network: "mainnet".to_string() }
+        ).is_err());
+    }
+
+    // --- hex_to_bytes tests ---
+
+    #[test]
+    fn hex_to_bytes_with_0x_prefix() {
+        assert_eq!(hex_to_bytes("0xabcdef").unwrap(), vec![0xab, 0xcd, 0xef]);
+    }
+
+    #[test]
+    fn hex_to_bytes_without_prefix() {
+        assert_eq!(hex_to_bytes("abcdef").unwrap(), vec![0xab, 0xcd, 0xef]);
+    }
+
+    #[test]
+    fn hex_to_bytes_empty() {
+        assert_eq!(hex_to_bytes("").unwrap(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn hex_to_bytes_invalid() {
+        assert!(hex_to_bytes("xyz").is_err());
+    }
+
+    #[test]
+    fn hex_to_bytes_uppercase() {
+        assert_eq!(hex_to_bytes("0xABCD").unwrap(), vec![0xab, 0xcd]);
+    }
+
+    // --- wei_to_bytes tests ---
+
+    #[test]
+    fn wei_to_bytes_zero() {
+        assert_eq!(wei_to_bytes("0").unwrap(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn wei_to_bytes_small_value() {
+        assert_eq!(wei_to_bytes("255").unwrap(), vec![0xff]);
+    }
+
+    #[test]
+    fn wei_to_bytes_one_eth() {
+        let result = wei_to_bytes("1000000000000000000").unwrap();
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn wei_to_bytes_invalid_input() {
+        assert!(wei_to_bytes("not_a_number").is_err());
+    }
+
+    #[test]
+    fn wei_to_bytes_256() {
+        assert_eq!(wei_to_bytes("256").unwrap(), vec![0x01, 0x00]);
+    }
+
+    // --- percent_encode tests ---
+
+    #[test]
+    fn percent_encode_alphanumeric() {
+        assert_eq!(percent_encode("abc123"), "abc123");
+    }
+
+    #[test]
+    fn percent_encode_space() {
+        assert_eq!(percent_encode("hello world"), "hello%20world");
+    }
+
+    #[test]
+    fn percent_encode_unreserved_chars() {
+        assert_eq!(percent_encode("a-b.c_d~e"), "a-b.c_d~e");
+    }
+
+    #[test]
+    fn percent_encode_url_chars() {
+        assert_eq!(
+            percent_encode("https://example.com/?q=1&r=2"),
+            "https%3A%2F%2Fexample.com%2F%3Fq%3D1%26r%3D2"
+        );
+    }
+
+    #[test]
+    fn percent_encode_empty() {
+        assert_eq!(percent_encode(""), "");
+    }
+
+    // --- decode_solana_pubkey tests ---
+
+    #[test]
+    fn decode_solana_pubkey_token_program() {
+        let result = decode_solana_pubkey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 32);
+    }
+
+    #[test]
+    fn decode_solana_pubkey_invalid_base58() {
+        assert!(decode_solana_pubkey("invalid!!!").is_err());
+    }
+
+    #[test]
+    fn decode_solana_pubkey_wrong_length() {
+        assert!(decode_solana_pubkey("abc").is_err());
+    }
+
+    #[test]
+    fn decode_solana_pubkey_system_program() {
+        let result = decode_solana_pubkey("11111111111111111111111111111111");
+        assert!(result.is_ok());
+    }
+
+    // --- RLP encoding tests ---
+
+    #[test]
+    fn rlp_encode_u64_zero() {
+        assert_eq!(rlp_encode_u64(0), vec![0x80]);
+    }
+
+    #[test]
+    fn rlp_encode_u64_one() {
+        assert_eq!(rlp_encode_u64(1), vec![0x01]);
+    }
+
+    #[test]
+    fn rlp_encode_u64_127() {
+        assert_eq!(rlp_encode_u64(127), vec![0x7f]);
+    }
+
+    #[test]
+    fn rlp_encode_u64_128() {
+        assert_eq!(rlp_encode_u64(128), vec![0x81, 0x80]);
+    }
+
+    #[test]
+    fn rlp_encode_u64_1024() {
+        assert_eq!(rlp_encode_u64(1024), vec![0x82, 0x04, 0x00]);
+    }
+
+    #[test]
+    fn rlp_encode_u64_max() {
+        let result = rlp_encode_u64(u64::MAX);
+        assert!(!result.is_empty());
+        assert!(result.len() <= 9);
+    }
+
+    #[test]
+    fn rlp_encode_bytes_empty() {
+        assert_eq!(rlp_encode_bytes(&[]), vec![0x80]);
+    }
+
+    #[test]
+    fn rlp_encode_bytes_single_below_128() {
+        assert_eq!(rlp_encode_bytes(&[0x42]), vec![0x42]);
+    }
+
+    #[test]
+    fn rlp_encode_bytes_single_at_128() {
+        assert_eq!(rlp_encode_bytes(&[0x80]), vec![0x81, 0x80]);
+    }
+
+    #[test]
+    fn rlp_encode_bytes_short_data() {
+        assert_eq!(rlp_encode_bytes(&[1, 2, 3]), vec![0x83, 1, 2, 3]);
+    }
+
+    #[test]
+    fn rlp_encode_bytes_long_data() {
+        let data = vec![0xAA; 56];
+        let result = rlp_encode_bytes(&data);
+        assert_eq!(result[0], 0xb8);
+        assert_eq!(result[1], 56);
+        assert_eq!(result.len(), 58);
+    }
+
+    #[test]
+    fn rlp_encode_list_empty() {
+        assert_eq!(rlp_encode_list(&[]), vec![0xc0]);
+    }
+
+    #[test]
+    fn rlp_encode_list_single_item() {
+        let item = rlp_encode_u64(1);
+        let result = rlp_encode_list(&[item]);
+        assert_eq!(result, vec![0xc1, 0x01]);
+    }
+
+    #[test]
+    fn rlp_encode_list_multiple_items() {
+        let items = vec![rlp_encode_u64(1), rlp_encode_u64(2), rlp_encode_u64(3)];
+        let result = rlp_encode_list(&items);
+        assert_eq!(result, vec![0xc3, 0x01, 0x02, 0x03]);
+    }
+
+    // --- build_eip1559_tx tests ---
+
+    #[test]
+    fn build_eip1559_tx_starts_with_type_byte() {
+        let tx = build_eip1559_tx_for_signing(1, 0, 100, 200, 21000, &[0xAA; 20], &[1], &[]);
+        assert_eq!(tx[0], 0x02);
+    }
+
+    #[test]
+    fn build_eip1559_tx_zero_values() {
+        let tx = build_eip1559_tx_for_signing(0, 0, 0, 0, 0, &[], &[], &[]);
+        assert_eq!(tx[0], 0x02);
+        assert!(tx.len() > 1);
+    }
+
+    #[test]
+    fn build_eip1559_tx_with_data() {
+        let to = hex::decode("d8dA6BF26964aF9D7eEd9e03E53415D37aA96045").unwrap();
+        let value = vec![0x01];
+        let data = hex::decode("a9059cbb").unwrap();
+        let tx = build_eip1559_tx_for_signing(1, 5, 1_000_000_000, 20_000_000_000, 100_000, &to, &value, &data);
+        assert_eq!(tx[0], 0x02);
+        let tx_no_data = build_eip1559_tx_for_signing(1, 5, 1_000_000_000, 20_000_000_000, 100_000, &to, &value, &[]);
+        assert!(tx.len() > tx_no_data.len(), "TX with data should be longer than without");
+        assert!(tx.len() >= data.len() + tx_no_data.len() - 1);
+    }
+
+    #[test]
+    fn build_eip1559_tx_deterministic() {
+        let tx1 = build_eip1559_tx_for_signing(1, 0, 100, 200, 21000, &[0xAA; 20], &[1], &[]);
+        let tx2 = build_eip1559_tx_for_signing(1, 0, 100, 200, 21000, &[0xAA; 20], &[1], &[]);
+        assert_eq!(tx1, tx2);
+    }
+
+    // --- build_spl_transfer_message tests ---
+
+    #[test]
+    fn build_spl_transfer_message_header() {
+        let zero = [0u8; 32];
+        let msg = build_spl_transfer_message(&zero, &zero, &zero, &zero, 100, &zero);
+        assert_eq!(msg[0], 1); // num_signatures
+        assert_eq!(msg[1], 0); // num_readonly_signed
+        assert_eq!(msg[2], 1); // num_readonly_unsigned
+    }
+
+    #[test]
+    fn build_spl_transfer_message_account_count() {
+        let zero = [0u8; 32];
+        let msg = build_spl_transfer_message(&zero, &zero, &zero, &zero, 100, &zero);
+        assert_eq!(msg[3], 4); // 4 accounts
+    }
+
+    #[test]
+    fn build_spl_transfer_message_amount_encoding() {
+        let zero = [0u8; 32];
+        let msg = build_spl_transfer_message(&zero, &zero, &zero, &zero, 100, &zero);
+        let amount_offset = 3 + 1 + 32 * 4 + 32 + 1 + 1 + 4 + 1 + 1;
+        let amount_bytes = &msg[amount_offset..amount_offset + 8];
+        assert_eq!(u64::from_le_bytes(amount_bytes.try_into().unwrap()), 100);
+    }
+
+    // --- derive_ata tests ---
+
+    #[test]
+    fn derive_ata_deterministic() {
+        let wallet = [1u8; 32];
+        let mint = [2u8; 32];
+        let ata1 = derive_associated_token_account(&wallet, &mint);
+        let ata2 = derive_associated_token_account(&wallet, &mint);
+        assert_eq!(ata1, ata2);
+    }
+
+    #[test]
+    fn derive_ata_different_inputs() {
+        let wallet = [1u8; 32];
+        let mint1 = [2u8; 32];
+        let mint2 = [3u8; 32];
+        assert_ne!(
+            derive_associated_token_account(&wallet, &mint1),
+            derive_associated_token_account(&wallet, &mint2)
+        );
+    }
+
+    // --- parse_agent_registered_event tests ---
+
+    #[test]
+    fn parse_agent_registered_event_matching_log() {
+        let mut keccak = Keccak::v256();
+        let mut event_hash = [0u8; 32];
+        keccak.update(b"AgentRegistered(uint256,address,string)");
+        keccak.finalize(&mut event_hash);
+        let event_topic = format!("0x{}", hex::encode(event_hash));
+
+        let log = EvmLog {
+            address: "0xregistry".to_string(),
+            topics: vec![event_topic, format!("0x{}", hex::encode([0u8; 31].iter().chain(&[42u8]).copied().collect::<Vec<u8>>()))],
+            data: String::new(),
+        };
+        let result = parse_agent_registered_event(&[log], "0xregistry");
+        assert_eq!(result, Some(42));
+    }
+
+    #[test]
+    fn parse_agent_registered_event_wrong_address() {
+        let log = EvmLog {
+            address: "0xother".to_string(),
+            topics: vec!["0xabc".to_string(), "0x01".to_string()],
+            data: String::new(),
+        };
+        assert_eq!(parse_agent_registered_event(&[log], "0xregistry"), None);
+    }
+
+    #[test]
+    fn parse_agent_registered_event_empty_logs() {
+        assert_eq!(parse_agent_registered_event(&[], "0xregistry"), None);
+    }
+
+    #[test]
+    fn parse_agent_registered_event_insufficient_topics() {
+        let log = EvmLog {
+            address: "0xregistry".to_string(),
+            topics: vec!["0xabc".to_string()],
+            data: String::new(),
+        };
+        assert_eq!(parse_agent_registered_event(&[log], "0xregistry"), None);
+    }
+
+    // --- Thread-local state tests ---
+
+    #[test]
+    fn get_chain_config_found() {
+        EVM_WALLET_STATE.with(|s| s.borrow_mut().configured_chains.clear());
+        EVM_WALLET_STATE.with(|s| {
+            s.borrow_mut().configured_chains.push(EvmChainConfig {
+                chain_id: 1,
+                chain_name: "Ethereum".to_string(),
+                rpc_url: "https://rpc.example.com".to_string(),
+                native_symbol: "ETH".to_string(),
+                decimals: 18,
+            });
+        });
+        let result = get_chain_config(1);
+        assert!(result.is_ok());
+        let config = result.unwrap();
+        assert_eq!(config.chain_id, 1);
+        assert_eq!(config.chain_name, "Ethereum");
+        EVM_WALLET_STATE.with(|s| s.borrow_mut().configured_chains.clear());
+    }
+
+    #[test]
+    fn get_chain_config_not_found() {
+        EVM_WALLET_STATE.with(|s| s.borrow_mut().configured_chains.clear());
+        let result = get_chain_config(999);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Chain 999 not configured"));
+    }
+
+    #[test]
+    fn get_chain_config_multiple_chains() {
+        EVM_WALLET_STATE.with(|s| {
+            let mut state = s.borrow_mut();
+            state.configured_chains.clear();
+            for (id, name) in [(1, "Ethereum"), (137, "Polygon"), (42161, "Arbitrum")] {
+                state.configured_chains.push(EvmChainConfig {
+                    chain_id: id,
+                    chain_name: name.to_string(),
+                    rpc_url: format!("https://rpc-{}.example.com", id),
+                    native_symbol: "ETH".to_string(),
+                    decimals: 18,
+                });
+            }
+        });
+        assert_eq!(get_chain_config(137).unwrap().chain_name, "Polygon");
+        assert_eq!(get_chain_config(42161).unwrap().chain_name, "Arbitrum");
+        assert!(get_chain_config(10).is_err());
+        EVM_WALLET_STATE.with(|s| s.borrow_mut().configured_chains.clear());
+    }
+
+    #[test]
+    fn get_solana_network_found() {
+        SOLANA_WALLET_STATE.with(|s| s.borrow_mut().configured_networks.clear());
+        SOLANA_WALLET_STATE.with(|s| {
+            s.borrow_mut().configured_networks.push(SolanaNetworkConfig {
+                network_name: "mainnet".to_string(),
+                rpc_url: "https://api.mainnet-beta.solana.com".to_string(),
+            });
+        });
+        let result = get_solana_network("mainnet");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().network_name, "mainnet");
+        SOLANA_WALLET_STATE.with(|s| s.borrow_mut().configured_networks.clear());
+    }
+
+    #[test]
+    fn get_solana_network_not_found() {
+        SOLANA_WALLET_STATE.with(|s| s.borrow_mut().configured_networks.clear());
+        let result = get_solana_network("devnet");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Network 'devnet' not configured"));
+    }
+
+    #[test]
+    fn get_solana_network_case_sensitive() {
+        SOLANA_WALLET_STATE.with(|s| s.borrow_mut().configured_networks.clear());
+        SOLANA_WALLET_STATE.with(|s| {
+            s.borrow_mut().configured_networks.push(SolanaNetworkConfig {
+                network_name: "mainnet".to_string(),
+                rpc_url: "https://api.mainnet.solana.com".to_string(),
+            });
+        });
+        assert!(get_solana_network("mainnet").is_ok());
+        assert!(get_solana_network("Mainnet").is_err());
+        SOLANA_WALLET_STATE.with(|s| s.borrow_mut().configured_networks.clear());
+    }
+
+    #[test]
+    fn should_respond_to_character_name() {
+        CHARACTER.with(|c| *c.borrow_mut() = None);
+        CHARACTER.with(|c| {
+            *c.borrow_mut() = Some(Character {
+                name: "Coo".to_string(),
+                system_prompt: String::new(),
+                bio: vec![],
+                style: vec![],
+            });
+        });
+        let msg = IncomingMessage {
+            id: "1".to_string(),
+            platform: SocialPlatform::Twitter,
+            author_id: "user1".to_string(),
+            author_name: "User".to_string(),
+            content: "hello coo, how are you?".to_string(),
+            timestamp: 0,
+            processed: false,
+            replied: false,
+            conversation_id: None,
+        };
+        assert!(should_respond_to(&msg));
+        CHARACTER.with(|c| *c.borrow_mut() = None);
+    }
+
+    #[test]
+    fn should_respond_to_at_mention() {
+        CHARACTER.with(|c| *c.borrow_mut() = None);
+        CHARACTER.with(|c| {
+            *c.borrow_mut() = Some(Character {
+                name: "Coo".to_string(),
+                system_prompt: String::new(),
+                bio: vec![],
+                style: vec![],
+            });
+        });
+        let msg = IncomingMessage {
+            id: "2".to_string(),
+            platform: SocialPlatform::Discord,
+            author_id: "user2".to_string(),
+            author_name: "User2".to_string(),
+            content: "hey @coo what's the weather".to_string(),
+            timestamp: 0,
+            processed: false,
+            replied: false,
+            conversation_id: None,
+        };
+        assert!(should_respond_to(&msg));
+        CHARACTER.with(|c| *c.borrow_mut() = None);
+    }
+
+    #[test]
+    fn should_respond_to_unrelated_message() {
+        CHARACTER.with(|c| *c.borrow_mut() = None);
+        CHARACTER.with(|c| {
+            *c.borrow_mut() = Some(Character {
+                name: "Coo".to_string(),
+                system_prompt: String::new(),
+                bio: vec![],
+                style: vec![],
+            });
+        });
+        let msg = IncomingMessage {
+            id: "3".to_string(),
+            platform: SocialPlatform::Twitter,
+            author_id: "user3".to_string(),
+            author_name: "User3".to_string(),
+            content: "hello world, nice weather today".to_string(),
+            timestamp: 0,
+            processed: false,
+            replied: false,
+            conversation_id: None,
+        };
+        assert!(!should_respond_to(&msg));
+        CHARACTER.with(|c| *c.borrow_mut() = None);
+    }
+
+    // --- parse_account_identifier tests ---
+
+    #[test]
+    fn parse_account_identifier_valid() {
+        let result = parse_account_identifier("abcdef0123456789");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), vec![0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89]);
+    }
+
+    #[test]
+    fn parse_account_identifier_invalid_hex() {
+        assert!(parse_account_identifier("xyz123").is_err());
+    }
+
+    // --- compute_account_identifier tests ---
+
+    #[test]
+    fn compute_account_identifier_deterministic() {
+        let principal = Principal::from_text("aaaaa-aa").unwrap();
+        let id1 = compute_account_identifier(&principal);
+        let id2 = compute_account_identifier(&principal);
+        assert_eq!(id1, id2);
+    }
+
+    #[test]
+    fn compute_account_identifier_different_principals() {
+        let p1 = Principal::from_text("aaaaa-aa").unwrap();
+        let p2 = Principal::from_text("2vxsx-fae").unwrap();
+        assert_ne!(compute_account_identifier(&p1), compute_account_identifier(&p2));
+    }
+
+    // --- default_character tests ---
+
+    #[test]
+    fn default_character_has_name() {
+        let ch = default_character();
+        assert!(!ch.name.is_empty());
+    }
+
+    #[test]
+    fn default_character_has_system_prompt() {
+        let ch = default_character();
+        assert!(!ch.system_prompt.is_empty());
+    }
+
+    #[test]
+    fn default_character_has_bio_and_style() {
+        let ch = default_character();
+        assert!(!ch.bio.is_empty());
+        assert!(!ch.style.is_empty());
+    }
+
+    // --- Additional edge case tests ---
+
+    #[test]
+    fn rlp_encode_bytes_boundary_55() {
+        let data = vec![0xBB; 55];
+        let result = rlp_encode_bytes(&data);
+        assert_eq!(result[0], 0xb7); // 0x80 + 55
+        assert_eq!(result.len(), 56);
+    }
+
+    #[test]
+    fn rlp_encode_bytes_boundary_56() {
+        let data = vec![0xCC; 56];
+        let result = rlp_encode_bytes(&data);
+        assert_eq!(result[0], 0xb8);
+        assert_eq!(result[1], 56);
+        assert_eq!(result.len(), 58);
+    }
+
+    #[test]
+    fn hex_to_bytes_odd_length() {
+        let result = hex_to_bytes("0xabc");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Invalid hex"));
+    }
+
+    #[test]
+    fn hex_to_bytes_0x_only() {
+        assert_eq!(hex_to_bytes("0x").unwrap(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn wei_to_bytes_max_u64() {
+        let result = wei_to_bytes("18446744073709551615").unwrap();
+        assert_eq!(result, vec![0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+    }
+
+    #[test]
+    fn wei_to_bytes_negative() {
+        assert!(wei_to_bytes("-1").is_err());
+    }
+
+    #[test]
+    fn validate_address_evm_checksum_case() {
+        let addr = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045";
+        let result = validate_address_format(addr, &ChainType::EVM { chain_id: 1 });
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_address_icp_with_dashes() {
+        let result = validate_address_format("aaaaa-aa", &ChainType::ICP);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn keccak256_selector_deterministic_across_calls() {
+        let sel1 = keccak256_selector(b"transfer(address,uint256)");
+        let sel2 = keccak256_selector(b"transfer(address,uint256)");
+        let sel3 = keccak256_selector(b"transfer(address,uint256)");
+        assert_eq!(sel1, sel2);
+        assert_eq!(sel2, sel3);
+    }
+
+    #[test]
+    fn decompress_pubkey_boundary_33_bytes_wrong_prefix() {
+        let mut key = vec![0x00; 33];
+        key[1..].copy_from_slice(&[0xAA; 32]);
+        let result = decompress_pubkey(&key);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn derive_eth_address_known_zero_privkey() {
+        let result = derive_eth_address(&hex::decode(
+            "0279BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798"
+        ).unwrap());
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().to_lowercase(), "0x7e5f4552091a69125d5dfcb7b8c2659029395bdf");
+    }
+
+    #[test]
+    fn truncate_text_very_long_string() {
+        let long = "a".repeat(10_000);
+        let result = truncate_text(&long, 100);
+        assert_eq!(result.len(), 100);
+        assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn crc32_incremental_consistency() {
+        let crc_ab = crc32(b"ab");
+        let crc_a = crc32(b"a");
+        let crc_b = crc32(b"b");
+        assert_ne!(crc_ab, crc_a);
+        assert_ne!(crc_ab, crc_b);
+        assert_eq!(crc32(b"ab"), crc32(b"ab"));
+    }
+
+    #[test]
+    fn build_spl_transfer_different_amounts() {
+        let zero_addr = [0u8; 32];
+        let msg1 = build_spl_transfer_message(&zero_addr, &zero_addr, &zero_addr, &zero_addr, 100, &zero_addr);
+        let msg2 = build_spl_transfer_message(&zero_addr, &zero_addr, &zero_addr, &zero_addr, 200, &zero_addr);
+        assert_ne!(msg1, msg2);
+    }
+
+    #[test]
+    fn normalize_evm_address_preserves_0x() {
+        assert_eq!(normalize_evm_address("0xABCDEF"), "0xabcdef");
+    }
+
+    #[test]
+    fn percent_encode_unicode() {
+        let encoded = percent_encode("こんにちは");
+        assert!(encoded.contains("%"));
+        assert!(!encoded.contains("こ"));
+    }
 }
 
 // Candid export
