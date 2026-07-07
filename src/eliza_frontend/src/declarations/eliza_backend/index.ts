@@ -27,6 +27,13 @@ export interface Config {
 
 export type Result<T, E> = { Ok: T } | { Err: E };
 
+export interface CanisterMetrics {
+  version: string;
+  conversations: bigint;
+  stable_memory_pages: bigint;
+  heap_memory_bytes: bigint;
+}
+
 export interface _SERVICE {
   chat: ActorMethod<[string], Result<string, string>>;
   update_character: ActorMethod<[Character], Result<null, string>>;
@@ -39,6 +46,7 @@ export interface _SERVICE {
   store_encrypted_api_key: ActorMethod<[Uint8Array | number[]], Result<null, string>>;
   health: ActorMethod<[], string>;
   version: ActorMethod<[], string>;
+  get_metrics: ActorMethod<[], CanisterMetrics>;
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -72,13 +80,6 @@ export const idlFactory = ({ IDL }: any) => {
   const CanisterMetrics = IDL.Record({
     version: IDL.Text,
     conversations: IDL.Nat64,
-    scheduled_posts: IDL.Nat64,
-    incoming_messages: IDL.Nat64,
-    post_counter: IDL.Nat64,
-    evm_chains: IDL.Nat64,
-    solana_networks: IDL.Nat64,
-    erc8004_registered: IDL.Bool,
-    governance_whitelist_enabled: IDL.Bool,
     stable_memory_pages: IDL.Nat64,
     heap_memory_bytes: IDL.Nat64,
   });
