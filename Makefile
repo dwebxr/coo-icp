@@ -206,53 +206,8 @@ set-character:
 		name = \"$$name\"; \
 		system_prompt = \"$$prompt\"; \
 		bio = vec { \"$$bio\" }; \
-		style = record { all = vec { \"$$style\" }; chat = vec {}; post = vec {} } \
+		style = vec { \"$$style\" } \
 	})"
 	@echo ""
 	@echo "✅ Character updated!"
 
-# =============================================================================
-# D2A Briefing API Configuration
-# =============================================================================
-
-set-d2a:
-	@echo ""
-	@echo "🔗 Configure D2A Briefing API (Aegis)"
-	@echo ""
-	@echo "This enables RAG-enhanced chat using scored content from Aegis."
-	@echo ""
-	@read -p "Aegis URL [https://aegis.dwebxr.xyz]: " url; \
-	read -p "Enable x402 payment? (y/n) [n]: " x402; \
-	url=$${url:-https://aegis.dwebxr.xyz}; \
-	x402_val=$$([ "$$x402" = "y" ] && echo "true" || echo "false"); \
-	dfx canister call eliza_backend configure_d2a "(record { \
-		enabled = true; \
-		aegis_url = \"$$url\"; \
-		fetch_interval_seconds = 3600; \
-		cache_ttl_seconds = 3600; \
-		min_composite_score = 4.0; \
-		max_context_items = 3; \
-		x402_enabled = $$x402_val; \
-		x402_network = \"eip155:8453\"; \
-		x402_usdc_contract = \"0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913\"; \
-	})"
-	@echo ""
-	@echo "✅ D2A configured!"
-
-d2a-fetch:
-	@echo "📡 Fetching D2A briefing from Aegis..."
-	@dfx canister call eliza_backend trigger_d2a_fetch
-
-d2a-status:
-	@echo "📊 D2A Briefing Status:"
-	@dfx canister call eliza_backend get_d2a_status
-
-d2a-start:
-	@echo "🔄 Starting D2A polling (1 hour interval)..."
-	@dfx canister call eliza_backend start_d2a_polling '(3600)'
-	@echo "✅ D2A polling started!"
-
-d2a-stop:
-	@echo "⏹ Stopping D2A polling..."
-	@dfx canister call eliza_backend stop_d2a_polling
-	@echo "✅ D2A polling stopped!"
