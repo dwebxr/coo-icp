@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import type { Notice } from '../useCoo';
-import { AlertIcon, GitHubIcon, InfoIcon, KeyIcon } from './icons';
+import { REPO_URL, SUPPORT_URL } from '../links';
+import { AlertIcon, GitHubIcon, HeartIcon, InfoIcon, KeyIcon } from './icons';
 import { CooAvatar } from './CooAvatar';
 
 interface Props {
@@ -12,8 +13,6 @@ interface Props {
   onSignIn: () => void;
   onCancel: () => void;
 }
-
-const REPO_URL = 'https://github.com/dwebxr/coo-icp';
 
 export function SignIn({ checking = false, signingIn, ready, notice, onSignIn, onCancel }: Props) {
   // If the identity window never appeared (pop-up blocked, opened behind), offer a way out.
@@ -65,6 +64,10 @@ export function SignIn({ checking = false, signingIn, ready, notice, onSignIn, o
       </main>
 
       <footer className={checking ? 'signin-footer is-hidden' : 'signin-footer'}>
+        <a href={SUPPORT_URL} target="_blank" rel="noopener noreferrer">
+          <HeartIcon size={15} />
+          Support Coo
+        </a>
         <a href={REPO_URL} target="_blank" rel="noopener noreferrer">
           <GitHubIcon size={15} />
           Open source
