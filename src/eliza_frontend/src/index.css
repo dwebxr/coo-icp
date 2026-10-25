@@ -385,6 +385,7 @@ a {
 .signin-footer {
   display: flex;
   justify-content: center;
+  gap: 4px;
   padding: 16px 0 24px;
 }
 
@@ -935,6 +936,19 @@ a {
   font-size: 12px;
   text-align: center;
   color: var(--text-3);
+}
+
+.composer-note a {
+  margin-left: 4px;
+  color: inherit;
+  text-decoration: underline;
+  text-decoration-color: color-mix(in srgb, currentColor 40%, transparent);
+  text-underline-offset: 2px;
+  transition: color 0.15s var(--ease);
+}
+
+.composer-note a:hover {
+  color: var(--text);
 }
 
 .jump-btn {

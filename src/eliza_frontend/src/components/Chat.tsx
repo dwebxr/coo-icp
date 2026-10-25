@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { Coo } from '../useCoo';
+import { SUPPORT_URL } from '../links';
 import { AccountMenu } from './AccountMenu';
 import { Composer } from './Composer';
 import { ConfirmDialog } from './ConfirmDialog';
@@ -169,7 +170,12 @@ export function Chat({ coo }: { coo: Coo }) {
           </button>
         )}
         <Composer value={coo.draft} onChange={coo.setDraft} onSend={coo.send} canSend={coo.canSend} />
-        <p className="composer-note">Coo can make mistakes.</p>
+        <p className="composer-note">
+          Coo can make mistakes.
+          <a href={SUPPORT_URL} target="_blank" rel="noopener noreferrer">
+            Support Coo
+          </a>
+        </p>
       </footer>
 
       <ConfirmDialog
