@@ -8,6 +8,17 @@ export const canisterId: string = (import.meta as any).env?.CANISTER_ID_ELIZA_BA
 export interface Message {
   role: string;
   content: string;
+  request_id: [] | [string];
+}
+
+export interface Conversation {
+  messages: Message[];
+  revision: bigint;
+}
+
+export interface Sent {
+  reply: string;
+  revision: bigint;
 }
 
 export interface Character {
@@ -27,6 +38,16 @@ export interface Config {
 
 export type Result<T, E> = { Ok: T } | { Err: E };
 
+export type ChatError =
+  | { Busy: null }
+  | { InProgress: null }
+  | { Conflict: null }
+  | { Cleared: null }
+  | { Invalid: string }
+  | { Failed: string };
+
+export type MessageStatus = { Unknown: null } | { Pending: null } | { Done: Sent };
+
 export interface CanisterMetrics {
   version: string;
   conversations: bigint;
@@ -36,12 +57,15 @@ export interface CanisterMetrics {
 
 export interface _SERVICE {
   chat: ActorMethod<[string], Result<string, string>>;
+  send_message: ActorMethod<[string, bigint, string], Result<Sent, ChatError>>;
+  get_conversation: ActorMethod<[], Conversation>;
+  get_message_status: ActorMethod<[string], MessageStatus>;
   update_character: ActorMethod<[Character], Result<null, string>>;
   get_character: ActorMethod<[], [] | [Character]>;
   set_llm_provider: ActorMethod<[LlmProvider], Result<null, string>>;
   get_config: ActorMethod<[], [] | [Config]>;
   get_conversation_history: ActorMethod<[], Message[]>;
-  clear_conversation: ActorMethod<[], void>;
+  clear_conversation: ActorMethod<[], bigint>;
   get_conversation_count: ActorMethod<[], bigint>;
   store_encrypted_api_key: ActorMethod<[Uint8Array | number[]], Result<null, string>>;
   health: ActorMethod<[], string>;
@@ -54,6 +78,17 @@ export const idlFactory = ({ IDL }: any) => {
   const Message = IDL.Record({
     role: IDL.Text,
     content: IDL.Text,
+    request_id: IDL.Opt(IDL.Text),
+  });
+
+  const Conversation = IDL.Record({
+    messages: IDL.Vec(Message),
+    revision: IDL.Nat64,
+  });
+
+  const Sent = IDL.Record({
+    reply: IDL.Text,
+    revision: IDL.Nat64,
   });
 
   const Character = IDL.Record({
@@ -77,6 +112,21 @@ export const idlFactory = ({ IDL }: any) => {
 
   const Result = (ok: any, err: any) => IDL.Variant({ Ok: ok, Err: err });
 
+  const ChatError = IDL.Variant({
+    Busy: IDL.Null,
+    InProgress: IDL.Null,
+    Conflict: IDL.Null,
+    Cleared: IDL.Null,
+    Invalid: IDL.Text,
+    Failed: IDL.Text,
+  });
+
+  const MessageStatus = IDL.Variant({
+    Unknown: IDL.Null,
+    Pending: IDL.Null,
+    Done: Sent,
+  });
+
   const CanisterMetrics = IDL.Record({
     version: IDL.Text,
     conversations: IDL.Nat64,
@@ -86,12 +136,15 @@ export const idlFactory = ({ IDL }: any) => {
 
   return IDL.Service({
     chat: IDL.Func([IDL.Text], [Result(IDL.Text, IDL.Text)], []),
+    send_message: IDL.Func([IDL.Text, IDL.Nat64, IDL.Text], [Result(Sent, ChatError)], []),
+    get_conversation: IDL.Func([], [Conversation], ['query']),
+    get_message_status: IDL.Func([IDL.Text], [MessageStatus], ['query']),
     update_character: IDL.Func([Character], [Result(IDL.Null, IDL.Text)], []),
     get_character: IDL.Func([], [IDL.Opt(Character)], ['query']),
     set_llm_provider: IDL.Func([LlmProvider], [Result(IDL.Null, IDL.Text)], []),
     get_config: IDL.Func([], [IDL.Opt(Config)], ['query']),
     get_conversation_history: IDL.Func([], [IDL.Vec(Message)], ['query']),
-    clear_conversation: IDL.Func([], [], []),
+    clear_conversation: IDL.Func([], [IDL.Nat64], []),
     get_conversation_count: IDL.Func([], [IDL.Nat64], ['query']),
     store_encrypted_api_key: IDL.Func([IDL.Vec(IDL.Nat8)], [Result(IDL.Null, IDL.Text)], []),
     health: IDL.Func([], [IDL.Text], ['query']),
