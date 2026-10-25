@@ -17,5 +17,11 @@ serde_json = "1"
 # IC LLM Canister
 ic-llm = "1.1"
 
+[dev-dependencies]
+# Must match the PocketIC server version (dfx 0.30.2 ships pocket-ic-server 10.0.0)
+pocket-ic = "=10.0.0"
+
 [features]
 default = []
+# Test-only: send_message traps after the reply arrives when the message is "trap after reply" (PocketIC tests).
+trap-after-reply = []

@@ -3,7 +3,7 @@
 # One-click deployment commands for Internet Computer
 # =============================================================================
 
-.PHONY: help install setup deploy-local deploy-ic build clean test \
+.PHONY: help install setup deploy-local deploy-ic build clean test test-canister \
         start stop logs set-openai-key set-provider info
 
 # Default target
@@ -128,6 +128,15 @@ clean:
 test:
 	@echo "🧪 Running health check..."
 	@dfx canister call eliza_backend health 2>/dev/null && echo "✅ Backend is healthy!" || echo "❌ Backend not responding. Is it deployed?"
+
+# Canister unit and PocketIC integration tests. POCKET_IC_BIN defaults to the server bundled with dfx.
+# Set ELIZA_OLD_WASM to a build of the deployed version to also test the upgrade from it.
+test-canister:
+	PATH="$$HOME/.cargo/bin:$$PATH" cargo build --target wasm32-unknown-unknown --release -p eliza_backend
+	PATH="$$HOME/.cargo/bin:$$PATH" cargo build --target wasm32-unknown-unknown --release -p eliza_backend \
+		--features trap-after-reply --target-dir target/trap-after-reply
+	PATH="$$HOME/.cargo/bin:$$PATH" POCKET_IC_BIN="$${POCKET_IC_BIN:-$$(dfx cache show)/pocket-ic}" \
+		cargo test -p eliza_backend -- --include-ignored --test-threads=1
 
 logs:
 	@echo "📜 Fetching canister logs..."

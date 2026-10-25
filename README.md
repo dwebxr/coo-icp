@@ -94,6 +94,17 @@ echo "Frontend: http://$(dfx canister id eliza_frontend).localhost:8080"
 
 > **Note:** IC LLM Canister is only available on mainnet. Local development uses a fallback mode with simple pattern matching.
 
+**Frontend only (no replica needed):** `cd src/eliza_frontend && npm run dev`, then open
+`http://localhost:5173/?mock=chat` to preview the UI with a mock backend. Other states: `?mock=signedout`,
+`empty`, `rich`, `slow`, `error`, `busy`, `offline`, `lostreply`, `inprogress`, `historyerror`, `expiring`.
+The mock exists only in dev builds.
+
+Frontend tests: `npm test` (unit), and with the dev server running, `npm run e2e` (Chromium and WebKit) and
+`npm run a11y` (axe). First time: `npx playwright install chromium webkit`.
+
+Canister tests: `make test-canister` (unit tests plus PocketIC integration tests; set `ELIZA_OLD_WASM` to a
+build of the deployed version to include the upgrade test).
+
 ### 3. Test the Backend
 
 ```bash
@@ -148,6 +159,38 @@ dfx canister call eliza_backend health --network ic
 dfx canister call eliza_backend get_config --network ic
 ```
 
+### Upgrading the backend with live conversations
+
+Conversations live in the heap and are carried across an upgrade only through `pre_upgrade` → stable memory →
+`post_upgrade`. Upgrade the backend before the frontend (new frontends need the new methods; older ones keep
+using `chat`), and check the result while the canister is still stopped, so no request is accepted before the
+upgrade is known to be good:
+
+```bash
+dfx build eliza_backend --network ic
+dfx canister call eliza_backend health --network ic    # note the conversation count
+dfx canister stop eliza_backend --network ic
+dfx canister snapshot create eliza_backend --network ic
+dfx canister install eliza_backend --mode upgrade --network ic    # the canister stays stopped
+dfx canister logs eliza_backend --network ic | grep -E 'pre_upgrade: [0-9]+ bytes|State restored'
+dfx canister start eliza_backend --network ic          # only if the check below passes
+dfx canister call eliza_backend health --network ic    # same conversation count
+cd src/eliza_frontend && npm run build && cd ../.. && dfx deploy eliza_frontend --network ic
+```
+
+The last two log lines must be `pre_upgrade: N bytes serialized to stable memory` and `State restored from stable
+memory successfully (N bytes, ...)` with the **same N**: that proves the state written just before the upgrade is
+the one restored (the pre-0.6.0 `pre_upgrade` could fail without trapping and leave older state behind). If the
+numbers differ or a line is missing, `dfx canister snapshot load` the snapshot taken above while the canister is
+still stopped, then start it.
+
+- Roll back only before the canister has served requests: a snapshot also carries the revisions and request ids,
+  so loading one after new messages were saved would forget them, and browsers that already saw a newer revision
+  would refuse to show the older history (they never show history older than the newest revision they saw).
+- If `pre_upgrade` traps, the upgrade is aborted and the old version keeps running with its data: fix the cause and
+  upgrade again. Do not use `--skip-pre-upgrade`; it restores the previous upgrade's (stale) state or none at all.
+- If saved state cannot be read, `post_upgrade` traps and the upgrade is rolled back the same way.
+
 ## Project Structure
 
 ```
@@ -164,7 +207,12 @@ eliza-icp/
 │       ├── package.json
 │       ├── vite.config.ts
 │       └── src/
-│           ├── App.tsx               # Main chat component
+│           ├── App.tsx               # Screen switch (sign-in / chat)
+│           ├── useCoo.ts             # Session + chat state
+│           ├── backend.ts            # Internet Identity + canister calls
+│           ├── components/           # UI components
+│           ├── lib/markdown.ts       # Safe Markdown subset for replies
+│           ├── dev/mockBackend.ts    # Dev-only UI preview backend
 │           └── declarations/         # Generated types
 └── README.md
 ```
@@ -174,10 +222,26 @@ eliza-icp/
 ### Chat
 
 ```candid
+get_conversation: () -> (record { messages: vec Message; revision: nat64 }) query;
+send_message: (request_id: text, base_revision: nat64, content: text)
+    -> (variant { Ok: record { reply: text; revision: nat64 }; Err: ChatError });
+get_message_status: (request_id: text) -> (variant { Unknown; Pending; Done: record { reply: text; revision: nat64 } }) query;
 chat: (text) -> (variant { Ok: text; Err: text });
 ```
 
-Send a message and receive an AI response from Coo. Conversation history is maintained per caller (Principal).
+Send a message and receive an AI response from Coo. Conversation history is maintained per caller (Principal);
+anonymous callers are rejected.
+
+`send_message` saves a message at most once. The client picks a request id (up to 64 printable ASCII bytes, e.g. a
+UUID) and names the conversation revision it continues (from `get_conversation`; every saved exchange and every
+clear moves it on, even a clear of a conversation that does not exist yet). Repeating a request id returns the
+saved reply instead of answering again, so a client can always retry after a lost response with the same id and
+revision, and a request whose revision is out of date is refused with `Conflict` without running. So one
+(request id, revision) pair is saved at most once, as long as the canister's state is not rolled back to a
+snapshot. (If a chat stuck for 5 minutes is taken over, the model may be asked twice, but only one reply is saved.) Each caller has one chat in progress at a time: `Busy` means
+another message is being answered, `InProgress` that this request id is (poll `get_message_status`). `Cleared`
+means the conversation was cleared while the reply was generated; `Failed` that the model could not reply. In all
+error cases nothing was saved. `chat` is the original endpoint without these guarantees.
 
 ### Character Management
 
@@ -224,7 +288,7 @@ dfx canister call eliza_backend get_config --network ic
 
 ```candid
 get_conversation_history: () -> (vec Message) query;
-clear_conversation: () -> ();
+clear_conversation: () -> (nat64);   // the new revision
 get_conversation_count: () -> (nat64) query;
 ```
 

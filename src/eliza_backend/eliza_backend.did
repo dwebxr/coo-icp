@@ -10,11 +10,20 @@ type Character = record {
   name : text;
   style : vec text;
 };
+type ChatError = variant {
+  Invalid : text;
+  Failed : text;
+  Busy;
+  Cleared;
+  InProgress;
+  Conflict;
+};
 type Config = record {
   admin : principal;
   llm_provider : LlmProvider;
   max_conversation_length : nat64;
 };
+type Conversation = record { messages : vec Message; revision : nat64 };
 type HttpHeader = record { value : text; name : text };
 type HttpResponse = record {
   status : nat;
@@ -22,24 +31,36 @@ type HttpResponse = record {
   headers : vec HttpHeader;
 };
 type LlmProvider = variant { Fallback; OpenAI; OnChain };
-type Message = record { content : text; role : text };
+type Message = record { request_id : opt text; content : text; role : text };
+type MessageStatus = variant { Done : Sent; Unknown; Pending };
 type Result = variant { Ok : text; Err : text };
-type Result_1 = variant { Ok; Err : text };
+type Result_1 = variant { Ok : Sent; Err : ChatError };
+type Result_2 = variant { Ok; Err : text };
+type Sent = record { revision : nat64; reply : text };
 type TransformArgs = record { context : blob; response : HttpResponse };
 service : () -> {
+  // Original endpoint without a request id, kept for older clients.
   chat : (text) -> (Result);
-  clear_conversation : () -> ();
+  // Also cancels saving a reply that is still being generated. The conversation is replaced by an empty one with
+  // the next revision (even if there was none yet), so no request sent before the clear can run afterwards.
+  // Returns the new revision (older clients that expect no result ignore it).
+  clear_conversation : () -> (nat64);
   get_character : () -> (opt Character) query;
   get_config : () -> (opt Config) query;
+  get_conversation : () -> (Conversation) query;
   get_conversation_count : () -> (nat64) query;
   get_conversation_history : () -> (vec Message) query;
+  get_message_status : (text) -> (MessageStatus) query;
   get_metrics : () -> (CanisterMetrics) query;
   health : () -> (text) query;
+  // Sends a message as the next exchange after `base_revision`. A (request id, base revision) pair is saved at most
+  // once: repeating it returns the saved reply, and a stale revision is a Conflict.
+  send_message : (text, nat64, text) -> (Result_1);
   // Transfer admin rights to a new principal
-  set_admin : (principal) -> (Result_1);
-  set_llm_provider : (LlmProvider) -> (Result_1);
-  store_encrypted_api_key : (blob) -> (Result_1);
+  set_admin : (principal) -> (Result_2);
+  set_llm_provider : (LlmProvider) -> (Result_2);
+  store_encrypted_api_key : (blob) -> (Result_2);
   transform_openai_response : (TransformArgs) -> (HttpResponse) query;
-  update_character : (Character) -> (Result_1);
+  update_character : (Character) -> (Result_2);
   version : () -> (text) query;
 }
