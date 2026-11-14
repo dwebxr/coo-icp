@@ -326,7 +326,6 @@ dependencies = [
  "ic-llm",
  "pocket-ic",
  "serde",
- "serde_json",
 ]
 
 [[package]]

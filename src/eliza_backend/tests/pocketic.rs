@@ -8,7 +8,7 @@
 //! `v1_chat` call runs unchanged and the tests can hold, release and inspect it.
 
 use candid::{decode_one, encode_args, encode_one, CandidType, Principal};
-use eliza_backend::{ChatError, Conversation, LlmProvider, Message, MessageStatus, Sent};
+use eliza_backend::{ChatError, Conversation, LlmProvider, MessageStatus, Sent};
 use pocket_ic::common::rest::RawMessageId;
 use pocket_ic::PocketIc;
 use serde::de::DeserializeOwned;
@@ -382,8 +382,7 @@ fn clearing_bumps_the_revision_and_keeps_the_count_meaningful() {
     assert_eq!(cleared, 2);
     assert_eq!(conversation(&pic, id, alice()).revision, 2);
     assert!(chat_messages(&pic, id, alice()).is_empty());
-    let history: Vec<Message> = query(&pic, id, alice(), "get_conversation_history", encode_args(()).unwrap());
-    assert!(history.iter().all(|m| m.role == "system"));
+    assert!(conversation(&pic, id, alice()).messages.iter().all(|m| m.role == "system"));
     assert_eq!(count(&pic, id), 1);
 
     // Clearing a conversation that never existed still moves the revision on, so a first message that was
@@ -456,17 +455,33 @@ fn rejects_anonymous_callers_and_bad_request_ids() {
     let (pic, id) = setup(read(NEW_WASM));
     set_provider(&pic, id, LlmProvider::Fallback);
     assert!(matches!(send(&pic, id, Principal::anonymous(), "r-1", 0, "hi"), Err(ChatError::Invalid(_))));
-    let old: Result<String, String> = update(&pic, id, Principal::anonymous(), "chat", encode_one("hi").unwrap());
-    assert!(old.is_err());
     for bad in ["", "has space", "ü", &"x".repeat(65)] {
         assert!(matches!(send(&pic, id, alice(), bad, 0, "hi"), Err(ChatError::Invalid(_))), "{bad:?}");
     }
     assert!(chat_messages(&pic, id, alice()).is_empty());
+    assert!(send(&pic, id, alice(), &"x".repeat(64), 0, "hi").is_ok());
+    assert_eq!(chat_messages(&pic, id, alice()).len(), 2);
+}
 
-    // The old endpoint still works and moves the revision, so a client that did not see it gets a Conflict.
-    let old: Result<String, String> = update(&pic, id, alice(), "chat", encode_one("hello").unwrap());
-    assert!(old.is_ok());
-    assert_eq!(send(&pic, id, alice(), &"x".repeat(64), 0, "hi"), Err(ChatError::Conflict));
-    assert!(send(&pic, id, alice(), &"x".repeat(64), 1, "hi").is_ok());
-    assert_eq!(chat_messages(&pic, id, alice()).len(), 4);
+#[test]
+#[ignore]
+fn administration_is_for_controllers_and_removed_methods_are_gone() {
+    let (pic, id) = setup(read(NEW_WASM));
+    // alice is not a controller.
+    let refused: Result<(), String> = update(&pic, id, alice(), "set_llm_provider", encode_one(LlmProvider::Fallback).unwrap());
+    assert!(refused.is_err());
+    assert_eq!(send(&pic, id, alice(), "r-1", 0, "hello"), sent("Hi there!", 1), "still the on-chain provider");
+    // The controller can switch it, but not to the removed OpenAI provider.
+    let removed: Result<(), String> = update(&pic, id, admin(), "set_llm_provider", encode_one(LlmProvider::OpenAI).unwrap());
+    assert!(removed.is_err());
+    set_provider(&pic, id, LlmProvider::Fallback);
+
+    for (method, arg) in [
+        ("chat", encode_one("hi").unwrap()),
+        ("get_conversation_history", encode_args(()).unwrap()),
+        ("set_admin", encode_one(alice()).unwrap()),
+        ("store_encrypted_api_key", encode_one(b"sk-test".to_vec()).unwrap()),
+    ] {
+        assert!(pic.update_call(id, admin(), method, arg).is_err(), "{method} must not exist");
+    }
 }

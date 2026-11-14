@@ -1,8 +1,4 @@
 use candid::{CandidType, Deserialize, Principal};
-use ic_cdk::api::management_canister::http_request::{
-    http_request, CanisterHttpRequestArgument, HttpHeader, HttpMethod, HttpResponse, TransformArgs,
-    TransformContext, TransformFunc,
-};
 use ic_cdk_macros::{init, pre_upgrade, post_upgrade, query, update};
 use serde::Serialize;
 use std::cell::{Cell, RefCell};
@@ -90,8 +86,10 @@ pub enum MessageStatus {
 
 #[derive(CandidType, Deserialize, Serialize, Clone, Debug)]
 pub enum LlmProvider {
-    OnChain,           // IC LLM Canister (fully on-chain) - mainnet only
-    OpenAI,            // HTTPS Outcalls to OpenAI
+    OnChain,           // IC LLM Canister - mainnet only
+    /// Removed in 0.7.0 (it could not reach consensus on mainnet). Still listed so saved state decodes; treated as
+    /// OnChain.
+    OpenAI,
     Fallback,          // Simple pattern matching (for local dev)
 }
 
@@ -114,7 +112,6 @@ struct InFlight {
 
 thread_local! {
     static CONVERSATIONS: RefCell<HashMap<Principal, ConversationState>> = RefCell::new(HashMap::new());
-    static ENCRYPTED_API_KEY: RefCell<Option<Vec<u8>>> = RefCell::new(None);
     static CHARACTER: RefCell<Option<Character>> = RefCell::new(None);
     static CONFIG: RefCell<Option<Config>> = RefCell::new(None);
     // At most one chat per caller. Heap-only on purpose: upgrades run with the canister stopped, so none is open.
@@ -137,6 +134,7 @@ struct StableState {
 
     // Core state
     conversations: HashMap<Principal, ConversationState>,
+    /// Unused since 0.7.0 (the OpenAI provider was removed); a key saved by an older version is dropped.
     encrypted_api_key: Option<Vec<u8>>,
     character: Option<Character>,
     config: Option<Config>,
@@ -224,7 +222,7 @@ fn pre_upgrade() {
     let state = StableState {
         version: 2,
         conversations: CONVERSATIONS.with(|c| c.borrow().clone()),
-        encrypted_api_key: ENCRYPTED_API_KEY.with(|k| k.borrow().clone()),
+        encrypted_api_key: None,
         character: CHARACTER.with(|c| c.borrow().clone()),
         config: CONFIG.with(|c| c.borrow().clone()),
     };
@@ -266,7 +264,6 @@ fn post_upgrade() {
 
         ic_cdk::println!("Restoring state (schema version {})", state.version);
         CONVERSATIONS.with(|c| *c.borrow_mut() = state.conversations);
-        ENCRYPTED_API_KEY.with(|k| *k.borrow_mut() = state.encrypted_api_key);
         CHARACTER.with(|c| *c.borrow_mut() = state.character);
         CONFIG.with(|c| *c.borrow_mut() = state.config);
 
@@ -457,7 +454,7 @@ fn mark_flight_cleared(caller: &Principal) {
     });
 }
 
-/// `request` is the request id and the revision the client last saw; None for the original `chat` endpoint.
+/// `request` is the request id and the revision the client last saw.
 async fn run_chat(request: Option<(String, u64)>, user_message: String) -> Result<Sent, ChatError> {
     let caller = ic_cdk::caller();
     // Anonymous callers would all share one conversation.
@@ -528,12 +525,6 @@ async fn send_message(request_id: String, base_revision: u64, content: String) -
     run_chat(Some((request_id, base_revision)), content).await
 }
 
-/// Original endpoint without a request id, kept for older clients.
-#[update]
-async fn chat(user_message: String) -> Result<String, String> {
-    run_chat(None, user_message).await.map(|sent| sent.reply).map_err(|e| e.to_string())
-}
-
 #[query]
 fn get_conversation() -> Conversation {
     let caller = ic_cdk::caller();
@@ -569,8 +560,7 @@ async fn generate_response(state: &ConversationState) -> Result<String, String> 
     });
 
     match provider {
-        LlmProvider::OnChain => generate_response_onchain(state).await,
-        LlmProvider::OpenAI => generate_response_openai(state).await,
+        LlmProvider::OnChain | LlmProvider::OpenAI => generate_response_onchain(state).await,
         LlmProvider::Fallback => generate_response_fallback(state),
     }
 }
@@ -667,132 +657,11 @@ fn generate_response_fallback(state: &ConversationState) -> Result<String, Strin
     Ok(response)
 }
 
-// Option 2: HTTPS Outcalls to OpenAI API
-async fn generate_response_openai(state: &ConversationState) -> Result<String, String> {
-    // Get decrypted API key
-    let api_key = decrypt_api_key().await?;
-
-    // Build messages JSON
-    let messages_json: Vec<serde_json::Value> = state.messages.iter().map(|m| {
-        serde_json::json!({
-            "role": m.role,
-            "content": m.content
-        })
-    }).collect();
-
-    let request_body = serde_json::json!({
-        "model": "gpt-4o-mini",
-        "messages": messages_json,
-        "max_tokens": 500,
-        "temperature": 0.7
-    });
-
-    let request_body_bytes = request_body.to_string().into_bytes();
-
-    let request = CanisterHttpRequestArgument {
-        url: "https://api.openai.com/v1/chat/completions".to_string(),
-        max_response_bytes: Some(10_000),
-        method: HttpMethod::POST,
-        headers: vec![
-            HttpHeader {
-                name: "Content-Type".to_string(),
-                value: "application/json".to_string(),
-            },
-            HttpHeader {
-                name: "Authorization".to_string(),
-                value: format!("Bearer {}", api_key),
-            },
-        ],
-        body: Some(request_body_bytes),
-        transform: Some(TransformContext {
-            function: TransformFunc(candid::Func {
-                principal: ic_cdk::id(),
-                method: "transform_openai_response".to_string(),
-            }),
-            context: vec![],
-        }),
-    };
-
-    // Attach cycles for HTTP request
-    let cycles = 50_000_000_000u128; // 50B cycles
-
-    match http_request(request, cycles).await {
-        Ok((response,)) => {
-            let body = String::from_utf8(response.body)
-                .map_err(|e| format!("UTF-8 decode error: {}", e))?;
-
-            let json: serde_json::Value = serde_json::from_str(&body)
-                .map_err(|e| format!("JSON parse error: {}", e))?;
-
-            json["choices"][0]["message"]["content"]
-                .as_str()
-                .map(|s| s.to_string())
-                .ok_or_else(|| "No response content".to_string())
-        }
-        Err((code, msg)) => Err(format!("HTTP error: {:?} - {}", code, msg)),
-    }
-}
-
-// Transform function for HTTPS Outcalls
-#[query]
-fn transform_openai_response(raw: TransformArgs) -> HttpResponse {
-    HttpResponse {
-        status: raw.response.status,
-        body: raw.response.body,
-        headers: vec![],
-    }
-}
-
-// ========== API Key Management (vetKeys integration placeholder) ==========
-
-async fn decrypt_api_key() -> Result<String, String> {
-    let encrypted_key = ENCRYPTED_API_KEY.with(|k| k.borrow().clone())
-        .ok_or_else(|| "No API key stored. Please call store_encrypted_api_key first.".to_string())?;
-
-    // In production, this would use vetKeys for decryption
-    // For now, we store the key directly (NOT secure for production)
-    String::from_utf8(encrypted_key)
-        .map_err(|e| format!("Decryption error: {}", e))
-}
-
-#[update]
-fn store_encrypted_api_key(encrypted_key: Vec<u8>) -> Result<(), String> {
-    // Check if caller is admin
-    let caller = ic_cdk::caller();
-    let is_admin = CONFIG.with(|cfg| {
-        cfg.borrow()
-            .as_ref()
-            .map(|c| c.admin == caller)
-            .unwrap_or(false)
-    });
-
-    if !is_admin {
-        return Err("Only admin can store API key".to_string());
-    }
-
-    ENCRYPTED_API_KEY.with(|k| {
-        *k.borrow_mut() = Some(encrypted_key);
-    });
-
-    Ok(())
-}
-
 // ========== Character Management ==========
 
 #[update]
 fn update_character(character: Character) -> Result<(), String> {
-    // Check if caller is admin
-    let caller = ic_cdk::caller();
-    let is_admin = CONFIG.with(|cfg| {
-        cfg.borrow()
-            .as_ref()
-            .map(|c| c.admin == caller)
-            .unwrap_or(false)
-    });
-
-    if !is_admin {
-        return Err("Only admin can update character".to_string());
-    }
+    require_controller()?;
 
     CHARACTER.with(|c| {
         *c.borrow_mut() = Some(character);
@@ -810,16 +679,9 @@ fn get_character() -> Option<Character> {
 
 #[update]
 fn set_llm_provider(provider: LlmProvider) -> Result<(), String> {
-    let caller = ic_cdk::caller();
-    let is_admin = CONFIG.with(|cfg| {
-        cfg.borrow()
-            .as_ref()
-            .map(|c| c.admin == caller)
-            .unwrap_or(false)
-    });
-
-    if !is_admin {
-        return Err("Only admin can change LLM provider".to_string());
+    require_controller()?;
+    if matches!(provider, LlmProvider::OpenAI) {
+        return Err("The OpenAI provider was removed in 0.7.0".to_string());
     }
 
     CONFIG.with(|cfg| {
@@ -836,33 +698,7 @@ fn get_config() -> Option<Config> {
     CONFIG.with(|cfg| cfg.borrow().clone())
 }
 
-/// Transfer admin rights to a new principal
-#[update]
-fn set_admin(new_admin: Principal) -> Result<(), String> {
-    require_admin()?;
-
-    CONFIG.with(|cfg| {
-        if let Some(config) = cfg.borrow_mut().as_mut() {
-            config.admin = new_admin;
-            Ok(())
-        } else {
-            Err("Config not initialized".to_string())
-        }
-    })
-}
-
 // ========== Conversation Management ==========
-
-#[query]
-fn get_conversation_history() -> Vec<Message> {
-    let caller = ic_cdk::caller();
-    CONVERSATIONS.with(|c| {
-        c.borrow()
-            .get(&caller)
-            .map(|s| s.messages.clone())
-            .unwrap_or_default()
-    })
-}
 
 /// Also cancels saving a reply that is still being generated. The conversation is replaced by an empty one with
 /// the next revision (even if there was none yet), so no request sent before the clear can run afterwards.
@@ -946,19 +782,13 @@ fn get_metrics() -> CanisterMetrics {
     }
 }
 
-fn require_admin() -> Result<(), String> {
-    let caller = ic_cdk::caller();
-    let is_admin = CONFIG.with(|cfg| {
-        cfg.borrow()
-            .as_ref()
-            .map(|c| c.admin == caller)
-            .unwrap_or(false)
-    });
-
-    if !is_admin {
-        return Err("Only admin can perform this action".to_string());
+/// Administration is for the canister's controllers (those who can also replace its code).
+fn require_controller() -> Result<(), String> {
+    if ic_cdk::api::is_controller(&ic_cdk::caller()) {
+        Ok(())
+    } else {
+        Err("Only a controller of the canister can do this".to_string())
     }
-    Ok(())
 }
 
 #[cfg(test)]
