@@ -3,7 +3,8 @@ import type { ActorMethod } from '@dfinity/agent';
 import type { IDL } from '@dfinity/candid';
 
 /**
- * Who Coo is. All of it goes into the system message of every model request.
+ * Who Coo is. All of it — name, system prompt, bio and style — makes the system message of every model request,
+ * which may be at most 3 000 bytes as a whole (`update_character` refuses a longer one).
  */
 export interface Character {
   'bio' : Array<string>,
@@ -48,8 +49,10 @@ export type ChatError = {
   } |
   {
     /**
-     * The conversation changed since the client's revision. Nothing was run, and this request never will be;
-     * reload and send again.
+     * The base revision is not the conversation's: nothing was run; reload and send again. For a revision the
+     * canister handed out (in a reply, a conversation or a clear) this is for good: the conversation has moved
+     * past it, and a request for it never runs. A revision the conversation has not reached yet is refused now,
+     * but not for ever: the same request would run if the conversation got there.
      */
     'Conflict' : null
   };
@@ -140,8 +143,10 @@ export interface Sent {
 export interface _SERVICE {
   /**
    * Empties the caller's conversation and cancels saving a reply that is still being generated. The conversation
-   * gets the next revision (even if there was none yet), so no request sent before the clear can run afterwards.
-   * Returns the new revision.
+   * gets the next revision (even if there was none yet), so no request for a revision handed out before the clear
+   * can run afterwards. Returns the new revision. Traps when the canister keeps nothing for the caller yet (not even
+   * a cleared conversation) and has no room: a clear only takes the place of conversations with nothing in them,
+   * never of anyone's saved exchanges.
    */
   'clear_conversation' : ActorMethod<[], bigint>,
   'get_character' : ActorMethod<[], Character>,
@@ -163,7 +168,8 @@ export interface _SERVICE {
   'health' : ActorMethod<[], string>,
   /**
    * Sends a message as the next exchange after `base_revision`. A (request id, base revision) pair is saved at most
-   * once: repeating it returns the saved reply, and a stale revision is a Conflict.
+   * once: repeating it returns the saved reply. A base revision other than the conversation's is a Conflict, for
+   * good once the conversation has moved past it (see `ChatError::Conflict`).
    */
   'send_message' : ActorMethod<[string, bigint, string], Result>,
   /**

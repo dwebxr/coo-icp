@@ -1,0 +1,6 @@
+[toolchain]
+# The version the canister is built and tested with. Change it deliberately: the Wasm module, and so its hash,
+# depends on the compiler.
+channel = "1.93.0"
+targets = ["wasm32-unknown-unknown"]
+components = ["rustfmt", "clippy"]

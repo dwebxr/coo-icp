@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  canister:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # rust-toolchain.toml selects the toolchain, the wasm32 target, rustfmt and clippy.
+      - run: rustup show
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked -p eliza_backend -p mock_llm --all-targets --features test-hooks -- -D warnings
+      # Unit tests, including "the Candid file matches the code" and "0.6.0 clients still understand the interface".
+      - run: cargo test --locked -p eliza_backend --lib
+      - run: cargo build --locked --target wasm32-unknown-unknown --release -p eliza_backend
+      # The PocketIC integration tests (make test-canister) need the PocketIC server that ships with dfx and are
+      # run locally before a release.
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: src/eliza_frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: src/eliza_frontend/package-lock.json
+      - run: npm ci
+      - run: npm audit --audit-level=high
+      - run: npx tsc --noEmit
+      - run: npm test
+      - run: npm run build
+      # Development-only code must not reach a production bundle.
+      - run: "! grep -l -E 'createMockBackend|coo:dev-identity' dist/assets/*.js"
