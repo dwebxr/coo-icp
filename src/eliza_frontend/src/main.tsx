@@ -6,13 +6,21 @@ import { trackViewport } from './lib/viewport';
 import './index.css';
 
 async function createBackend(): Promise<Backend> {
-  // Development only: ?mock=<scenario> previews UI states without Internet Identity.
-  // import.meta.env.DEV is statically false in production builds, so this branch and the mock are removed.
+  // Development only. import.meta.env.DEV is statically false in production builds, so this branch and the
+  // modules it imports are removed from them.
+  //   ?mock=<scenario>        previews UI states without a canister or Internet Identity
+  //   ?dev-identity[=<name>]  the real client against a local replica, signed in with a locally made identity
   if (import.meta.env.DEV) {
-    const scenario = new URLSearchParams(window.location.search).get('mock');
+    const params = new URLSearchParams(window.location.search);
+    const scenario = params.get('mock');
     if (scenario !== null) {
       const { createMockBackend } = await import('./dev/mockBackend');
       return createMockBackend(scenario);
+    }
+    const devIdentity = params.get('dev-identity');
+    if (devIdentity !== null) {
+      const { devAuth } = await import('./dev/devIdentity');
+      return createIcBackend(devAuth(devIdentity || 'default'));
     }
   }
   return createIcBackend();

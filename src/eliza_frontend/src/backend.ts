@@ -1,8 +1,15 @@
-import { Actor, HttpAgent, type Identity } from '@dfinity/agent';
+import { Actor, HttpAgent, type ActorMethod, type Identity } from '@dfinity/agent';
 import { AuthClient } from '@dfinity/auth-client';
+import type { IDL } from '@dfinity/candid';
 import { isDelegationValid, type DelegationChain } from '@dfinity/identity';
-import { idlFactory, canisterId, type _SERVICE, type Message as CandidMessage } from './declarations/eliza_backend';
+import {
+  idlFactory,
+  type _SERVICE,
+  type Conversation as CandidConversation,
+  type Message as CandidMessage,
+} from './declarations/eliza_backend';
 import { isAuthError, isCanisterReject } from './lib/callErrors';
+import { network } from './network';
 
 export interface Message {
   role: string;
@@ -29,9 +36,9 @@ export interface Session {
 
 /**
  * What the canister did with this call (submitted exactly once). `err` is short, user-facing text: nothing was
- * saved, and no other attempt with the same id and base can be saved later either. Busy, conflict (the
- * conversation changed since `base`), failed (the model could not reply) and rejected (the canister refused or
- * failed it) only say that this call saved nothing.
+ * saved, and no other attempt with the same id and base can be saved later either. Busy (the caller has another
+ * chat in progress, or the canister is at a limit), conflict (the conversation is not at `base`), failed (the model
+ * could not reply) and rejected (the canister refused or failed it) only say that this call saved nothing.
  */
 export type SendOutcome =
   | { ok: Sent }
@@ -58,7 +65,10 @@ export interface Backend {
   /** Must be called synchronously from a click handler so the identity window is not blocked. */
   signIn(): Promise<Session>;
   signOut(): Promise<void>;
+  /** The saved conversation, as one replica reports it (fast; a replica can be a little behind). */
   history(): Promise<Conversation>;
+  /** The saved conversation, as the subnet certifies it (an update call: slower, never behind). */
+  certifiedHistory(): Promise<Conversation>;
   /**
    * Sends a message as the next exchange after revision `base`. A (request id, base) pair is saved at most once:
    * repeating it replays the saved reply, and a changed conversation is a conflict.
@@ -71,17 +81,14 @@ export interface Backend {
   sessionExpiresAt(): number | null;
 }
 
-const isMainnet =
-  typeof window !== 'undefined' &&
-  (window.location.hostname.endsWith('.icp0.io') ||
-    window.location.hostname.endsWith('.ic0.app') ||
-    window.location.hostname.endsWith('.raw.ic0.app'));
-
-const iiCanisterId =
-  (import.meta as { env?: Record<string, string | undefined> }).env?.CANISTER_ID_INTERNET_IDENTITY ||
-  'rdmx6-jaaaa-aaaaa-aaadq-cai';
-
-const identityProvider = isMainnet ? 'https://identity.internetcomputer.org' : `http://${iiCanisterId}.localhost:4943`;
+/** Signing in and out. The default is Internet Identity; development can supply another (see dev/). */
+export interface Auth {
+  /** Prepares sign-in and returns the identity of an earlier session, if there is one. */
+  restore(): Promise<Identity | null>;
+  /** Must begin synchronously inside a click handler, so the identity window is not blocked as a pop-up. */
+  signIn(): Promise<Identity>;
+  signOut(): Promise<void>;
+}
 
 function delegationOf(identity: Identity): DelegationChain | null {
   const maybe = identity as Identity & { getDelegation?: () => DelegationChain };
@@ -98,79 +105,29 @@ function popupFeatures(): string | undefined {
   return `width=${width},height=${height},left=${left},top=${top},toolbar=0,location=0,menubar=0`;
 }
 
-const toMessage = (m: CandidMessage): Message => ({
-  role: m.role,
-  content: m.content,
-  ...(m.request_id.length ? { requestId: m.request_id[0] } : {}),
-});
-
-const toSent = (sent: { reply: string; revision: bigint }): Sent => ({ reply: sent.reply, revision: Number(sent.revision) });
-
-export function createIcBackend(): Backend {
+export function internetIdentityAuth(identityProvider: string): Auth {
   let client: AuthClient | null = null;
-  // Queries go through an agent that retries on its own. Updates go through one that never re-submits: the app
-  // re-sends them itself (with a request id the canister deduplicates), so it always knows whether an earlier
-  // submission might still arrive. (The agent's v3 → v2 fallback only follows a v3 404, i.e. an unprocessed call.)
-  let actors: { query: _SERVICE; update: _SERVICE } | null = null;
-  let restoring: Promise<Session | null> | null = null;
-  // Bumped by every connect and sign-out, so a slower, superseded connect never publishes its actor.
-  let connection = 0;
-
   // The library idle manager leaks listeners and re-fires callbacks; the app runs its own idle timer.
   const newClient = () => AuthClient.create({ idleOptions: { disableIdle: true } });
 
-  const connect = async (identity: Identity): Promise<Session> => {
-    const attempt = ++connection;
-    const host = isMainnet ? 'https://icp-api.io' : undefined;
-    const queryAgent = HttpAgent.createSync({ identity, host });
-    const updateAgent = HttpAgent.createSync({ identity, host, retryTimes: 0 });
-    if (!isMainnet) await Promise.all([queryAgent.fetchRootKey(), updateAgent.fetchRootKey()]);
-    if (attempt !== connection) throw new SignInCancelled();
-    actors = {
-      query: Actor.createActor<_SERVICE>(idlFactory, { agent: queryAgent, canisterId }),
-      update: Actor.createActor<_SERVICE>(idlFactory, { agent: updateAgent, canisterId }),
-    };
-    return { principal: identity.getPrincipal().toText() };
-  };
-
-  const call = async <T>(fn: (a: _SERVICE) => Promise<T>, kind: 'query' | 'update' = 'query'): Promise<T> => {
-    if (!actors) throw new SessionInvalid('Not signed in');
-    const current = actors[kind];
-    if (!sessionValid()) throw new SessionInvalid('Session expired');
-    try {
-      return await fn(current);
-    } catch (err) {
-      if (isAuthError(err)) throw new SessionInvalid(String(err));
-      throw err;
-    }
-  };
-
-  const sessionValid = () => {
-    const chain = client ? delegationOf(client.getIdentity()) : null;
-    return !!chain && isDelegationValid(chain);
-  };
-
   return {
-    restore() {
-      restoring ??= (async () => {
-        client = await newClient();
-        if (!(await client.isAuthenticated()) || !sessionValid()) return null;
-        return connect(client.getIdentity());
-      })();
-      return restoring;
+    async restore() {
+      client = await newClient();
+      // isAuthenticated() ignores expiry; the caller checks the delegation itself.
+      return (await client.isAuthenticated()) ? client.getIdentity() : null;
     },
 
     signIn() {
       const current = client;
       if (!current) return Promise.reject(new Error('Sign-in is not ready'));
-      return new Promise<Session>((resolve, reject) => {
+      return new Promise<Identity>((resolve, reject) => {
         void current.login({
           identityProvider,
           windowOpenerFeatures: popupFeatures(),
           onSuccess: () => {
             // Ignore a late success from a client that was replaced by sign-out in the meantime.
-            if (client !== current) return reject(new SignInCancelled());
-            connect(current.getIdentity()).then(resolve, reject);
+            if (client !== current) reject(new SignInCancelled());
+            else resolve(current.getIdentity());
           },
           onError: (reason) => {
             reject(reason === 'UserInterrupt' ? new SignInCancelled() : new Error(reason || 'Sign-in failed'));
@@ -180,11 +137,6 @@ export function createIcBackend(): Backend {
     },
 
     async signOut() {
-      connection += 1;
-      // The actor is dropped rather than its agent invalidated: a chat already in flight keeps polling with
-      // its own identity until it settles, so the app learns whether the canister saved it. No new call can
-      // be made once the actor is gone.
-      actors = null;
       const previous = client;
       client = null;
       try {
@@ -195,16 +147,123 @@ export function createIcBackend(): Backend {
         client = await newClient();
       }
     },
+  };
+}
+
+const toMessage = (m: CandidMessage): Message => ({
+  role: m.role,
+  content: m.content,
+  ...(m.request_id.length ? { requestId: m.request_id[0] } : {}),
+});
+
+const toConversation = (c: CandidConversation): Conversation => ({
+  messages: c.messages.map(toMessage),
+  revision: Number(c.revision),
+});
+
+const toSent = (sent: { reply: string; revision: bigint }): Sent => ({ reply: sent.reply, revision: Number(sent.revision) });
+
+/**
+ * `get_conversation` declared as an update method. Called that way it goes through consensus and the subnet
+ * certifies the answer, where a query is answered by a single replica that may be a few seconds behind.
+ */
+interface CertifiedReads {
+  get_conversation: ActorMethod<[], CandidConversation>;
+}
+
+const certifiedReads: IDL.InterfaceFactory = (args) => {
+  const [, read] = idlFactory(args)._fields.find(([name]) => name === 'get_conversation')!;
+  return args.IDL.Service({ get_conversation: args.IDL.Func(read.argTypes, read.retTypes, []) });
+};
+
+interface Actors {
+  query: _SERVICE;
+  update: _SERVICE;
+  certified: CertifiedReads;
+}
+
+export function createIcBackend(auth: Auth = internetIdentityAuth(network.identityProvider)): Backend {
+  // The identity of the current session, and the actors that call the canister as it.
+  // Queries go through an agent that retries on its own. Updates go through one that never re-submits: the app
+  // re-sends them itself (with a request id the canister deduplicates), so it always knows whether an earlier
+  // submission might still arrive. (The agent's v3 → v2 fallback only follows a v3 404, i.e. an unprocessed call.)
+  let session: { identity: Identity; actors: Actors } | null = null;
+  let restoring: Promise<Session | null> | null = null;
+  // Bumped by every connect and sign-out, so a slower, superseded connect never publishes its actors.
+  let connection = 0;
+
+  const valid = (identity: Identity) => {
+    const chain = delegationOf(identity);
+    return !!chain && isDelegationValid(chain);
+  };
+
+  const connect = async (identity: Identity): Promise<Session> => {
+    const attempt = ++connection;
+    const canisterId = network.backendCanisterId;
+    if (!canisterId) throw new Error('No backend canister id for the local replica: deploy locally first.');
+    const queryAgent = HttpAgent.createSync({ identity, host: network.host });
+    const updateAgent = HttpAgent.createSync({ identity, host: network.host, retryTimes: 0 });
+    // Only a local replica has its own root key. On the Internet Computer the agent's built-in key is the trust
+    // anchor and must never be replaced by one fetched from the network.
+    if (network.local) await Promise.all([queryAgent.fetchRootKey(), updateAgent.fetchRootKey()]);
+    if (attempt !== connection) throw new SignInCancelled();
+    session = {
+      identity,
+      actors: {
+        query: Actor.createActor<_SERVICE>(idlFactory, { agent: queryAgent, canisterId }),
+        update: Actor.createActor<_SERVICE>(idlFactory, { agent: updateAgent, canisterId }),
+        certified: Actor.createActor<CertifiedReads>(certifiedReads, { agent: queryAgent, canisterId }),
+      },
+    };
+    return { principal: identity.getPrincipal().toText() };
+  };
+
+  const call = async <T>(fn: (actors: Actors) => Promise<T>): Promise<T> => {
+    if (!session) throw new SessionInvalid('Not signed in');
+    if (!valid(session.identity)) throw new SessionInvalid('Session expired');
+    try {
+      return await fn(session.actors);
+    } catch (err) {
+      if (isAuthError(err)) throw new SessionInvalid(String(err));
+      throw err;
+    }
+  };
+
+  return {
+    restore() {
+      restoring ??= (async () => {
+        const identity = await auth.restore();
+        return identity && valid(identity) ? connect(identity) : null;
+      })();
+      return restoring;
+    },
+
+    signIn() {
+      // auth.signIn() runs synchronously inside the caller's click.
+      return auth.signIn().then(connect);
+    },
+
+    async signOut() {
+      connection += 1;
+      // The session is dropped rather than its agents invalidated: an update call already submitted still
+      // completes on its own (the canister may save it), but no new call can be made, and the app only learns
+      // about that request again from the history it loads after the next sign-in.
+      session = null;
+      await auth.signOut();
+    },
 
     async history() {
-      const conversation = await call((a) => a.get_conversation());
-      return { messages: conversation.messages.map(toMessage), revision: Number(conversation.revision) };
+      return toConversation(await call((a) => a.query.get_conversation()));
+    },
+
+    async certifiedHistory() {
+      return toConversation(await call((a) => a.certified.get_conversation()));
     },
 
     async send(requestId, base, text) {
       let result;
       try {
-        result = await call((a) => a.send_message(requestId, BigInt(base), text), 'update');
+        result = await call((a) => a.update.send_message(requestId, BigInt(base), text));
       } catch (err) {
         if (!isCanisterReject(err)) throw err;
         console.error('Chat rejected:', err);
@@ -222,15 +281,15 @@ export function createIcBackend(): Backend {
     },
 
     async status(requestId) {
-      const status = await call((a) => a.get_message_status(requestId));
+      const status = await call((a) => a.query.get_message_status(requestId));
       if ('Done' in status) return { done: toSent(status.Done) };
       return 'Pending' in status ? 'pending' : 'unknown';
     },
 
-    clear: async () => Number(await call((a) => a.clear_conversation(), 'update')),
+    clear: async () => Number(await call((a) => a.update.clear_conversation())),
 
     sessionExpiresAt() {
-      const chain = actors && client ? delegationOf(client.getIdentity()) : null;
+      const chain = session ? delegationOf(session.identity) : null;
       if (!chain || chain.delegations.length === 0) return null;
       const earliest = chain.delegations.reduce(
         (min, { delegation }) => (delegation.expiration < min ? delegation.expiration : min),

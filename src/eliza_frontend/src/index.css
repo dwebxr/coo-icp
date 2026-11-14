@@ -862,6 +862,13 @@ a {
   color: var(--text-2);
 }
 
+.state-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+}
+
 .state-card > svg {
   color: var(--danger);
 }
@@ -929,6 +936,18 @@ a {
 .send-btn:disabled {
   background: var(--surface-hover);
   color: var(--text-3);
+}
+
+.composer-count {
+  padding: 6px 18px 0;
+  font-size: 12px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-3);
+}
+
+.composer-count.over {
+  color: var(--danger);
 }
 
 .composer-note {

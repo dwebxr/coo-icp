@@ -356,8 +356,15 @@ await test('Sign out while a reply is pending: no stale reply, Send works after 
   await p.waitForTimeout(1500);
   // The canister may have saved the exchange; the old request must not add a second copy.
   expect((await replies(p)) <= 1 && (await userBubbles(p)) <= 1, 'stale reply not duplicated');
+  // Wait for the old request to settle (the canister saves it), then really send.
+  await p.waitForSelector('.msg-assistant:not(.thinking)', { timeout: 6000 });
+  const before = await replies(p);
   await p.locator('textarea').fill('again');
   expect(!(await p.locator('.send-btn').isDisabled()), 'send enabled (pending reset)');
+  await p.keyboard.press('Enter');
+  await p.waitForFunction((n) => document.querySelectorAll('.msg-assistant:not(.thinking)').length === n + 1, before, { timeout: 6000 });
+  expect((await p.locator('.msg-user .bubble').last().innerText()) === 'again', 'the new message is in the thread');
+  expect((await stats(p)).answered === before + 1, `answered ${(await stats(p)).answered}`);
 });
 
 await test('Sign-in cancel is silent; error shows notice', async (p) => {
@@ -509,6 +516,153 @@ await test('Request from a previous session blocks writes until it settles, then
   await p.waitForSelector('.msg-assistant:not(.thinking)', { timeout: 6000 });
   expect(!(await p.locator('.send-btn').isDisabled()), 'send enabled after it settles');
 });
+
+// ---------- 0.7.0 ----------
+
+await test('A draft kept from an expired session is not shown to someone else who signs in', async (p) => {
+  await open(p, '?mock=expiring&relogin=aaaaa-aa');
+  await p.locator('textarea').fill('private thought');
+  await p.waitForSelector('.signin', { timeout: 8000 });
+  await p.getByRole('button', { name: /sign in/i }).click();
+  await p.waitForSelector('.chat');
+  expect((await p.locator('textarea').inputValue()) === '', 'the other principal starts with an empty composer');
+});
+
+await test('Cancel during sign-in is final: a sign-in that completes afterwards is discarded', async (p) => {
+  await open(p, '?mock=signedout&signin=late');
+  await p.getByRole('button', { name: /sign in/i }).click();
+  await p.waitForSelector('text=Allow pop-ups', { timeout: 5000 });
+  await p.getByRole('button', { name: 'Cancel' }).click();
+  // The mock completes the sign-in about a second later.
+  await p.waitForTimeout(2500);
+  expect((await p.locator('.chat').count()) === 0, 'still signed out');
+  await p.waitForFunction(() => !document.querySelector('.btn-primary')?.disabled, null, { timeout: 3000 });
+  // A sign-in the user does not cancel still works.
+  await p.getByRole('button', { name: /sign in/i }).click();
+  await p.waitForSelector('.chat', { timeout: 8000 });
+});
+
+await test('Signing out in one tab signs out the other', async (p, ctx) => {
+  await open(p, '?mock=chat');
+  const other = await ctx.newPage();
+  await other.goto(`${BASE}/?mock=chat`);
+  await other.waitForSelector('.thread[aria-busy="false"]');
+  await other.locator('textarea').fill('half a message');
+  await p.getByRole('button', { name: 'Account' }).click();
+  await p.getByRole('menuitem', { name: /sign out/i }).click();
+  await other.waitForSelector('.signin', { timeout: 3000 });
+  expect((await other.locator('.notice').innerText()).includes('another tab'), 'says why');
+  await other.getByRole('button', { name: /sign in/i }).click();
+  await other.waitForSelector('.chat');
+  expect((await other.locator('textarea').inputValue()) === '', 'its draft is gone');
+});
+
+await test('A session that sat idle with the tab closed is not restored', async (p, ctx) => {
+  await ctx.addInitScript(() => localStorage.setItem('coo:last-active', String(Date.now() - 11 * 60 * 1000)));
+  await p.goto(`${BASE}/?mock=chat`);
+  await p.waitForSelector('.signin');
+  expect((await p.locator('.notice').innerText()).includes('inactivity'), 'idle notice');
+  expect((await p.locator('.chat').count()) === 0, 'not signed in');
+});
+
+await test('Activity in another tab keeps this one signed in', async (p) => {
+  await p.clock.install();
+  await open(p, '?mock=chat');
+  await p.clock.runFor(1500);
+  await p.waitForSelector('.chat textarea');
+  await p.clock.runFor(9 * 60 * 1000);
+  // Another tab was used a moment ago.
+  await p.evaluate(() => localStorage.setItem('coo:last-active', String(Date.now())));
+  await p.clock.runFor(2 * 60 * 1000);
+  expect((await p.locator('.chat').count()) === 1, 'still signed in 11 minutes after its own last activity');
+  await p.clock.runFor(9 * 60 * 1000);
+  await p.waitForSelector('.signin');
+});
+
+await test('A clear that gets no answer can be left, blocks sending, and is not reported as done', async (p) => {
+  await p.clock.install();
+  await open(p, '?mock=clearhang');
+  await p.clock.runFor(1500);
+  await p.waitForSelector('.thread[aria-busy="false"]');
+  await p.getByRole('button', { name: 'Account' }).click();
+  await p.getByRole('menuitem', { name: /clear/i }).click();
+  await p.locator('dialog').getByRole('button', { name: 'Clear' }).click();
+  await p.clock.runFor(31_000);
+  await p.waitForSelector('.dialog-error');
+  await p.locator('dialog').getByRole('button', { name: 'Cancel' }).click();
+  expect((await p.locator('dialog[open]').count()) === 0, 'dialog closed');
+  expect((await userBubbles(p)) > 0, 'the thread is not emptied on a guess');
+  await p.locator('textarea').fill('next');
+  expect(await p.locator('.send-btn').isDisabled(), 'nothing is sent while the clear is still out');
+});
+
+await test('History behind what this device saw is settled by asking the canister through consensus', async (p) => {
+  await open(p, '?mock=chat&delay=200');
+  // One exchange, so this device has a floor stored for the conversation.
+  await p.locator('textarea').fill('hello');
+  await p.keyboard.press('Enter');
+  await p.waitForFunction(() => Object.keys(localStorage).some((name) => name.startsWith('coo:floor:')));
+  // As if the canister had been restored to an older state: this device remembers a far newer revision.
+  const key = await p.evaluate(() => {
+    const k = Object.keys(localStorage).find((name) => name.startsWith('coo:floor:'));
+    if (k) localStorage.setItem(k, '0:99');
+    return k;
+  });
+  expect(!!key, 'a floor was stored');
+  await p.reload();
+  await p.waitForSelector('.thread[aria-busy="false"]', { timeout: 15000 });
+  expect((await p.locator('.state-card').count()) === 0, 'no error');
+  expect((await userBubbles(p)) === 2, 'the conversation is shown');
+  const stored = await p.evaluate((k) => localStorage.getItem(k), key);
+  expect(stored === '1:0', `the floor follows the canister in a new epoch (${stored})`);
+});
+
+await test('A conversation that cannot be loaded can still be cleared', async (p) => {
+  await open(p, '?mock=historyerror');
+  await p.waitForSelector('text=Couldn\'t load your conversation');
+  await p.getByRole('button', { name: 'Clear conversation' }).click();
+  await p.locator('dialog').getByRole('button', { name: 'Clear' }).click();
+  await p.waitForSelector('.empty');
+  expect((await p.locator('.state-card').count()) === 0, 'error gone');
+  await p.locator('textarea').fill('hello again');
+  expect(!(await p.locator('.send-btn').isDisabled()), 'can send');
+});
+
+await test('A message over 4 000 bytes cannot be sent, and the composer says so', async (p) => {
+  await open(p, '?mock=empty');
+  const area = p.locator('textarea');
+  await area.fill('x'.repeat(100));
+  expect((await p.locator('.composer-count').count()) === 0, 'no counter for a short message');
+  await area.fill('x'.repeat(3700));
+  expect((await p.locator('.composer-count').innerText()).replace(/\s/g, '') === '3700/4000bytes', 'counter near the limit');
+  expect(!(await p.locator('.send-btn').isDisabled()), 'still sendable');
+  // Bytes, not characters: 1 334 Japanese characters are 4 002 bytes.
+  await area.fill('あ'.repeat(1334));
+  expect(await p.locator('.send-btn').isDisabled(), 'send disabled over the limit');
+  expect((await p.locator('.composer-count.over').count()) === 1, 'counter shows the overflow');
+  await area.press('Enter');
+  await p.waitForTimeout(300);
+  expect((await stats(p)).sends === 0, 'Enter does not send it either');
+  await area.fill('あ'.repeat(1333));
+  expect(!(await p.locator('.send-btn').isDisabled()), 'sendable at the limit');
+});
+
+await test('A suggestion sent with one click leaves a typed draft alone', async (p) => {
+  await open(p, '?mock=empty&delay=300');
+  await p.locator('textarea').fill('my own question');
+  await p.locator('.chip').first().click();
+  await p.waitForSelector('.msg-assistant:not(.thinking)');
+  expect((await p.locator('textarea').inputValue()) === 'my own question', 'draft kept');
+});
+
+await test('Each message names its speaker for screen readers', async (p) => {
+  await open(p, '?mock=chat');
+  // textContent: engines differ on whether innerText includes visually hidden text.
+  expect((await p.locator('.msg-user').first().textContent()).startsWith('You'), 'user message is labelled');
+  expect((await p.locator('.msg-assistant .msg-body').first().textContent()).startsWith('Coo'), 'reply is labelled');
+  expect((await p.locator('.msg-user .bubble').first().innerText()) === 'What is the Internet Computer?', 'bubble text unchanged');
+});
+
 
 await browser.close();
 console.log(results.join('\n'));

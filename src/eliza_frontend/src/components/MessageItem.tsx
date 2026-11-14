@@ -20,6 +20,8 @@ export const MessageItem = memo(function MessageItem({ message, latest = false, 
   if (message.role === 'user') {
     return (
       <div className={`msg msg-user${motion}`}>
+        {/* Outside .bubble so the text of the bubble stays exactly the message. */}
+        <span className="sr-only">You: </span>
         <div className={message.error ? 'bubble failed' : 'bubble'}>{message.content}</div>
         {message.checking && (
           <div className="msg-status" role="status">
@@ -49,6 +51,8 @@ export const MessageItem = memo(function MessageItem({ message, latest = false, 
     <div className={`msg msg-assistant${latest ? ' is-latest' : ''}${motion}`}>
       <CooAvatar size={28} className="avatar" />
       <div className="msg-body">
+        {/* The copy button copies message.content, not the DOM, so the label never reaches the clipboard. */}
+        <span className="sr-only">Coo: </span>
         <Markdown text={message.content} />
         <div className="msg-actions">
           <CopyButton text={message.content} label="Copy reply" />

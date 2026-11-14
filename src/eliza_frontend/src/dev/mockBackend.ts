@@ -5,8 +5,9 @@
 //
 // Scenarios: signedout | empty | chat | long | rich | slow | error | busy | offline | lostreply | inprogress | hang |
 //            latesave | conflict | stale | laggy (one history read from before the last clear) | clearerror |
-//            historyerror | expiring | badsession
-// Extra params: signin=cancel|error|hang  delay=<ms>
+//            clearhang (the clear call never returns) | historyerror | expiring | badsession
+// Extra params: signin=cancel|error|hang|late (succeeds after 4 s)  delay=<ms>
+//               relogin=<principal> (who signs in after the first session has ended: someone else at the same tab)
 import {
   SessionInvalid,
   SignInCancelled,
@@ -19,6 +20,8 @@ import {
 } from '../backend';
 
 const PRINCIPAL = 'h7xqe-2mlpn-aaaab-qbm3a-cai4f-ufp5q-tdqbv-wv6jf-3pgv3-zkm4p-aqe';
+// What the canister accepts (UTF-8 bytes).
+const MAX_MESSAGE_BYTES = 4000;
 
 const SAMPLE: Message[] = [
   { role: 'user', content: 'What is the Internet Computer?' },
@@ -71,8 +74,8 @@ const REPLY =
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// The canister keeps at most this many messages, its system prompt included.
-const MAX_CONVERSATION_LENGTH = 50;
+// The canister keeps at most this many turns per conversation.
+const MAX_TURNS = 50;
 
 export function createMockBackend(scenario: string): Backend {
   const params = new URLSearchParams(window.location.search);
@@ -97,7 +100,8 @@ export function createMockBackend(scenario: string): Backend {
   const stats = { sends: 0, answered: 0, ids: [] as string[] };
   (window as unknown as { __mock: typeof stats }).__mock = stats;
 
-  const session = (): Session => ({ principal: PRINCIPAL });
+  let principal = PRINCIPAL;
+  const session = (): Session => ({ principal });
   const guard = () => {
     if (!signedIn || Date.now() >= expiresAt) throw new SessionInvalid('mock session invalid');
   };
@@ -119,6 +123,8 @@ export function createMockBackend(scenario: string): Backend {
   function check(id: string, base: number, text: string): SendOutcome | null {
     const exchange = saved(id);
     if (exchange) return exchange.text === text ? { ok: exchange.sent } : { err: 'This request id was used for another message.' };
+    const bytes = new TextEncoder().encode(text).length;
+    if (bytes > MAX_MESSAGE_BYTES) return { err: `Message is too long (${bytes} bytes; the limit is ${MAX_MESSAGE_BYTES}).` };
     if (inFlight) return inFlight.id === id ? { inProgress: true } : { busy: true };
     if (base !== revision) return { conflict: true };
     return null;
@@ -132,10 +138,10 @@ export function createMockBackend(scenario: string): Backend {
     inFlight = null;
     if (flight.cleared) return { err: 'Conversation cleared.' };
     if (scenario === 'error') return { failed: true };
-    // Trim like the canister (which also keeps a system prompt), then add the reply.
-    const next = [...messages, { role: 'user', content: text, requestId: id }];
-    const kept = next.length + 1 > MAX_CONVERSATION_LENGTH ? next.slice(1 - MAX_CONVERSATION_LENGTH) : next;
-    messages = [...kept, { role: 'assistant', content: REPLY }];
+    // Trim like the canister: the newest turns, never starting with a reply.
+    const next = [...messages, { role: 'user', content: text, requestId: id }, { role: 'assistant', content: REPLY }];
+    const kept = next.slice(Math.max(next.length - MAX_TURNS, 0));
+    messages = kept.slice(kept.findIndex((m) => m.role === 'user'));
     revision += 1;
     stats.answered += 1;
     return { ok: { reply: REPLY, revision } };
@@ -148,12 +154,13 @@ export function createMockBackend(scenario: string): Backend {
     },
 
     async signIn() {
-      await sleep(1200);
+      await sleep(signInMode === 'late' ? 4000 : 1200);
       if (signInMode === 'hang') return new Promise<Session>(() => {});
       if (signInMode === 'cancel') throw new SignInCancelled();
       if (signInMode === 'error') throw new Error('mock sign-in failure');
       signedIn = true;
       expiresAt = Date.now() + 8 * 3600 * 1000;
+      principal = params.get('relogin') ?? principal;
       return session();
     },
 
@@ -172,6 +179,13 @@ export function createMockBackend(scenario: string): Backend {
         beforeClear = null;
         return stale;
       }
+      return { messages: messages.map((m) => ({ ...m })), revision };
+    },
+
+    async certifiedHistory() {
+      // Through consensus: slower, and never the stale copy a lagging replica returns.
+      await sleep(600);
+      guard();
       return { messages: messages.map((m) => ({ ...m })), revision };
     },
 
@@ -236,6 +250,7 @@ export function createMockBackend(scenario: string): Backend {
       guard();
       await sleep(300);
       if (scenario === 'clearerror') throw new Error('mock clear failure');
+      if (scenario === 'clearhang') return new Promise<number>(() => {});
       if (scenario === 'laggy') beforeClear = { messages: messages.map((m) => ({ ...m })), revision };
       revision += 1;
       messages = [];

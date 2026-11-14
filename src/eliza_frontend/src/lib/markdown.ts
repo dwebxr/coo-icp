@@ -35,14 +35,52 @@ const ESCAPABLE = '\\`*_[]()#+-.!>~|';
 const MAX_INLINE_DEPTH = 6;
 const MAX_QUOTE_DEPTH = 4;
 
+// Block constructs are only recognised on lines up to this length; a longer line is paragraph text.
+// Real markup lines are short, and the cap bounds the work any line-level pattern can do.
+const MAX_BLOCK_LINE = 2000;
+
 export function safeHref(url: string): string | null {
   if (!/^https?:\/\/[^\s]+$/i.test(url)) return null;
   try {
-    const { protocol } = new URL(url);
+    const { protocol, username, password } = new URL(url);
+    // https://good.example@evil.example/ would read as "good.example" but go to evil.example.
+    if (username || password) return null;
     return protocol === 'http:' || protocol === 'https:' ? url : null;
   } catch {
     return null;
   }
+}
+
+// A host name (at least one dot, alphabetic TLD) with optional scheme, port and path. Labels are at most 300
+// characters and segments are separated by a mandatory dot that the segment class excludes, so it is linear.
+const URL_LABEL = /^(?:https?:\/\/)?[\p{L}\p{N}-]+(?:\.[\p{L}\p{N}-]+)*\.\p{L}{2,}(?::\d{1,5})?(?:[/?#]\S*)?$/iu;
+
+/** True when a link label reads as a URL or host name (so it must not be trusted to name the target). */
+export function looksLikeUrl(label: string): boolean {
+  return URL_LABEL.test(label.trim());
+}
+
+const hostOf = (url: string): string | null => {
+  try {
+    return new URL(/^https?:\/\//i.test(url) ? url : `https://${url}`).hostname.replace(/^www\./, '');
+  } catch {
+    return null;
+  }
+};
+
+/** Children to show for a link: a URL-like label that names another host is replaced by the real target. */
+function linkChildren(label: Inline[], href: string): Inline[] {
+  const plain = inlineText(label).trim();
+  if (!looksLikeUrl(plain)) return label;
+  const shown = hostOf(plain);
+  return shown !== null && shown === hostOf(href) ? label : [{ type: 'text', text: href }];
+}
+
+// Drops trailing sentence punctuation from an autolink with a scan; an unanchored /[.,;:!?]+$/ is quadratic on long runs.
+function trimUrlEnd(url: string): string {
+  let end = url.length;
+  while (end > 0 && '.,;:!?'.includes(url[end - 1])) end -= 1;
+  return url.slice(0, end);
 }
 
 const isWordChar = (ch: string | undefined) => !!ch && /[\p{L}\p{N}_]/u.test(ch);
@@ -57,7 +95,8 @@ const EM_STAR = /^\*(?=[^\s*])([\s\S]{0,400}?[^\s*])\*(?!\*)/;
 const SPECIAL = '\\\n`[!h*_';
 const EM_UNDER = /^_(?=[^\s_])([\s\S]{0,400}?[^\s_])_(?![\p{L}\p{N}_])/u;
 
-export function parseInline(src: string, depth = 0): Inline[] {
+// inLabel: inside a link label, where bare URLs and nested links stay plain text (no link in a link).
+export function parseInline(src: string, depth = 0, inLabel = false): Inline[] {
   if (depth > MAX_INLINE_DEPTH) return src ? [{ type: 'text', text: src }] : [];
   const out: Inline[] = [];
   let buf = '';
@@ -129,14 +168,14 @@ export function parseInline(src: string, depth = 0): Inline[] {
     if (ch === '!' && (m = IMAGE.exec(rest))) {
       const href = safeHref(m[2]);
       const label = m[1] || 'image';
-      if (href) push({ type: 'link', href, children: [{ type: 'text', text: label }] }, m[0].length);
+      if (href && !inLabel) push({ type: 'link', href, children: [{ type: 'text', text: label }] }, m[0].length);
       else push({ type: 'text', text: label }, m[0].length);
       continue;
     }
-    if (ch === '[' && (m = LINK.exec(rest))) {
+    if (ch === '[' && !inLabel && (m = LINK.exec(rest))) {
       const href = safeHref(m[2]);
-      const children = parseInline(m[1], depth + 1);
-      if (href) push({ type: 'link', href, children }, m[0].length);
+      const children = parseInline(m[1], depth + 1, true);
+      if (href) push({ type: 'link', href, children: linkChildren(children, href) }, m[0].length);
       else {
         flush();
         out.push(...children);
@@ -144,22 +183,24 @@ export function parseInline(src: string, depth = 0): Inline[] {
       }
       continue;
     }
-    if (ch === 'h' && !isWordChar(prev) && (m = /^https?:\/\/[^\s<>()[\]{}"']+/i.exec(rest))) {
-      const url = m[0].replace(/[.,;:!?]+$/, '');
-      push({ type: 'link', href: url, children: [{ type: 'text', text: url }] }, url.length);
-      continue;
+    if (ch === 'h' && !inLabel && !isWordChar(prev) && (m = /^https?:\/\/[^\s<>()[\]{}"']+/i.exec(rest))) {
+      const url = trimUrlEnd(m[0]);
+      if (safeHref(url)) {
+        push({ type: 'link', href: url, children: [{ type: 'text', text: url }] }, url.length);
+        continue;
+      }
     }
     if (ch === '*' || ch === '_') {
       const canOpen = ch === '*' || !isWordChar(prev);
       if (canOpen) {
         const strong = (ch === '*' ? STRONG_STAR : STRONG_UNDER).exec(rest);
         if (strong) {
-          push({ type: 'strong', children: parseInline(strong[1], depth + 1) }, strong[0].length);
+          push({ type: 'strong', children: parseInline(strong[1], depth + 1, inLabel) }, strong[0].length);
           continue;
         }
         const em = (ch === '*' ? EM_STAR : EM_UNDER).exec(rest);
         if (em) {
-          push({ type: 'em', children: parseInline(em[1], depth + 1) }, em[0].length);
+          push({ type: 'em', children: parseInline(em[1], depth + 1, inLabel) }, em[0].length);
           continue;
         }
       }
@@ -181,9 +222,61 @@ const indentOf = (line: string) => {
   return n;
 };
 
-const FENCE = /^\s*(```+|~~~+)\s*([\w+#.-]*)\s*$/;
-const HEADING = /^\s{0,3}(#{1,6})\s+(.*?)\s*#*\s*$/;
-const HR = /^\s{0,3}([-*_])(\s*\1){2,}\s*$/;
+// Fence, heading and rule are recognised with a linear prefix test plus string scans. The obvious single
+// regexes (nested \s* around optional groups, a lazy body before a closing run) are cubic on long runs of
+// spaces or '#', and a stored reply would freeze the tab on every load.
+const HEADING_OPEN = /^\s{0,3}(#{1,6})\s+([\s\S]*)$/;
+const INFO = /^[\w+#.-]*$/;
+const isSpace = (c: string) => /\s/.test(c);
+
+function parseFenceOpen(line: string): { char: string; length: number; lang: string } | null {
+  const t = line.trim();
+  const char = t[0];
+  if (char !== '`' && char !== '~') return null;
+  let n = 1;
+  while (t[n] === char) n += 1;
+  if (n < 3) return null;
+  const lang = t.slice(n).trim();
+  return INFO.test(lang) ? { char, length: n, lang } : null;
+}
+
+// A closing fence is only the fence character, at least as many as the opener.
+function isFenceClose(line: string, char: string, length: number): boolean {
+  const t = line.trim();
+  if (t.length < length) return false;
+  for (let k = 0; k < t.length; k++) if (t[k] !== char) return false;
+  return true;
+}
+
+function parseHeading(line: string): { level: number; text: string } | null {
+  const m = HEADING_OPEN.exec(line);
+  if (!m) return null;
+  const body = m[2];
+  let end = body.length;
+  while (end > 0 && isSpace(body[end - 1])) end -= 1;
+  let start = end;
+  while (start > 0 && body[start - 1] === '#') start -= 1;
+  // A closing run only counts after whitespace (so "C#" keeps its #) or when it is the whole content.
+  if (start < end && (start === 0 || isSpace(body[start - 1]))) {
+    end = start;
+    while (end > 0 && isSpace(body[end - 1])) end -= 1;
+  }
+  return { level: m[1].length, text: body.slice(0, end) };
+}
+
+function isHr(line: string): boolean {
+  let k = 0;
+  while (k < 3 && k < line.length && isSpace(line[k])) k += 1;
+  const mark = line[k];
+  if (mark !== '-' && mark !== '*' && mark !== '_') return false;
+  let count = 0;
+  for (; k < line.length; k++) {
+    if (line[k] === mark) count += 1;
+    else if (!isSpace(line[k])) return false;
+  }
+  return count >= 3;
+}
+
 const QUOTE = /^\s{0,3}>\s?(.*)$/;
 const BULLET = /^(\s*)[-*+]\s+(.*)$/;
 const ORDERED = /^(\s*)(\d{1,9})[.)]\s+(.*)$/;
@@ -217,19 +310,19 @@ export function parseBlocks(src: string, depth = 0): Block[] {
 
   for (let li = 0; li < lines.length; li++) {
     const line = lines[li];
+    const long = line.length > MAX_BLOCK_LINE;
 
-    const fence = FENCE.exec(line);
+    const fence = long ? null : parseFenceOpen(line);
     if (fence) {
       closePara();
       closeLists();
-      const closer = fence[1][0];
       const body: string[] = [];
       li++;
-      while (li < lines.length && !new RegExp(`^\\s*\\${closer}{${fence[1].length},}\\s*$`).test(lines[li])) {
+      while (li < lines.length && !isFenceClose(lines[li], fence.char, fence.length)) {
         body.push(lines[li]);
         li++;
       }
-      blocks.push({ type: 'code', lang: fence[2], text: body.join('\n') });
+      blocks.push({ type: 'code', lang: fence.lang, text: body.join('\n') });
       afterBlank = false;
       continue;
     }
@@ -240,9 +333,9 @@ export function parseBlocks(src: string, depth = 0): Block[] {
       continue;
     }
 
-    const bullet = BULLET.exec(line);
-    const ordered = bullet ? null : ORDERED.exec(line);
-    if ((bullet || ordered) && !HR.test(line)) {
+    const bullet = long ? null : BULLET.exec(line);
+    const ordered = long || bullet ? null : ORDERED.exec(line);
+    if ((bullet || ordered) && !isHr(line)) {
       closePara();
       const indent = indentOf(line);
       const isOrdered = !!ordered;
@@ -278,7 +371,7 @@ export function parseBlocks(src: string, depth = 0): Block[] {
     if (stack.length) {
       const indent = indentOf(line);
       if (indent >= 2 || !afterBlank) {
-        if (!(HEADING.test(line) || QUOTE.test(line) || HR.test(line))) {
+        if (long || !(parseHeading(line) || QUOTE.test(line) || isHr(line))) {
           appendToItem(line, afterBlank);
           afterBlank = false;
           continue;
@@ -287,26 +380,26 @@ export function parseBlocks(src: string, depth = 0): Block[] {
       closeLists();
     }
 
-    const heading = HEADING.exec(line);
+    const heading = long ? null : parseHeading(line);
     if (heading) {
       closePara();
-      const level = Math.min(heading[1].length, 3) as 1 | 2 | 3;
-      blocks.push({ type: 'heading', level, children: parseInline(heading[2]) });
+      const level = Math.min(heading.level, 3) as 1 | 2 | 3;
+      blocks.push({ type: 'heading', level, children: parseInline(heading.text) });
       afterBlank = false;
       continue;
     }
 
-    if (HR.test(line)) {
+    if (!long && isHr(line)) {
       closePara();
       blocks.push({ type: 'hr' });
       afterBlank = false;
       continue;
     }
 
-    if (QUOTE.test(line) && depth < MAX_QUOTE_DEPTH) {
+    if (!long && QUOTE.test(line) && depth < MAX_QUOTE_DEPTH) {
       closePara();
       const inner: string[] = [];
-      while (li < lines.length && QUOTE.test(lines[li])) {
+      while (li < lines.length && lines[li].length <= MAX_BLOCK_LINE && QUOTE.test(lines[li])) {
         inner.push(QUOTE.exec(lines[li])![1]);
         li++;
       }

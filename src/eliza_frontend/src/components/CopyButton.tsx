@@ -1,44 +1,52 @@
 import { useEffect, useState } from 'react';
-import { CheckIcon, CopyIcon } from './icons';
+import { AlertIcon, CheckIcon, CopyIcon } from './icons';
 
-async function writeClipboard(text: string) {
+// Always resolves to a boolean: the fallback can throw (blocked or unsupported), and the textarea must not be left behind.
+async function writeClipboard(text: string): Promise<boolean> {
   try {
     await navigator.clipboard.writeText(text);
     return true;
   } catch {
     // Fallback for browsers that block the async clipboard API.
     const area = document.createElement('textarea');
-    area.value = text;
-    area.setAttribute('readonly', '');
-    area.style.position = 'fixed';
-    area.style.opacity = '0';
-    document.body.appendChild(area);
-    area.select();
-    const ok = document.execCommand('copy');
-    area.remove();
-    return ok;
+    try {
+      area.value = text;
+      area.setAttribute('readonly', '');
+      area.style.position = 'fixed';
+      area.style.opacity = '0';
+      document.body.appendChild(area);
+      area.select();
+      return document.execCommand('copy');
+    } catch {
+      return false;
+    } finally {
+      area.remove();
+    }
   }
 }
 
 export function CopyButton({ text, label = 'Copy', compact = false }: { text: string; label?: string; compact?: boolean }) {
-  const [copied, setCopied] = useState(false);
+  const [result, setResult] = useState<'copied' | 'failed' | null>(null);
 
   useEffect(() => {
-    if (!copied) return;
-    const timer = setTimeout(() => setCopied(false), 1600);
+    if (!result) return;
+    const timer = setTimeout(() => setResult(null), 1600);
     return () => clearTimeout(timer);
-  }, [copied]);
+  }, [result]);
+
+  const name = result === 'copied' ? 'Copied' : result === 'failed' ? 'Copy failed' : label;
+  const size = compact ? 14 : 16;
 
   return (
     <button
       type="button"
       className={compact ? 'copy-btn compact' : 'icon-btn'}
-      onClick={async () => setCopied(await writeClipboard(text))}
-      aria-label={copied ? 'Copied' : label}
-      title={copied ? 'Copied' : label}
+      onClick={async () => setResult((await writeClipboard(text)) ? 'copied' : 'failed')}
+      aria-label={name}
+      title={name}
     >
-      {copied ? <CheckIcon size={compact ? 14 : 16} /> : <CopyIcon size={compact ? 14 : 16} />}
-      {compact && <span>{copied ? 'Copied' : 'Copy'}</span>}
+      {result === 'copied' ? <CheckIcon size={size} /> : result === 'failed' ? <AlertIcon size={size} /> : <CopyIcon size={size} />}
+      {compact && <span>{result === 'copied' ? 'Copied' : result === 'failed' ? 'Failed' : 'Copy'}</span>}
     </button>
   );
 }

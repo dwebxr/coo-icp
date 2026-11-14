@@ -11,7 +11,7 @@ import { MessageItem, Thinking } from './MessageItem';
 const SUGGESTIONS = [
   'What is the Internet Computer?',
   'How do you run on-chain?',
-  'Explain elizaOS in simple terms',
+  'What can you help me with?',
   'Give me a Web3 project idea',
 ];
 
@@ -119,10 +119,16 @@ export function Chat({ coo }: { coo: Coo }) {
             <div className="state-card" role="alert">
               <AlertIcon size={20} />
               <p>Couldn't load your conversation.</p>
-              <button type="button" className="btn btn-ghost btn-sm" onClick={() => void coo.reloadHistory()}>
-                <RetryIcon size={15} />
-                Retry
-              </button>
+              <div className="state-actions">
+                <button type="button" className="btn btn-ghost btn-sm" onClick={() => void coo.reloadHistory()}>
+                  <RetryIcon size={15} />
+                  Retry
+                </button>
+                {/* A conversation that cannot be loaded can still be cleared, which also makes it loadable. */}
+                <button type="button" className="btn btn-ghost btn-sm" onClick={() => setConfirmClear(true)} disabled={busy}>
+                  Clear conversation
+                </button>
+              </div>
             </div>
           )}
 
@@ -132,7 +138,7 @@ export function Chat({ coo }: { coo: Coo }) {
               <h2>How can I help?</h2>
               <div className="suggestions">
                 {SUGGESTIONS.map((text) => (
-                  <button key={text} type="button" className="chip" onClick={() => coo.send(text)} disabled={!coo.canSend}>
+                  <button key={text} type="button" className="chip" onClick={() => coo.send(text, false)} disabled={!coo.canSend}>
                     {text}
                   </button>
                 ))}
@@ -181,7 +187,7 @@ export function Chat({ coo }: { coo: Coo }) {
       <ConfirmDialog
         open={confirmClear}
         title="Clear conversation?"
-        body="This permanently deletes your messages with Coo."
+        body="This deletes your conversation with Coo. It cannot be undone."
         confirmLabel="Clear"
         errorText="Couldn't clear the conversation. Try again."
         onConfirm={coo.clear}

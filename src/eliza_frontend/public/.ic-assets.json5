@@ -1,0 +1,29 @@
+// Response headers of the asset canister (read by dfx when it uploads dist/).
+// `dfx info security-policy` prints the standard policy this starts from.
+[
+  {
+    "match": "**/*",
+    // "hardened" = the standard policy's headers, with the ones below replacing its defaults.
+    "security_policy": "hardened",
+    "headers": {
+      // The app loads its own script, stylesheet and images, and talks to the Internet Computer's API — nothing
+      // else. No inline script or style, no eval, no frames, no forms; it may not be framed (clickjacking).
+      // Sign-in opens Internet Identity in its own window, which this policy does not govern.
+      // http://localhost:* and http://127.0.0.1:* are for a local replica (the same file is deployed there).
+      "Content-Security-Policy": "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self' https://icp-api.io http://localhost:* http://127.0.0.1:*; manifest-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; object-src 'none'",
+      // Everything off except writing to the clipboard, which the Copy buttons need. (The standard policy turns
+      // that off too, which would break them without any visible error.)
+      "Permissions-Policy": "accelerometer=(), ambient-light-sensor=(), autoplay=(), battery=(), camera=(), cross-origin-isolated=(), display-capture=(), document-domain=(), encrypted-media=(), execution-while-not-rendered=(), execution-while-out-of-viewport=(), fullscreen=(), geolocation=(), gyroscope=(), keyboard-map=(), magnetometer=(), microphone=(), midi=(), navigation-override=(), payment=(), picture-in-picture=(), publickey-credentials-get=(), screen-wake-lock=(), sync-xhr=(), usb=(), web-share=(), xr-spatial-tracking=(), clipboard-read=(), clipboard-write=(self), gamepad=(), speaker-selection=(), conversion-measurement=(), focus-without-user-activation=(), hid=(), idle-detection=(), interest-cohort=(), serial=(), sync-script=(), trust-token-redemption=(), window-placement=(), vertical-scroll=()",
+      "Referrer-Policy": "no-referrer"
+    },
+    // The uncertified *.raw.icp0.io domain redirects to the certified one.
+    "allow_raw_access": false
+  },
+  {
+    // Vite gives these files content-hashed names.
+    "match": "assets/**/*",
+    "headers": {
+      "Cache-Control": "public, max-age=31536000, immutable"
+    }
+  }
+]
