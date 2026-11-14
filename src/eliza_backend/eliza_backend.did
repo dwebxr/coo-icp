@@ -1,46 +1,47 @@
-type CanisterMetrics = record {
-  stable_memory_pages : nat64;
-  heap_memory_bytes : nat64;
-  version : text;
-  conversations : nat64;
-};
+// Who Coo is. All of it goes into the system message of every model request.
 type Character = record {
   bio : vec text;
   system_prompt : text;
   name : text;
   style : vec text;
 };
+// Why `send_message` saved nothing.
 type ChatError = variant {
+  // The request itself is refused, whenever it is sent: anonymous caller, malformed request id, a request id
+  // already used for another message, or an empty or too long message.
   Invalid : text;
-  // The model could not reply. Nothing was saved.
+  // The model did not answer, or not in time.
   Failed : text;
-  // Another message from this caller is being answered. Nothing was saved; retry later with the same id.
+  // Try again later, with the same request id: another message from this caller is being answered, or the
+  // canister is at one of its limits (chats in progress, model calls per minute, storage).
   Busy;
-  // The conversation was cleared while the reply was generated. Nothing was saved.
+  // The conversation was cleared while the reply was generated.
   Cleared;
   // This request id is already being answered; poll `get_message_status`.
   InProgress;
-  // The conversation changed since the client's revision. Nothing was run; reload and send again.
+  // The conversation changed since the client's revision. Nothing was run, and this request never will be;
+  // reload and send again.
   Conflict;
 };
-type Config = record {
-  admin : principal;
-  llm_provider : LlmProvider;
-  max_conversation_length : nat64;
+type Config = record { llm_provider : LlmProvider };
+// The caller's conversation and its revision.
+type Conversation = record {
+  messages : vec Message;
+  // Changes with every saved exchange and every clear, and never repeats for a caller.
+  revision : nat64;
 };
-// A conversation and its revision, for clients of send_message.
-type Conversation = record { messages : vec Message; revision : nat64 };
 type LlmProvider = variant {
+  // A canned echo, for local replicas where the LLM canister does not exist.
   Fallback;
-  // Removed in 0.7.0 (it could not reach consensus on mainnet). Still listed so saved state decodes; treated as
-  // OnChain.
-  OpenAI;
+  // The Internet Computer's LLM canister (mainnet only).
   OnChain;
 };
+// One turn of a conversation, as returned by `get_conversation`.
 type Message = record {
-  // The request id of a user message sent with send_message. Absent in state saved before v0.6.0.
+  // The request id a user message was sent with.
   request_id : opt text;
   content : text;
+  // "user" or "assistant".
   role : text;
 };
 type MessageStatus = variant {
@@ -48,6 +49,22 @@ type MessageStatus = variant {
   // Not being answered and not in the conversation (never received, failed, cleared, or trimmed away).
   Unknown;
   Pending;
+};
+type Metrics = record {
+  // Pages of stable memory allocated (64 KiB each). Stable memory is only written during upgrades.
+  stable_memory_pages : nat64;
+  // Size of the Wasm memory, which grows but never shrinks; not the bytes currently in use.
+  wasm_memory_bytes : nat64;
+  // All entries, including cleared conversations that only keep their revision.
+  entries : nat64;
+  version : text;
+  // Conversations with at least one saved exchange.
+  conversations : nat64;
+  // Bytes counted against the storage budget.
+  stored_bytes : nat64;
+  // The revision of every caller without an entry; raised whenever an entry is removed to make room.
+  revision_floor : nat64;
+  chats_in_flight : nat64;
 };
 type Result = variant { Ok : Sent; Err : ChatError };
 type Result_1 = variant { Ok; Err : text };
@@ -57,21 +74,27 @@ type Sent = record {
   reply : text;
 };
 service : () -> {
-  // Also cancels saving a reply that is still being generated. The conversation is replaced by an empty one with
-  // the next revision (even if there was none yet), so no request sent before the clear can run afterwards.
-  // Returns the new revision (older clients that expect no result ignore it).
+  // Empties the caller's conversation and cancels saving a reply that is still being generated. The conversation
+  // gets the next revision (even if there was none yet), so no request sent before the clear can run afterwards.
+  // Returns the new revision.
   clear_conversation : () -> (nat64);
-  get_character : () -> (opt Character) query;
-  get_config : () -> (opt Config) query;
+  get_character : () -> (Character) query;
+  get_config : () -> (Config) query;
+  // The caller's conversation: user and assistant turns, oldest first.
   get_conversation : () -> (Conversation) query;
+  // Conversations with at least one saved exchange.
   get_conversation_count : () -> (nat64) query;
   get_message_status : (text) -> (MessageStatus) query;
-  get_metrics : () -> (CanisterMetrics) query;
+  get_metrics : () -> (Metrics) query;
+  // "ok | v<version> | <n> conversations": the canister answers and its state is loaded. It says nothing about
+  // whether the model can be reached.
   health : () -> (text) query;
   // Sends a message as the next exchange after `base_revision`. A (request id, base revision) pair is saved at most
   // once: repeating it returns the saved reply, and a stale revision is a Conflict.
   send_message : (text, nat64, text) -> (Result);
+  // Controllers only.
   set_llm_provider : (LlmProvider) -> (Result_1);
+  // Controllers only. The new character applies to every conversation from its next message on.
   update_character : (Character) -> (Result_1);
   version : () -> (text) query;
 }

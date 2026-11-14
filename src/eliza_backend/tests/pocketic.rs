@@ -1,36 +1,38 @@
 //! Integration tests against a local PocketIC server.
 //!
-//! Ignored by default; run them with `make test-canister`, which builds the three wasm modules they load
-//! (the canister, the canister with `trap-after-reply`, and the mock LLM canister) and points POCKET_IC_BIN at the
-//! server bundled with dfx.
+//! Ignored by default; run them with `make test-canister`, which builds the wasm modules they load (the canister,
+//! its two test-only variants, the mock LLM canister, and the version deployed on mainnet) and points POCKET_IC_BIN
+//! at the server bundled with dfx.
 //!
 //! The on-chain model is replaced by `mock_llm`, installed at the LLM canister's real id, so the canister's own
 //! `v1_chat` call runs unchanged and the tests can hold, release and inspect it.
+//!
+//! An update call that `canister_inspect_message` refuses never reaches the method: the tests tell "rejected at
+//! ingress" (`ingress_rejected`) from "the method answered with an error" (`Ok(Err(..))`).
 
-use candid::{decode_one, encode_args, encode_one, CandidType, Principal};
-use eliza_backend::{ChatError, Conversation, LlmProvider, MessageStatus, Sent};
-use pocket_ic::common::rest::RawMessageId;
+use candid::{decode_one, encode_args, encode_one, CandidType, Nat, Principal};
+use eliza_backend::{Character, ChatError, Config, Conversation, LlmProvider, MessageStatus, Metrics, Sent};
+use pocket_ic::common::rest::{RawEffectivePrincipal, RawMessageId};
 use pocket_ic::PocketIc;
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use std::time::Duration;
 
-const NEW_WASM: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../target/wasm32-unknown-unknown/release/eliza_backend.wasm"
-);
-const TRAP_WASM: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../target/trap-after-reply/wasm32-unknown-unknown/release/eliza_backend.wasm"
-);
-const MOCK_LLM_WASM: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../target/wasm32-unknown-unknown/release/mock_llm.wasm"
-);
+macro_rules! wasm_path {
+    ($dir:literal) => {
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/", $dir, "wasm32-unknown-unknown/release/eliza_backend.wasm")
+    };
+}
+/// The canister as it is deployed.
+const NEW_WASM: &str = wasm_path!("");
+/// With `test-hooks`: `test_fill`, and a trap after the model replied to "trap after reply".
+const HOOKS_WASM: &str = wasm_path!("test-hooks/");
+/// With `small-limits` (2 MiB of storage, 8 entries, 2 chats at once, 5 model calls a minute) and `test-hooks`.
+const SMALL_WASM: &str = wasm_path!("small-limits/");
+const MOCK_LLM_WASM: &str =
+    concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/wasm32-unknown-unknown/release/mock_llm.wasm");
 /// The LLM canister the backend calls (mainnet id).
 const LLM_CANISTER: &str = "w36hm-eqaaa-aaaal-qr76a-cai";
-
-type SendResult = Result<Sent, ChatError>;
 
 fn admin() -> Principal {
     Principal::self_authenticating(b"admin")
@@ -41,10 +43,18 @@ fn alice() -> Principal {
 fn bob() -> Principal {
     Principal::self_authenticating(b"bob")
 }
+fn carol() -> Principal {
+    Principal::self_authenticating(b"carol")
+}
+fn user(n: u32) -> Principal {
+    Principal::self_authenticating(n.to_be_bytes())
+}
 
 fn read(path: &str) -> Vec<u8> {
-    std::fs::read(path).unwrap_or_else(|e| panic!("cannot read {path}: {e} (build the wasm first)"))
+    std::fs::read(path).unwrap_or_else(|e| panic!("cannot read {path}: {e} (run `make test-canister`)"))
 }
+
+type SendResult = Result<Sent, ChatError>;
 
 /// The canister alone: the LLM canister does not exist, so calls to it are rejected.
 fn setup_without_llm(wasm: Vec<u8>) -> (PocketIc, Principal) {
@@ -58,12 +68,16 @@ fn setup_without_llm(wasm: Vec<u8>) -> (PocketIc, Principal) {
 /// The canister plus the mock LLM canister at the real LLM canister id (PocketIC adds a subnet for it).
 fn setup(wasm: Vec<u8>) -> (PocketIc, Principal) {
     let (pic, id) = setup_without_llm(wasm);
+    install_llm(&pic);
+    (pic, id)
+}
+
+fn install_llm(pic: &PocketIc) {
     let llm = pic
         .create_canister_with_id(Some(admin()), None, llm())
         .expect("cannot create the mock LLM canister at the LLM canister id");
     pic.add_cycles(llm, 20_000_000_000_000);
     pic.install_canister(llm, read(MOCK_LLM_WASM), encode_args(()).unwrap(), Some(admin()));
-    (pic, id)
 }
 
 fn llm() -> Principal {
@@ -129,24 +143,33 @@ fn assert_logged_sizes_match(pic: &PocketIc, id: Principal) {
         .map(|r| String::from_utf8_lossy(&r.content).into_owned())
         .collect();
     let last_number = |prefix: &str| -> u64 {
-        let line = logs.iter().rev().find(|l| l.contains(prefix)).unwrap_or_else(|| panic!("no {prefix:?} in {logs:?}"));
+        let line =
+            logs.iter().rev().find(|l| l.contains(prefix)).unwrap_or_else(|| panic!("no {prefix:?} in {logs:?}"));
         let rest = &line[line.find(prefix).unwrap() + prefix.len()..];
         rest.chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse().unwrap()
     };
     assert_eq!(last_number("pre_upgrade: "), last_number("State restored from stable memory successfully ("));
 }
 
-fn update<T: CandidType + DeserializeOwned>(pic: &PocketIc, id: Principal, from: Principal, method: &str, arg: Vec<u8>) -> T {
-    let bytes = pic
-        .update_call(id, from, method, arg)
-        .unwrap_or_else(|e| panic!("{method} rejected: {e:?}"));
+fn update<T: CandidType + DeserializeOwned>(
+    pic: &PocketIc,
+    id: Principal,
+    from: Principal,
+    method: &str,
+    arg: Vec<u8>,
+) -> T {
+    let bytes = pic.update_call(id, from, method, arg).unwrap_or_else(|e| panic!("{method} rejected: {e:?}"));
     decode_one(&bytes).unwrap()
 }
 
-fn query<T: CandidType + DeserializeOwned>(pic: &PocketIc, id: Principal, from: Principal, method: &str, arg: Vec<u8>) -> T {
-    let bytes = pic
-        .query_call(id, from, method, arg)
-        .unwrap_or_else(|e| panic!("{method} rejected: {e:?}"));
+fn query<T: CandidType + DeserializeOwned>(
+    pic: &PocketIc,
+    id: Principal,
+    from: Principal,
+    method: &str,
+    arg: Vec<u8>,
+) -> T {
+    let bytes = pic.query_call(id, from, method, arg).unwrap_or_else(|e| panic!("{method} rejected: {e:?}"));
     decode_one(&bytes).unwrap()
 }
 
@@ -155,8 +178,7 @@ fn send(pic: &PocketIc, id: Principal, from: Principal, request_id: &str, base: 
 }
 
 fn submit(pic: &PocketIc, id: Principal, from: Principal, request_id: &str, base: u64, text: &str) -> RawMessageId {
-    pic.submit_call(id, from, "send_message", encode_args((request_id, base, text)).unwrap())
-        .unwrap()
+    pic.submit_call(id, from, "send_message", encode_args((request_id, base, text)).unwrap()).unwrap()
 }
 
 fn outcome(pic: &PocketIc, call: RawMessageId) -> SendResult {
@@ -193,12 +215,57 @@ fn sent(reply: &str, revision: u64) -> SendResult {
     Ok(Sent { reply: reply.to_string(), revision })
 }
 
+/// True if the call was refused before it reached the method (by `canister_inspect_message`).
+fn ingress_rejected(pic: &PocketIc, id: Principal, from: Principal, method: &str, arg: Vec<u8>) -> bool {
+    match pic.submit_call(id, from, method, arg) {
+        Err(_) => true,
+        Ok(message) => {
+            let _ = pic.await_call(message);
+            false
+        }
+    }
+}
+
+/// Calls the canister from the mock LLM canister, i.e. as another canister: such calls do not pass through
+/// `canister_inspect_message`, so the method's own checks answer. Returns the reply bytes, or the reject text.
+fn via_canister(pic: &PocketIc, id: Principal, method: &str, arg: Vec<u8>) -> Result<Vec<u8>, String> {
+    update(pic, llm(), admin(), "mock_proxy", encode_args((id, method, arg)).unwrap())
+}
+
+fn metrics(pic: &PocketIc, id: Principal) -> Metrics {
+    query(pic, id, admin(), "get_metrics", encode_args(()).unwrap())
+}
+
+fn character(pic: &PocketIc, id: Principal) -> Character {
+    query(pic, id, admin(), "get_character", encode_args(()).unwrap())
+}
+
+fn clear(pic: &PocketIc, id: Principal, from: Principal) -> u64 {
+    update(pic, id, from, "clear_conversation", encode_args(()).unwrap())
+}
+
 /// The wasm of the version running on mainnet (v0.6.0), built by `make test-canister` from its commit.
 fn old_wasm() -> Vec<u8> {
     let path = std::env::var("ELIZA_OLD_WASM")
         .expect("ELIZA_OLD_WASM must point at a build of the deployed version (make test-canister sets it)");
     read(&path)
 }
+
+/// Like `send`, but a rejected call is an `Err` instead of a panic.
+fn send_raw(
+    pic: &PocketIc,
+    id: Principal,
+    from: Principal,
+    request_id: &str,
+    base: u64,
+    text: &str,
+) -> Result<SendResult, String> {
+    pic.update_call(id, from, "send_message", encode_args((request_id, base, text)).unwrap())
+        .map(|bytes| decode_one(&bytes).unwrap())
+        .map_err(|e| format!("{e:?}"))
+}
+
+// ========== Upgrades ==========
 
 #[test]
 #[ignore]
@@ -207,49 +274,122 @@ fn upgrade_from_the_deployed_version_keeps_every_conversation() {
     set_provider(&pic, id, LlmProvider::Fallback);
     let first = send(&pic, id, alice(), "a-1", 0, "hello").unwrap();
     let second = send(&pic, id, alice(), "a-2", 1, "tell me about icp").unwrap();
+    // Longer than 0.7.0 accepts; 0.6.0 had no limit.
+    let long_text = "long ".repeat(1_000);
+    let long = send(&pic, id, alice(), "a-long", 2, &long_text).unwrap();
     let legacy: Result<String, String> = update(&pic, id, bob(), "chat", encode_one("who are you").unwrap());
     legacy.unwrap();
-    let carol = Principal::self_authenticating(b"carol");
-    send(&pic, id, carol, "c-1", 0, "hello").unwrap();
-    let cleared: u64 = update(&pic, id, carol, "clear_conversation", encode_args(()).unwrap());
-    assert_eq!(cleared, 2);
+    send(&pic, id, carol(), "c-1", 0, "hello").unwrap();
+    assert_eq!(clear(&pic, id, carol()), 2);
+    let stored: Result<(), String> =
+        update(&pic, id, admin(), "store_encrypted_api_key", encode_one(b"sk-test".to_vec()).unwrap());
+    stored.unwrap();
     let (alice_before, bob_before) = (chat_messages(&pic, id, alice()), chat_messages(&pic, id, bob()));
-    assert_eq!((alice_before.len(), bob_before.len()), (4, 2));
+    assert_eq!((alice_before.len(), bob_before.len()), (6, 2));
 
     upgrade(&pic, id, read(NEW_WASM));
 
+    // Every turn is still there; the system message that 0.6.0 kept in each conversation is not.
     assert_eq!(chat_messages(&pic, id, alice()), alice_before);
     assert_eq!(chat_messages(&pic, id, bob()), bob_before);
-    assert!(chat_messages(&pic, id, carol).is_empty());
+    assert!(conversation(&pic, id, alice()).messages.iter().all(|m| m.role != "system"));
+    assert!(conversation(&pic, id, carol()).messages.is_empty());
     assert_eq!(count(&pic, id), 2);
-    assert_eq!(conversation(&pic, id, alice()).revision, 2);
+    assert_eq!(conversation(&pic, id, alice()).revision, 3);
     assert_eq!(conversation(&pic, id, bob()).revision, 1);
-    assert_eq!(conversation(&pic, id, carol).revision, 2);
-    // Requests saved before the upgrade still replay instead of running again, and stale ones stay refused.
-    assert_eq!(status(&pic, id, alice(), "a-2"), MessageStatus::Done(second.clone()));
-    assert_eq!(send(&pic, id, alice(), "a-1", 0, "hello"), Ok(Sent { reply: first.reply.clone(), revision: 2 }));
-    assert_eq!(send(&pic, id, carol, "c-1", 0, "hello"), Err(ChatError::Conflict));
+    assert_eq!(conversation(&pic, id, carol()).revision, 2);
+    let m = metrics(&pic, id);
+    assert_eq!((m.entries, m.revision_floor, m.version.as_str()), (3, 0, env!("CARGO_PKG_VERSION")));
+    // Requests saved before the upgrade replay instead of running again — the too-long one included — and
+    // stale ones stay refused.
+    assert_eq!(
+        status(&pic, id, alice(), "a-2"),
+        MessageStatus::Done(Sent { reply: second.reply.clone(), revision: 3 })
+    );
+    assert_eq!(send(&pic, id, alice(), "a-1", 0, "hello"), Ok(Sent { reply: first.reply.clone(), revision: 3 }));
+    assert_eq!(send(&pic, id, alice(), "a-long", 2, &long_text), Ok(Sent { reply: long.reply.clone(), revision: 3 }));
+    assert_eq!(send(&pic, id, carol(), "c-1", 0, "hello"), Err(ChatError::Conflict));
     assert_eq!(llm_seen(&pic).len(), 0, "nothing was run again");
+    // The provider is kept (0.6.0 forced OnChain on every upgrade); the untouched default character is replaced.
+    let config: Config = query(&pic, id, admin(), "get_config", encode_args(()).unwrap());
+    assert_eq!(config.llm_provider, LlmProvider::Fallback);
+    let coo = character(&pic, id);
+    assert!(!coo.system_prompt.contains("elizaOS"), "{}", coo.system_prompt);
+    assert!(coo.bio.iter().any(|line| line.contains("inspired by elizaOS")));
 
-    // And the upgraded canister keeps working, through another upgrade as well.
-    set_provider(&pic, id, LlmProvider::Fallback);
-    let third = send(&pic, id, alice(), "a-3", 2, "hi").unwrap();
-    assert_eq!(third.revision, 3);
+    // The upgraded canister keeps working, through another upgrade as well.
+    let third = send(&pic, id, alice(), "a-3", 3, "hi").unwrap();
+    assert_eq!(third.revision, 4);
     upgrade(&pic, id, read(NEW_WASM));
     assert_eq!(status(&pic, id, alice(), "a-3"), MessageStatus::Done(third.clone()));
-    assert_eq!(conversation(&pic, id, alice()).revision, 3);
-    assert_eq!(chat_messages(&pic, id, alice()).len(), 6);
+    assert_eq!(conversation(&pic, id, alice()).revision, 4);
+    assert_eq!(chat_messages(&pic, id, alice()).len(), 8);
+    assert_eq!(chat_messages(&pic, id, bob()), bob_before);
+    let config: Config = query(&pic, id, admin(), "get_config", encode_args(()).unwrap());
+    assert_eq!(config.llm_provider, LlmProvider::Fallback);
+}
+
+#[test]
+#[ignore]
+fn a_customised_character_survives_the_upgrade() {
+    let (pic, id) = setup(old_wasm());
+    let zoe = Character { name: "Zoe".into(), system_prompt: "You are Zoe.".into(), bio: vec![], style: vec![] };
+    let set: Result<(), String> = update(&pic, id, admin(), "update_character", encode_one(&zoe).unwrap());
+    set.unwrap();
+    upgrade(&pic, id, read(NEW_WASM));
+    assert_eq!(character(&pic, id), zoe);
 }
 
 #[test]
 #[ignore]
 fn an_upgrade_without_saved_state_is_refused() {
     // An empty module has no pre_upgrade, so nothing reaches stable memory.
-    let (pic, id) = setup(b"\0asm\x01\0\0\0".to_vec());
+    let (pic, id) = setup_without_llm(b"\0asm\x01\0\0\0".to_vec());
     pic.stop_canister(id, Some(admin())).unwrap();
     let result = pic.upgrade_canister(id, read(NEW_WASM), encode_args(()).unwrap(), Some(admin()));
     assert!(result.is_err(), "post_upgrade must trap instead of starting empty");
 }
+
+/// A canister filled to its storage budget still upgrades, under the Wasm memory limit the README tells
+/// operators to set. (If this fails after raising a limit in limits.rs, the README's number must change too.)
+#[test]
+#[ignore]
+fn a_canister_at_its_storage_budget_upgrades_within_the_recommended_memory_limit() {
+    const RECOMMENDED_WASM_MEMORY_LIMIT: u64 = 512 * 1024 * 1024;
+    const BUDGET: u64 = 32 * 1024 * 1024;
+    let (pic, id) = setup(read(HOOKS_WASM));
+    let settings = ic_management_canister_types::CanisterSettings {
+        wasm_memory_limit: Some(Nat::from(RECOMMENDED_WASM_MEMORY_LIMIT)),
+        ..Default::default()
+    };
+    pic.update_canister_settings(id, Some(admin()), settings).unwrap();
+
+    // 1 663 conversations of one 2 × 10 000-byte exchange: the 32 MiB budget, to within one exchange.
+    let filled: u64 = update(&pic, id, admin(), "test_fill", encode_args((1_663u32, 1u32, 10_000u32)).unwrap());
+    assert!(filled <= BUDGET && filled + 20_000 > BUDGET, "{filled}");
+    let before = metrics(&pic, id);
+
+    upgrade(&pic, id, read(HOOKS_WASM));
+
+    let after = metrics(&pic, id);
+    assert_eq!((after.entries, after.stored_bytes), (1_663, filled));
+    assert_eq!(after.conversations, before.conversations);
+    eprintln!(
+        "full budget: {} bytes counted; wasm memory {} MiB before the upgrade, {} MiB after",
+        filled,
+        before.wasm_memory_bytes >> 20,
+        after.wasm_memory_bytes >> 20
+    );
+    // Saving and restoring each need the state twice (the conversations and their encoding): about 70 MiB here.
+    assert!(after.wasm_memory_bytes < RECOMMENDED_WASM_MEMORY_LIMIT / 4, "a quarter of the limit is not reached");
+    // And it still chats: making room for the next exchange evicts down to the target.
+    set_provider(&pic, id, LlmProvider::Fallback);
+    assert!(send(&pic, id, alice(), "r-1", 0, "hello").is_ok());
+    let evicted = metrics(&pic, id);
+    assert!(evicted.stored_bytes <= BUDGET * 90 / 100 && evicted.revision_floor == 2, "{evicted:?}");
+}
+
+// ========== The chat protocol ==========
 
 #[test]
 #[ignore]
@@ -267,12 +407,10 @@ fn single_flight_busy_in_progress_and_clear_wins() {
     // Another user is not blocked by alice's request.
     assert_eq!(status(&pic, id, bob(), "r-1"), MessageStatus::Unknown);
 
-    let cleared: u64 = update(&pic, id, alice(), "clear_conversation", encode_args(()).unwrap());
-    assert_eq!(cleared, 1);
+    assert_eq!(clear(&pic, id, alice()), 1);
     llm_release(&pic);
     assert_eq!(outcome(&pic, first), Err(ChatError::Cleared));
-    let cleared = conversation(&pic, id, alice());
-    assert_eq!((cleared.messages.len(), cleared.revision), (1, 1), "only the system prompt, next revision");
+    assert_eq!(conversation(&pic, id, alice()), Conversation { messages: vec![], revision: 1 });
     assert_eq!(status(&pic, id, alice(), "r-1"), MessageStatus::Unknown);
     // The request from before the clear can never run.
     assert_eq!(send(&pic, id, alice(), "r-1", 0, "hello"), Err(ChatError::Conflict));
@@ -307,6 +445,7 @@ fn a_request_runs_at_most_once_whatever_happens_after_it() {
         send(&pic, id, alice(), &format!("tab-{i}"), i, &format!("message {i}")).unwrap();
     }
     let before = chat_messages(&pic, id, alice());
+    assert_eq!(before.len(), 50);
     assert!(!before.iter().any(|(_, text)| text == "hello"), "trimmed away");
     assert_eq!(send(&pic, id, alice(), "lost", 0, "hello"), Err(ChatError::Conflict));
     assert_eq!(chat_messages(&pic, id, alice()), before);
@@ -322,13 +461,56 @@ fn a_request_runs_at_most_once_whatever_happens_after_it() {
 
 #[test]
 #[ignore]
+fn clearing_bumps_the_revision_and_keeps_the_count_meaningful() {
+    let (pic, id) = setup(read(NEW_WASM));
+    set_provider(&pic, id, LlmProvider::Fallback);
+    send(&pic, id, alice(), "a1", 0, "hello").unwrap();
+    send(&pic, id, bob(), "b1", 0, "hello").unwrap();
+    assert_eq!(count(&pic, id), 2);
+
+    assert_eq!(clear(&pic, id, alice()), 2);
+    assert_eq!(conversation(&pic, id, alice()), Conversation { messages: vec![], revision: 2 });
+    assert_eq!(count(&pic, id), 1);
+
+    // Clearing a conversation that never existed still moves the revision on, so a first message that was
+    // delayed in transit cannot arrive after the clear and be saved.
+    assert_eq!(clear(&pic, id, carol()), 1);
+    assert_eq!(conversation(&pic, id, carol()).revision, 1);
+    assert_eq!(send(&pic, id, carol(), "late", 0, "sent before the clear"), Err(ChatError::Conflict));
+    assert_eq!(count(&pic, id), 1);
+    assert_eq!(metrics(&pic, id).entries, 3);
+    assert_eq!(send(&pic, id, alice(), "a2", 2, "again").map(|s| s.revision), Ok(3));
+}
+
+#[test]
+#[ignore]
+fn bad_requests_are_refused_and_save_nothing() {
+    let (pic, id) = setup(read(NEW_WASM));
+    set_provider(&pic, id, LlmProvider::Fallback);
+    for bad in ["", "has space", "ü", &"x".repeat(65)] {
+        assert!(matches!(send(&pic, id, alice(), bad, 0, "hi"), Err(ChatError::Invalid(_))), "{bad:?}");
+    }
+    for (what, text) in [("empty", String::new()), ("blank", " \n".to_string()), ("too long", "x".repeat(4_001))] {
+        assert!(matches!(send(&pic, id, alice(), "r-1", 0, &text), Err(ChatError::Invalid(_))), "{what}");
+    }
+    assert_eq!(conversation(&pic, id, alice()), Conversation { messages: vec![], revision: 0 });
+    assert_eq!(metrics(&pic, id).entries, 0);
+    // The limits themselves are accepted.
+    assert!(send(&pic, id, alice(), &"x".repeat(64), 0, &"x".repeat(4_000)).is_ok());
+    assert_eq!(chat_messages(&pic, id, alice()).len(), 2);
+}
+
+// ========== The model ==========
+
+#[test]
+#[ignore]
 fn a_slow_model_call_that_fails_saves_nothing_and_cannot_run_later() {
     let (pic, id) = setup(read(NEW_WASM));
     llm_mode(&pic, Mode::HoldThenReject);
 
     let slow = submit(&pic, id, alice(), "x", 0, "first try");
     llm_pending(&pic, 1);
-    pic.advance_time(Duration::from_secs(5 * 60 + 1));
+    pic.advance_time(Duration::from_secs(60));
     llm_release(&pic);
     assert!(matches!(outcome(&pic, slow), Err(ChatError::Failed(_))));
     assert!(chat_messages(&pic, id, alice()).is_empty());
@@ -341,147 +523,336 @@ fn a_slow_model_call_that_fails_saves_nothing_and_cannot_run_later() {
     assert_eq!(chat_messages(&pic, id, alice()).len(), 2);
 }
 
+/// The model call is a bounded-wait call: it ends after five minutes whatever the LLM canister does.
 #[test]
 #[ignore]
-fn a_chat_stuck_for_five_minutes_is_taken_over_and_its_late_reply_is_not_saved() {
+fn a_model_that_never_answers_times_out_and_nothing_is_saved() {
     let (pic, id) = setup(read(NEW_WASM));
-    llm_mode(&pic, Mode::Hold("late".into()));
+    llm_mode(&pic, Mode::Hold("too late".into()));
 
     let stuck = submit(&pic, id, alice(), "x", 0, "first try");
     llm_pending(&pic, 1);
     assert_eq!(send(&pic, id, alice(), "y", 0, "second try"), Err(ChatError::Busy));
     pic.advance_time(Duration::from_secs(5 * 60 + 1));
-    pic.tick(); // queries see the time of the latest round
+    // The mock is still holding the call; the canister's own deadline ends it.
+    assert!(matches!(outcome(&pic, stuck), Err(ChatError::Failed(_))));
     assert_eq!(status(&pic, id, alice(), "x"), MessageStatus::Unknown);
+    assert!(chat_messages(&pic, id, alice()).is_empty());
+    assert_eq!(metrics(&pic, id).chats_in_flight, 0);
 
-    // The new request takes the stuck one's place...
-    let fresh = submit(&pic, id, alice(), "y", 0, "second try");
-    llm_pending(&pic, 2);
-    assert_eq!(status(&pic, id, alice(), "y"), MessageStatus::Pending);
+    // The caller is not left locked, and the late answer changes nothing.
+    llm_mode(&pic, Mode::Reply("Hi there!".into()));
     llm_release(&pic);
-    // ...and only the new one is saved, whichever answer arrives first.
-    assert_eq!(outcome(&pic, fresh), sent("late", 1));
-    assert!(outcome(&pic, stuck).is_err());
+    assert_eq!(send(&pic, id, alice(), "y", 0, "second try"), sent("Hi there!", 1));
+    for _ in 0..10 {
+        pic.tick();
+    }
     assert_eq!(
         chat_messages(&pic, id, alice()),
-        [("user".to_string(), "second try".to_string()), ("assistant".to_string(), "late".to_string())]
+        [("user".to_string(), "second try".to_string()), ("assistant".to_string(), "Hi there!".to_string())]
     );
     assert_eq!(send(&pic, id, alice(), "x", 0, "first try"), Err(ChatError::Conflict));
 }
 
+/// With an unbounded call, a model that hangs would keep the canister in "stopping" for ever, and a canister that
+/// cannot stop cannot be upgraded safely.
 #[test]
 #[ignore]
-fn clearing_bumps_the_revision_and_keeps_the_count_meaningful() {
+fn a_model_that_never_answers_does_not_keep_the_canister_from_stopping() {
     let (pic, id) = setup(read(NEW_WASM));
-    set_provider(&pic, id, LlmProvider::Fallback);
-    send(&pic, id, alice(), "a1", 0, "hello").unwrap();
-    send(&pic, id, bob(), "b1", 0, "hello").unwrap();
-    assert_eq!(count(&pic, id), 2);
+    llm_mode(&pic, Mode::Hold("too late".into()));
+    let stuck = submit(&pic, id, alice(), "x", 0, "hello");
+    llm_pending(&pic, 1);
 
-    let cleared: u64 = update(&pic, id, alice(), "clear_conversation", encode_args(()).unwrap());
-    assert_eq!(cleared, 2);
-    assert_eq!(conversation(&pic, id, alice()).revision, 2);
-    assert!(chat_messages(&pic, id, alice()).is_empty());
-    assert!(conversation(&pic, id, alice()).messages.iter().all(|m| m.role == "system"));
-    assert_eq!(count(&pic, id), 1);
+    #[derive(CandidType)]
+    struct CanisterIdRecord {
+        canister_id: Principal,
+    }
+    let stop = pic
+        .submit_call_with_effective_principal(
+            Principal::management_canister(),
+            RawEffectivePrincipal::CanisterId(id.as_slice().to_vec()),
+            admin(),
+            "stop_canister",
+            encode_one(CanisterIdRecord { canister_id: id }).unwrap(),
+        )
+        .unwrap();
+    for _ in 0..5 {
+        pic.tick();
+    }
+    assert!(send_raw(&pic, id, bob(), "b", 0, "hi").is_err(), "a stopping canister takes no new calls");
+    pic.advance_time(Duration::from_secs(5 * 60 + 1));
+    pic.await_call(stop).expect("the canister stops once the model call has timed out");
+    assert!(matches!(outcome(&pic, stuck), Err(ChatError::Failed(_))));
 
-    // Clearing a conversation that never existed still moves the revision on, so a first message that was
-    // delayed in transit cannot arrive after the clear and be saved.
-    let carol = Principal::self_authenticating(b"carol");
-    let cleared: u64 = update(&pic, id, carol, "clear_conversation", encode_args(()).unwrap());
-    assert_eq!(cleared, 1);
-    assert_eq!(conversation(&pic, id, carol).revision, 1);
-    assert!(chat_messages(&pic, id, carol).is_empty());
-    assert_eq!(send(&pic, id, carol, "late", 0, "sent before the clear"), Err(ChatError::Conflict));
-    assert_eq!(count(&pic, id), 1);
-    assert_eq!(send(&pic, id, alice(), "a2", 2, "again").map(|s| s.revision), Ok(3));
-    // Anonymous callers have no conversation to clear.
-    let _: u64 = update(&pic, id, Principal::anonymous(), "clear_conversation", encode_args(()).unwrap());
-    assert_eq!(conversation(&pic, id, Principal::anonymous()).revision, 0);
+    pic.upgrade_canister(id, read(NEW_WASM), encode_args(()).unwrap(), Some(admin())).unwrap();
+    pic.start_canister(id, Some(admin())).unwrap();
+    assert_logged_sizes_match(&pic, id);
+    assert_eq!(conversation(&pic, id, alice()), Conversation { messages: vec![], revision: 0 });
 }
 
 #[test]
 #[ignore]
-fn llm_failure_is_an_error_not_a_trap() {
+fn model_failure_is_an_error_not_a_trap() {
     // No LLM canister at all (as on a local replica): the call is rejected.
     let (pic, id) = setup_without_llm(read(NEW_WASM));
-    assert!(matches!(send(&pic, id, alice(), "r-1", 0, "hello"), Err(ChatError::Failed(_))));
+    let failed = send(&pic, id, alice(), "r-1", 0, "hello");
+    // The user gets a plain sentence; the reject code and message are in the canister log, not in the reply.
+    assert_eq!(failed, Err(ChatError::Failed("The model did not answer.".into())));
     assert!(chat_messages(&pic, id, alice()).is_empty());
     assert_eq!(status(&pic, id, alice(), "r-1"), MessageStatus::Unknown);
     // Not left locked, and nothing changed the revision.
     assert!(matches!(send(&pic, id, alice(), "r-2", 0, "again"), Err(ChatError::Failed(_))));
 
-    // The LLM canister rejects the call, or answers without content: an error too, and nothing is saved.
-    let (pic, id) = setup(read(NEW_WASM));
-    for mode in [Mode::Reject, Mode::Empty] {
+    // The LLM canister rejects the call, or answers without content or with blanks: errors too, nothing saved.
+    install_llm(&pic);
+    for mode in [Mode::Reject, Mode::Empty, Mode::Reply(" \n".into())] {
         llm_mode(&pic, mode);
         assert!(matches!(send(&pic, id, alice(), "r-3", 0, "hello"), Err(ChatError::Failed(_))));
         assert!(chat_messages(&pic, id, alice()).is_empty());
         assert_eq!(conversation(&pic, id, alice()).revision, 0);
     }
-    // The same request succeeds once the model answers.
-    llm_mode(&pic, Mode::Reply("Hi there!".into()));
+    // The same request succeeds once the model answers; a reply is saved trimmed.
+    llm_mode(&pic, Mode::Reply("  Hi there!\n".into()));
     assert_eq!(send(&pic, id, alice(), "r-3", 0, "hello"), sent("Hi there!", 1));
 }
 
 #[test]
 #[ignore]
 fn a_trap_in_the_reply_callback_rolls_back_and_releases_the_lock() {
-    let (pic, id) = setup(read(TRAP_WASM));
+    let (pic, id) = setup(read(HOOKS_WASM));
     let call = submit(&pic, id, alice(), "r-1", 0, "trap after reply");
     assert!(pic.await_call(call).is_err(), "the call is rejected");
     assert_eq!(llm_seen(&pic).len(), 1, "the model was asked before the trap");
     assert!(chat_messages(&pic, id, alice()).is_empty());
     assert_eq!(status(&pic, id, alice(), "r-1"), MessageStatus::Unknown);
     // The in-flight entry was released by the cleanup callback: not Busy.
+    assert_eq!(metrics(&pic, id).chats_in_flight, 0);
     assert_eq!(send(&pic, id, alice(), "r-2", 0, "next"), sent("Hi there!", 1));
 }
 
 #[test]
 #[ignore]
-fn the_on_chain_request_is_what_the_llm_canister_expects() {
+fn the_model_gets_the_character_and_the_recent_conversation_within_its_limits() {
     let (pic, id) = setup(read(NEW_WASM));
-    assert_eq!(send(&pic, id, alice(), "r-1", 0, "hello"), sent("Hi there!", 1));
-    let asked = &llm_seen(&pic)[0];
-    assert_eq!(asked.model, "llama3.1:8b");
-    assert_eq!(asked.messages.len(), 2);
-    assert_eq!(asked.messages[0].0, "system");
-    assert_eq!(asked.messages[1], ("user".to_string(), "hello".to_string()));
-}
+    assert_eq!(send(&pic, id, alice(), "r-0", 0, "hello"), sent("Hi there!", 1));
+    let first = &llm_seen(&pic)[0];
+    assert_eq!(first.model, "llama3.1:8b");
+    assert_eq!(first.messages.len(), 2);
+    let (role, system) = &first.messages[0];
+    assert_eq!(role, "system");
+    // The whole character is in the system message, bio and style included.
+    assert!(system.starts_with("You are Coo") && system.contains("About you:") && system.contains("- Friendly"));
+    assert_eq!(first.messages[1], ("user".to_string(), "hello".to_string()));
 
-#[test]
-#[ignore]
-fn rejects_anonymous_callers_and_bad_request_ids() {
-    let (pic, id) = setup(read(NEW_WASM));
-    set_provider(&pic, id, LlmProvider::Fallback);
-    assert!(matches!(send(&pic, id, Principal::anonymous(), "r-1", 0, "hi"), Err(ChatError::Invalid(_))));
-    for bad in ["", "has space", "ü", &"x".repeat(65)] {
-        assert!(matches!(send(&pic, id, alice(), bad, 0, "hi"), Err(ChatError::Invalid(_))), "{bad:?}");
+    // Twelve exchanges later the system message is still first, and the request has at most 10 messages.
+    for i in 1..=12u64 {
+        send(&pic, id, alice(), &format!("r-{i}"), i, &format!("question {i}")).unwrap();
     }
-    assert!(chat_messages(&pic, id, alice()).is_empty());
-    assert!(send(&pic, id, alice(), &"x".repeat(64), 0, "hi").is_ok());
-    assert_eq!(chat_messages(&pic, id, alice()).len(), 2);
+    let last = llm_seen(&pic).pop().unwrap();
+    assert_eq!(last.messages.len(), 10);
+    assert_eq!(last.messages[0], ("system".to_string(), system.clone()));
+    assert_eq!(last.messages[1], ("user".to_string(), "question 8".to_string()));
+    assert_eq!(last.messages[9], ("user".to_string(), "question 12".to_string()));
+
+    // Long turns are cut so the request stays under the LLM canister's 10 KiB, the new message excepted.
+    llm_mode(&pic, Mode::Reply("r".repeat(15_000)));
+    send(&pic, id, bob(), "b-1", 0, &"q".repeat(4_000)).unwrap();
+    send(&pic, id, bob(), "b-2", 1, &"q".repeat(4_000)).unwrap();
+    let last = llm_seen(&pic).pop().unwrap();
+    let total: usize = last.messages.iter().map(|(_, text)| text.len()).sum();
+    assert!(total <= 9_000, "{total}");
+    assert_eq!(last.messages.last().unwrap().1.len(), 4_000);
+    assert!(last.messages.len() > 2, "some context is kept");
+    // The saved reply is cut to its own limit only.
+    assert_eq!(conversation(&pic, id, bob()).messages[1].content.len(), 15_000);
+
+    // A new character reaches conversations that already exist.
+    let zoe = Character { name: "Zoe".into(), system_prompt: "You are Zoe.".into(), bio: vec![], style: vec![] };
+    let set: Result<(), String> = update(&pic, id, admin(), "update_character", encode_one(&zoe).unwrap());
+    set.unwrap();
+    llm_mode(&pic, Mode::Reply("Hi there!".into()));
+    send(&pic, id, alice(), "r-13", 13, "who are you?").unwrap();
+    assert_eq!(llm_seen(&pic).pop().unwrap().messages[0], ("system".to_string(), "You are Zoe.".to_string()));
 }
+
+// ========== Who may call what ==========
 
 #[test]
 #[ignore]
-fn administration_is_for_controllers_and_removed_methods_are_gone() {
+fn ingress_is_filtered_before_the_canister_pays_for_it() {
     let (pic, id) = setup(read(NEW_WASM));
-    // alice is not a controller.
-    let refused: Result<(), String> = update(&pic, id, alice(), "set_llm_provider", encode_one(LlmProvider::Fallback).unwrap());
-    assert!(refused.is_err());
-    assert_eq!(send(&pic, id, alice(), "r-1", 0, "hello"), sent("Hi there!", 1), "still the on-chain provider");
-    // The controller can switch it, but not to the removed OpenAI provider.
-    let removed: Result<(), String> = update(&pic, id, admin(), "set_llm_provider", encode_one(LlmProvider::OpenAI).unwrap());
-    assert!(removed.is_err());
-    set_provider(&pic, id, LlmProvider::Fallback);
+    let anonymous = Principal::anonymous();
+    let send_args = |text: &str| encode_args(("r-1", 0u64, text)).unwrap();
 
-    for (method, arg) in [
-        ("chat", encode_one("hi").unwrap()),
-        ("get_conversation_history", encode_args(()).unwrap()),
-        ("set_admin", encode_one(alice()).unwrap()),
-        ("store_encrypted_api_key", encode_one(b"sk-test".to_vec()).unwrap()),
+    // Anonymous update calls.
+    assert!(ingress_rejected(&pic, id, anonymous, "send_message", send_args("hi")));
+    assert!(ingress_rejected(&pic, id, anonymous, "clear_conversation", encode_args(()).unwrap()));
+    // Arguments far beyond what the method accepts.
+    assert!(ingress_rejected(&pic, id, alice(), "send_message", send_args(&"x".repeat(9_000))));
+    assert!(ingress_rejected(&pic, id, alice(), "clear_conversation", vec![0u8; 1_000]));
+    // Administration by someone who is not a controller.
+    let zoe = Character { name: "Zoe".into(), system_prompt: "You are Zoe.".into(), bio: vec![], style: vec![] };
+    assert!(ingress_rejected(&pic, id, alice(), "update_character", encode_one(&zoe).unwrap()));
+    assert!(ingress_rejected(&pic, id, alice(), "set_llm_provider", encode_one(LlmProvider::Fallback).unwrap()));
+    // Queries sent as update calls, and methods that do not exist (any more).
+    for method in ["health", "get_metrics", "get_character", "chat", "set_admin", "store_encrypted_api_key"] {
+        assert!(ingress_rejected(&pic, id, alice(), method, encode_args(()).unwrap()), "{method}");
+    }
+    assert_eq!(metrics(&pic, id).entries, 0);
+    assert_eq!(llm_seen(&pic).len(), 0);
+
+    // What the frontend does is accepted: chatting, clearing, and reading its conversation as an update call
+    // (answered by the subnet, not by a single replica).
+    assert!(!ingress_rejected(&pic, id, alice(), "send_message", send_args("hi")));
+    let certified: Conversation = update(&pic, id, alice(), "get_conversation", encode_args(()).unwrap());
+    assert_eq!((certified.messages.len(), certified.revision), (2, 1));
+    let certified: MessageStatus = update(&pic, id, alice(), "get_message_status", encode_one("r-1").unwrap());
+    assert!(matches!(certified, MessageStatus::Done(_)));
+    assert_eq!(clear(&pic, id, alice()), 2);
+}
+
+/// Calls from other canisters never pass through the ingress filter, so each method must refuse on its own.
+#[test]
+#[ignore]
+fn every_method_checks_its_caller_and_input_itself() {
+    let (pic, id) = setup(read(NEW_WASM));
+    let zoe = Character { name: "Zoe".into(), system_prompt: "You are Zoe.".into(), bio: vec![], style: vec![] };
+
+    // The mock LLM canister is not a controller of the backend.
+    let reply = via_canister(&pic, id, "update_character", encode_one(&zoe).unwrap()).unwrap();
+    assert!(decode_one::<Result<(), String>>(&reply).unwrap().is_err());
+    let reply = via_canister(&pic, id, "set_llm_provider", encode_one(LlmProvider::Fallback).unwrap()).unwrap();
+    assert!(decode_one::<Result<(), String>>(&reply).unwrap().is_err());
+    assert_eq!(character(&pic, id).name, "Coo");
+    let config: Config = query(&pic, id, admin(), "get_config", encode_args(()).unwrap());
+    assert_eq!(config.llm_provider, LlmProvider::OnChain);
+
+    // A message far too long for the method, which inspect_message would have stopped at ingress.
+    let reply = via_canister(&pic, id, "send_message", encode_args(("r-1", 0u64, "x".repeat(9_000))).unwrap()).unwrap();
+    assert!(matches!(decode_one::<SendResult>(&reply).unwrap(), Err(ChatError::Invalid(_))));
+    assert_eq!(metrics(&pic, id).entries, 0);
+    // Removed methods are gone for every kind of caller.
+    for method in
+        ["chat", "get_conversation_history", "set_admin", "store_encrypted_api_key", "transform_openai_response"]
+    {
+        assert!(via_canister(&pic, id, method, encode_args(()).unwrap()).is_err(), "{method} must not exist");
+    }
+
+    // A controller is held to the character's limits too.
+    for (what, bad) in [
+        ("empty name", Character { name: String::new(), ..zoe.clone() }),
+        ("long prompt", Character { system_prompt: "p".repeat(2_001), ..zoe.clone() }),
+        ("too many bio lines", Character { bio: vec!["b".to_string(); 9], ..zoe.clone() }),
     ] {
-        assert!(pic.update_call(id, admin(), method, arg).is_err(), "{method} must not exist");
+        let refused: Result<(), String> = update(&pic, id, admin(), "update_character", encode_one(&bad).unwrap());
+        assert!(refused.is_err(), "{what}");
     }
+    let accepted: Result<(), String> = update(&pic, id, admin(), "update_character", encode_one(&zoe).unwrap());
+    accepted.unwrap();
+    assert_eq!(character(&pic, id), zoe);
+}
+
+/// Test-only methods and hooks exist in the test builds only.
+#[test]
+#[ignore]
+fn the_deployed_build_has_no_test_hooks() {
+    let contains = |wasm: &[u8], needle: &[u8]| wasm.windows(needle.len()).any(|w| w == needle);
+    let (deployed, hooks) = (read(NEW_WASM), read(HOOKS_WASM));
+    for needle in [&b"test_fill"[..], &b"trap in the reply callback"[..]] {
+        assert!(contains(&hooks, needle), "the check itself must be able to find the hook");
+        assert!(!contains(&deployed, needle));
+    }
+    let (pic, id) = setup(read(NEW_WASM));
+    assert!(pic.update_call(id, admin(), "test_fill", encode_args((1u32, 1u32, 1u32)).unwrap()).is_err());
+    let _ = (pic, id);
+}
+
+// ========== Limits over all callers (the `small-limits` build) ==========
+
+#[test]
+#[ignore]
+fn chats_at_once_and_model_calls_per_minute_are_limited() {
+    let (pic, id) = setup(read(SMALL_WASM));
+    llm_mode(&pic, Mode::Hold("Hi there!".into()));
+
+    // Two chats at once is the limit of this build.
+    let a = submit(&pic, id, alice(), "a-1", 0, "hello");
+    let b = submit(&pic, id, bob(), "b-1", 0, "hello");
+    llm_pending(&pic, 2);
+    assert_eq!(metrics(&pic, id).chats_in_flight, 2);
+    assert_eq!(send(&pic, id, carol(), "c-1", 0, "hello"), Err(ChatError::Busy));
+    // What does not depend on the limit keeps its own answer: a repeated request, and an outdated revision.
+    assert_eq!(send(&pic, id, alice(), "a-1", 0, "hello"), Err(ChatError::InProgress));
+    assert_eq!(send(&pic, id, carol(), "c-1", 7, "hello"), Err(ChatError::Conflict));
+    assert_eq!(metrics(&pic, id).entries, 2, "a refused request leaves no entry");
+    llm_release(&pic);
+    assert_eq!(outcome(&pic, a), sent("Hi there!", 1));
+    assert_eq!(outcome(&pic, b), sent("Hi there!", 1));
+
+    // Five model calls a minute: two were made, three more go through, the sixth is refused — for everyone.
+    llm_mode(&pic, Mode::Reply("Hi there!".into()));
+    for i in 1..=3u64 {
+        assert_eq!(send(&pic, id, alice(), &format!("a-{}", i + 1), i, "more"), sent("Hi there!", i + 1));
+    }
+    assert_eq!(send(&pic, id, alice(), "a-5", 4, "more"), Err(ChatError::Busy));
+    assert_eq!(send(&pic, id, carol(), "c-1", 0, "hello"), Err(ChatError::Busy));
+    // A saved request still replays (no model call).
+    assert_eq!(send(&pic, id, alice(), "a-4", 3, "more"), sent("Hi there!", 4));
+    assert_eq!(llm_seen(&pic).len(), 5);
+    // A minute later the same request is accepted.
+    pic.advance_time(Duration::from_secs(61));
+    assert_eq!(send(&pic, id, alice(), "a-5", 4, "more"), sent("Hi there!", 5));
+    assert_eq!(send(&pic, id, carol(), "c-1", 0, "hello"), sent("Hi there!", 1));
+}
+
+#[test]
+#[ignore]
+fn when_storage_is_full_the_least_recently_used_conversations_make_way() {
+    let (pic, id) = setup(read(SMALL_WASM));
+    set_provider(&pic, id, LlmProvider::Fallback);
+
+    // Eight entries is the limit of this build.
+    for n in 0..8u32 {
+        pic.advance_time(Duration::from_secs(1));
+        assert_eq!(send(&pic, id, user(n), "first", 0, "hello").map(|s| s.revision), Ok(1));
+    }
+    assert_eq!(send(&pic, id, user(0), "second", 1, "again").map(|s| s.revision), Ok(2));
+    let full = metrics(&pic, id);
+    assert_eq!((full.entries, full.conversations, full.revision_floor), (8, 8, 0));
+
+    // A ninth caller, who has read revision 0, is answered in one call: the least recently used conversation
+    // (user 1's — user 0 just wrote) makes way.
+    pic.advance_time(Duration::from_secs(1));
+    assert_eq!(send(&pic, id, user(8), "first", 0, "hello").map(|s| s.revision), Ok(1));
+    let after = metrics(&pic, id);
+    assert_eq!((after.entries, after.revision_floor), (8, 2));
+    assert_eq!(chat_messages(&pic, id, user(0)).len(), 4);
+    // The caller that lost its conversation sees it empty, at a revision past everything it had seen, so nothing
+    // it sent before can run again; from there it can go on.
+    assert_eq!(conversation(&pic, id, user(1)), Conversation { messages: vec![], revision: 2 });
+    assert_eq!(send(&pic, id, user(1), "first", 0, "hello"), Err(ChatError::Conflict));
+    assert_eq!(send(&pic, id, user(1), "second", 1, "again"), Err(ChatError::Conflict));
+    pic.advance_time(Duration::from_secs(1));
+    assert_eq!(send(&pic, id, user(1), "third", 2, "back again").map(|s| s.revision), Ok(3));
+    // Clearing without a conversation needs an entry too, and gets one the same way.
+    pic.advance_time(Duration::from_secs(1));
+    let floor = metrics(&pic, id).revision_floor;
+    assert_eq!(clear(&pic, id, user(9)), metrics(&pic, id).revision_floor + 1);
+    assert!(metrics(&pic, id).revision_floor >= floor);
+    assert_eq!(metrics(&pic, id).entries, 8);
+
+    // The byte budget (2 MiB in this build) works the same way: filled past it behind the canister's back,
+    // the next chat first frees room down to 90 %.
+    let filled: u64 = update(&pic, id, admin(), "test_fill", encode_args((6u32, 20u32, 9_000u32)).unwrap());
+    assert!(filled > 2 * 1024 * 1024, "{filled}");
+    pic.advance_time(Duration::from_secs(1));
+    assert!(send(&pic, id, user(1), "fourth", 3, "still here").is_ok());
+    let freed = metrics(&pic, id);
+    assert!(freed.stored_bytes <= 2 * 1024 * 1024 * 90 / 100, "{freed:?}");
+    assert_eq!(chat_messages(&pic, id, user(1)).len(), 4, "the caller's own conversation is never evicted");
+    // And the state still survives an upgrade.
+    upgrade(&pic, id, read(SMALL_WASM));
+    assert_eq!(metrics(&pic, id).revision_floor, freed.revision_floor);
+    assert_eq!(chat_messages(&pic, id, user(1)).len(), 4);
 }

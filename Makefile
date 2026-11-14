@@ -143,9 +143,15 @@ $(DEPLOYED_WASM):
 	cd target/deployed/src && $(WASM_BUILD) -p eliza_backend
 	cp target/deployed/src/target/wasm32-unknown-unknown/release/eliza_backend.wasm $@
 
+# Regenerates the candid file from the code (cargo test fails when it is out of date).
+candid:
+	$(WASM_BUILD) -p eliza_backend
+	candid-extractor target/wasm32-unknown-unknown/release/eliza_backend.wasm > src/eliza_backend/eliza_backend.did
+
 test-canister: $(DEPLOYED_WASM)
 	$(WASM_BUILD) -p eliza_backend -p mock_llm
-	$(WASM_BUILD) -p eliza_backend --features trap-after-reply --target-dir target/trap-after-reply
+	$(WASM_BUILD) -p eliza_backend --features test-hooks --target-dir target/test-hooks
+	$(WASM_BUILD) -p eliza_backend --features small-limits,test-hooks --target-dir target/small-limits
 	POCKET_IC_BIN="$${POCKET_IC_BIN:-$$(dfx cache show)/pocket-ic}" ELIZA_OLD_WASM="$(CURDIR)/$(DEPLOYED_WASM)" \
 		$(CARGO) test --locked -p eliza_backend -- --include-ignored --test-threads=1
 
