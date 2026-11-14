@@ -990,6 +990,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mock_llm"
+version = "0.0.0"
+dependencies = [
+ "candid",
+ "ic-cdk",
+ "serde",
+]
+
+[[package]]
 name = "nu-ansi-term"
 version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

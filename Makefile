@@ -130,13 +130,24 @@ test:
 	@dfx canister call eliza_backend health 2>/dev/null && echo "✅ Backend is healthy!" || echo "❌ Backend not responding. Is it deployed?"
 
 # Canister unit and PocketIC integration tests. POCKET_IC_BIN defaults to the server bundled with dfx.
-# Set ELIZA_OLD_WASM to a build of the deployed version to also test the upgrade from it.
-test-canister:
-	PATH="$$HOME/.cargo/bin:$$PATH" cargo build --target wasm32-unknown-unknown --release -p eliza_backend
-	PATH="$$HOME/.cargo/bin:$$PATH" cargo build --target wasm32-unknown-unknown --release -p eliza_backend \
-		--features trap-after-reply --target-dir target/trap-after-reply
-	PATH="$$HOME/.cargo/bin:$$PATH" POCKET_IC_BIN="$${POCKET_IC_BIN:-$$(dfx cache show)/pocket-ic}" \
-		cargo test -p eliza_backend -- --include-ignored --test-threads=1
+# The upgrade test needs the version that runs on mainnet: it is built from DEPLOYED_COMMIT (needs the git history).
+CARGO := PATH="$$HOME/.cargo/bin:$$PATH" cargo
+WASM_BUILD := $(CARGO) build --target wasm32-unknown-unknown --release --locked
+DEPLOYED_COMMIT := 5e9c5a29587dc75553d37d43bf1ce4add6aeabd5
+DEPLOYED_WASM := target/deployed/eliza_backend.wasm
+
+$(DEPLOYED_WASM):
+	rm -rf target/deployed && mkdir -p target/deployed/src
+	git archive $(DEPLOYED_COMMIT) Cargo.toml Cargo.lock src/eliza_backend/Cargo.toml src/eliza_backend/src/lib.rs \
+		| tar -x -C target/deployed/src
+	cd target/deployed/src && $(WASM_BUILD) -p eliza_backend
+	cp target/deployed/src/target/wasm32-unknown-unknown/release/eliza_backend.wasm $@
+
+test-canister: $(DEPLOYED_WASM)
+	$(WASM_BUILD) -p eliza_backend -p mock_llm
+	$(WASM_BUILD) -p eliza_backend --features trap-after-reply --target-dir target/trap-after-reply
+	POCKET_IC_BIN="$${POCKET_IC_BIN:-$$(dfx cache show)/pocket-ic}" ELIZA_OLD_WASM="$(CURDIR)/$(DEPLOYED_WASM)" \
+		$(CARGO) test --locked -p eliza_backend -- --include-ignored --test-threads=1
 
 logs:
 	@echo "📜 Fetching canister logs..."

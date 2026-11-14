@@ -1,21 +1,18 @@
 //! Integration tests against a local PocketIC server.
 //!
-//! Ignored by default. Run with:
-//!   cargo build --target wasm32-unknown-unknown --release -p eliza_backend
-//!   cargo build --target wasm32-unknown-unknown --release -p eliza_backend --features trap-after-reply \
-//!     --target-dir target/trap-after-reply
-//!   POCKET_IC_BIN=~/.cache/dfinity/versions/0.30.2/pocket-ic \
-//!   ELIZA_OLD_WASM=<v0.5.0 wasm, for the upgrade test; skipped without it> \
-//!   cargo test -p eliza_backend --test pocketic -- --ignored --test-threads=1
-//! or `make test-canister`.
+//! Ignored by default; run them with `make test-canister`, which builds the three wasm modules they load
+//! (the canister, the canister with `trap-after-reply`, and the mock LLM canister) and points POCKET_IC_BIN at the
+//! server bundled with dfx.
+//!
+//! The on-chain model is replaced by `mock_llm`, installed at the LLM canister's real id, so the canister's own
+//! `v1_chat` call runs unchanged and the tests can hold, release and inspect it.
 
 use candid::{decode_one, encode_args, encode_one, CandidType, Principal};
-use eliza_backend::{ChatError, Config, Conversation, LlmProvider, Message, MessageStatus, Sent};
-use pocket_ic::common::rest::{
-    CanisterHttpReply, CanisterHttpRequest, CanisterHttpResponse, MockCanisterHttpResponse, RawMessageId,
-};
+use eliza_backend::{ChatError, Conversation, LlmProvider, Message, MessageStatus, Sent};
+use pocket_ic::common::rest::RawMessageId;
 use pocket_ic::PocketIc;
 use serde::de::DeserializeOwned;
+use serde::Deserialize;
 use std::time::Duration;
 
 const NEW_WASM: &str = concat!(
@@ -26,6 +23,12 @@ const TRAP_WASM: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../target/trap-after-reply/wasm32-unknown-unknown/release/eliza_backend.wasm"
 );
+const MOCK_LLM_WASM: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../target/wasm32-unknown-unknown/release/mock_llm.wasm"
+);
+/// The LLM canister the backend calls (mainnet id).
+const LLM_CANISTER: &str = "w36hm-eqaaa-aaaal-qr76a-cai";
 
 type SendResult = Result<Sent, ChatError>;
 
@@ -43,12 +46,71 @@ fn read(path: &str) -> Vec<u8> {
     std::fs::read(path).unwrap_or_else(|e| panic!("cannot read {path}: {e} (build the wasm first)"))
 }
 
-fn setup(wasm: Vec<u8>) -> (PocketIc, Principal) {
+/// The canister alone: the LLM canister does not exist, so calls to it are rejected.
+fn setup_without_llm(wasm: Vec<u8>) -> (PocketIc, Principal) {
     let pic = PocketIc::new();
     let id = pic.create_canister_with_settings(Some(admin()), None);
     pic.add_cycles(id, 20_000_000_000_000);
     pic.install_canister(id, wasm, encode_args(()).unwrap(), Some(admin()));
     (pic, id)
+}
+
+/// The canister plus the mock LLM canister at the real LLM canister id (PocketIC adds a subnet for it).
+fn setup(wasm: Vec<u8>) -> (PocketIc, Principal) {
+    let (pic, id) = setup_without_llm(wasm);
+    let llm = pic
+        .create_canister_with_id(Some(admin()), None, llm())
+        .expect("cannot create the mock LLM canister at the LLM canister id");
+    pic.add_cycles(llm, 20_000_000_000_000);
+    pic.install_canister(llm, read(MOCK_LLM_WASM), encode_args(()).unwrap(), Some(admin()));
+    (pic, id)
+}
+
+fn llm() -> Principal {
+    Principal::from_text(LLM_CANISTER).unwrap()
+}
+
+/// How the mock answers `v1_chat` (mirrors `mock_llm::Mode`).
+#[derive(CandidType)]
+enum Mode {
+    Reply(String),
+    Hold(String),
+    HoldThenReject,
+    Reject,
+    Empty,
+}
+
+/// A request the mock received (mirrors `mock_llm::Seen`): (role, content) per message.
+#[derive(CandidType, Deserialize, Debug, Clone, PartialEq, Eq)]
+struct Seen {
+    model: String,
+    messages: Vec<(String, String)>,
+}
+
+fn llm_mode(pic: &PocketIc, mode: Mode) {
+    let () = update(pic, llm(), admin(), "mock_set_mode", encode_one(mode).unwrap());
+}
+
+/// Lets the held model calls finish.
+fn llm_release(pic: &PocketIc) {
+    let () = update(pic, llm(), admin(), "mock_release", encode_args(()).unwrap());
+}
+
+fn llm_seen(pic: &PocketIc) -> Vec<Seen> {
+    query(pic, llm(), admin(), "mock_seen", encode_args(()).unwrap())
+}
+
+/// Ticks until the mock has received `count` requests, i.e. the canister's call is waiting for its answer.
+fn llm_pending(pic: &PocketIc, count: usize) -> Seen {
+    for _ in 0..50 {
+        let seen = llm_seen(pic);
+        assert!(seen.len() <= count, "more model calls than expected: {seen:?}");
+        if seen.len() == count {
+            return seen[count - 1].clone();
+        }
+        pic.tick();
+    }
+    panic!("the model was not called {count} time(s)");
 }
 
 fn upgrade(pic: &PocketIc, id: Principal, wasm: Vec<u8>) {
@@ -127,90 +189,55 @@ fn set_provider(pic: &PocketIc, id: Principal, provider: LlmProvider) {
     r.unwrap();
 }
 
-fn openai(pic: &PocketIc, id: Principal) {
-    let r: Result<(), String> = update(pic, id, admin(), "store_encrypted_api_key", encode_one(b"sk-test".to_vec()).unwrap());
-    r.unwrap();
-    set_provider(pic, id, LlmProvider::OpenAI);
-}
-
-/// Ticks until an HTTPS outcall whose request body contains `marker` is waiting for a response.
-fn pending_http(pic: &PocketIc, marker: &str) -> CanisterHttpRequest {
-    for _ in 0..20 {
-        pic.tick();
-        if let Some(req) = pic
-            .get_canister_http()
-            .into_iter()
-            .find(|r| String::from_utf8_lossy(&r.body).contains(marker))
-        {
-            return req;
-        }
-    }
-    panic!("no pending HTTPS outcall for {marker:?}");
-}
-
-fn reply_http(pic: &PocketIc, req: &CanisterHttpRequest, body: &str) {
-    pic.mock_canister_http_response(MockCanisterHttpResponse {
-        subnet_id: req.subnet_id,
-        request_id: req.request_id,
-        response: CanisterHttpResponse::CanisterHttpReply(CanisterHttpReply {
-            status: 200,
-            headers: vec![],
-            body: body.as_bytes().to_vec(),
-        }),
-        additional_responses: vec![],
-    });
-}
-
-const OPENAI_REPLY: &str = r#"{"choices":[{"message":{"content":"Hi there!"}}]}"#;
-
 fn sent(reply: &str, revision: u64) -> SendResult {
     Ok(Sent { reply: reply.to_string(), revision })
 }
 
+/// The wasm of the version running on mainnet (v0.6.0), built by `make test-canister` from its commit.
+fn old_wasm() -> Vec<u8> {
+    let path = std::env::var("ELIZA_OLD_WASM")
+        .expect("ELIZA_OLD_WASM must point at a build of the deployed version (make test-canister sets it)");
+    read(&path)
+}
+
 #[test]
 #[ignore]
-fn upgrade_from_v050_keeps_every_conversation() {
-    let Ok(old) = std::env::var("ELIZA_OLD_WASM") else {
-        eprintln!("SKIPPED upgrade test: set ELIZA_OLD_WASM to a build of v0.5.0");
-        return;
-    };
-    let (pic, id) = setup(read(&old));
+fn upgrade_from_the_deployed_version_keeps_every_conversation() {
+    let (pic, id) = setup(old_wasm());
     set_provider(&pic, id, LlmProvider::Fallback);
-    for (who, text) in [(alice(), "hello"), (bob(), "who are you"), (alice(), "tell me about icp")] {
-        let r: Result<String, String> = update(&pic, id, who, "chat", encode_one(text).unwrap());
-        r.unwrap();
-    }
-    let history = |who| -> Vec<Message> { query(&pic, id, who, "get_conversation_history", encode_args(()).unwrap()) };
-    let plain = |messages: Vec<Message>| -> Vec<(String, String)> { messages.into_iter().map(|m| (m.role, m.content)).collect() };
-    let (alice_before, bob_before) = (plain(history(alice())), plain(history(bob())));
-    assert_eq!(alice_before.len(), 5);
+    let first = send(&pic, id, alice(), "a-1", 0, "hello").unwrap();
+    let second = send(&pic, id, alice(), "a-2", 1, "tell me about icp").unwrap();
+    let legacy: Result<String, String> = update(&pic, id, bob(), "chat", encode_one("who are you").unwrap());
+    legacy.unwrap();
+    let carol = Principal::self_authenticating(b"carol");
+    send(&pic, id, carol, "c-1", 0, "hello").unwrap();
+    let cleared: u64 = update(&pic, id, carol, "clear_conversation", encode_args(()).unwrap());
+    assert_eq!(cleared, 2);
+    let (alice_before, bob_before) = (chat_messages(&pic, id, alice()), chat_messages(&pic, id, bob()));
+    assert_eq!((alice_before.len(), bob_before.len()), (4, 2));
 
     upgrade(&pic, id, read(NEW_WASM));
 
-    assert_eq!(plain(history(alice())), alice_before);
-    assert_eq!(plain(history(bob())), bob_before);
-    assert!(history(alice()).iter().all(|m| m.request_id.is_none()));
+    assert_eq!(chat_messages(&pic, id, alice()), alice_before);
+    assert_eq!(chat_messages(&pic, id, bob()), bob_before);
+    assert!(chat_messages(&pic, id, carol).is_empty());
     assert_eq!(count(&pic, id), 2);
-    let config: Option<Config> = query(&pic, id, admin(), "get_config", encode_args(()).unwrap());
-    assert!(matches!(config.unwrap().llm_provider, LlmProvider::OnChain));
-    // Restored conversations start at revision 0 and know no request ids.
-    assert_eq!(conversation(&pic, id, alice()).revision, 0);
-    assert_eq!(status(&pic, id, alice(), "r-1"), MessageStatus::Unknown);
+    assert_eq!(conversation(&pic, id, alice()).revision, 2);
+    assert_eq!(conversation(&pic, id, bob()).revision, 1);
+    assert_eq!(conversation(&pic, id, carol).revision, 2);
+    // Requests saved before the upgrade still replay instead of running again, and stale ones stay refused.
+    assert_eq!(status(&pic, id, alice(), "a-2"), MessageStatus::Done(second.clone()));
+    assert_eq!(send(&pic, id, alice(), "a-1", 0, "hello"), Ok(Sent { reply: first.reply.clone(), revision: 2 }));
+    assert_eq!(send(&pic, id, carol, "c-1", 0, "hello"), Err(ChatError::Conflict));
+    assert_eq!(llm_seen(&pic).len(), 0, "nothing was run again");
 
+    // And the upgraded canister keeps working, through another upgrade as well.
     set_provider(&pic, id, LlmProvider::Fallback);
-    let first = send(&pic, id, alice(), "r-1", 0, "hi").unwrap();
-    assert_eq!(first.revision, 1);
-    assert_eq!(chat_messages(&pic, id, alice()).len(), 6);
-    // An old client that expects clear_conversation to return nothing still decodes the reply.
-    let reply = pic.update_call(id, bob(), "clear_conversation", encode_args(()).unwrap()).unwrap();
-    let () = candid::decode_args(&reply).unwrap();
-
-    // Request ids and revisions survive the next upgrade.
+    let third = send(&pic, id, alice(), "a-3", 2, "hi").unwrap();
+    assert_eq!(third.revision, 3);
     upgrade(&pic, id, read(NEW_WASM));
-    assert_eq!(status(&pic, id, alice(), "r-1"), MessageStatus::Done(first.clone()));
-    assert_eq!(conversation(&pic, id, alice()).revision, 1);
-    set_provider(&pic, id, LlmProvider::Fallback);
-    assert_eq!(send(&pic, id, alice(), "r-1", 0, "hi"), Ok(first));
+    assert_eq!(status(&pic, id, alice(), "a-3"), MessageStatus::Done(third.clone()));
+    assert_eq!(conversation(&pic, id, alice()).revision, 3);
     assert_eq!(chat_messages(&pic, id, alice()).len(), 6);
 }
 
@@ -228,10 +255,11 @@ fn an_upgrade_without_saved_state_is_refused() {
 #[ignore]
 fn single_flight_busy_in_progress_and_clear_wins() {
     let (pic, id) = setup(read(NEW_WASM));
-    openai(&pic, id);
+    llm_mode(&pic, Mode::Hold("Hi there!".into()));
 
     let first = submit(&pic, id, alice(), "r-1", 0, "hello");
-    let req = pending_http(&pic, "hello");
+    let asked = llm_pending(&pic, 1);
+    assert_eq!(asked.messages.last().unwrap(), &("user".to_string(), "hello".to_string()));
 
     assert_eq!(status(&pic, id, alice(), "r-1"), MessageStatus::Pending);
     assert_eq!(send(&pic, id, alice(), "r-2", 0, "other"), Err(ChatError::Busy));
@@ -241,7 +269,7 @@ fn single_flight_busy_in_progress_and_clear_wins() {
 
     let cleared: u64 = update(&pic, id, alice(), "clear_conversation", encode_args(()).unwrap());
     assert_eq!(cleared, 1);
-    reply_http(&pic, &req, OPENAI_REPLY);
+    llm_release(&pic);
     assert_eq!(outcome(&pic, first), Err(ChatError::Cleared));
     let cleared = conversation(&pic, id, alice());
     assert_eq!((cleared.messages.len(), cleared.revision), (1, 1), "only the system prompt, next revision");
@@ -251,13 +279,13 @@ fn single_flight_busy_in_progress_and_clear_wins() {
 
     // The lock is released: a new request goes through, and repeating it replays the saved reply.
     let second = submit(&pic, id, alice(), "r-2", 1, "other");
-    let req = pending_http(&pic, "other");
-    reply_http(&pic, &req, OPENAI_REPLY);
+    llm_pending(&pic, 2);
+    llm_release(&pic);
     assert_eq!(outcome(&pic, second), sent("Hi there!", 2));
     assert_eq!(status(&pic, id, alice(), "r-2"), MessageStatus::Done(Sent { reply: "Hi there!".into(), revision: 2 }));
     assert_eq!(send(&pic, id, alice(), "r-2", 1, "other"), sent("Hi there!", 2));
     assert_eq!(chat_messages(&pic, id, alice()).len(), 2);
-    assert!(pic.get_canister_http().is_empty(), "replay must not call the LLM");
+    assert_eq!(llm_seen(&pic).len(), 2, "replay must not call the model");
 }
 
 #[test]
@@ -292,27 +320,53 @@ fn a_request_runs_at_most_once_whatever_happens_after_it() {
     assert!(matches!(send(&pic, id, alice(), "x", 30, "something else"), Err(ChatError::Invalid(_))));
 }
 
-// (Taking over a chat stuck for 5 minutes is covered by unit tests: PocketIC times out the outcall first.)
 #[test]
 #[ignore]
-fn a_timed_out_llm_call_saves_nothing_and_cannot_run_later() {
+fn a_slow_model_call_that_fails_saves_nothing_and_cannot_run_later() {
     let (pic, id) = setup(read(NEW_WASM));
-    openai(&pic, id);
+    llm_mode(&pic, Mode::HoldThenReject);
 
     let slow = submit(&pic, id, alice(), "x", 0, "first try");
-    pending_http(&pic, "first try");
+    llm_pending(&pic, 1);
     pic.advance_time(Duration::from_secs(5 * 60 + 1));
+    llm_release(&pic);
     assert!(matches!(outcome(&pic, slow), Err(ChatError::Failed(_))));
     assert!(chat_messages(&pic, id, alice()).is_empty());
     assert_eq!(status(&pic, id, alice(), "x"), MessageStatus::Unknown);
 
     // Not left locked; once something else is saved, the failed request can no longer run.
-    let next = submit(&pic, id, alice(), "y", 0, "second try");
-    let req = pending_http(&pic, "second try");
-    reply_http(&pic, &req, OPENAI_REPLY);
-    assert_eq!(outcome(&pic, next), sent("Hi there!", 1));
+    llm_mode(&pic, Mode::Reply("Hi there!".into()));
+    assert_eq!(send(&pic, id, alice(), "y", 0, "second try"), sent("Hi there!", 1));
     assert_eq!(send(&pic, id, alice(), "x", 0, "first try"), Err(ChatError::Conflict));
     assert_eq!(chat_messages(&pic, id, alice()).len(), 2);
+}
+
+#[test]
+#[ignore]
+fn a_chat_stuck_for_five_minutes_is_taken_over_and_its_late_reply_is_not_saved() {
+    let (pic, id) = setup(read(NEW_WASM));
+    llm_mode(&pic, Mode::Hold("late".into()));
+
+    let stuck = submit(&pic, id, alice(), "x", 0, "first try");
+    llm_pending(&pic, 1);
+    assert_eq!(send(&pic, id, alice(), "y", 0, "second try"), Err(ChatError::Busy));
+    pic.advance_time(Duration::from_secs(5 * 60 + 1));
+    pic.tick(); // queries see the time of the latest round
+    assert_eq!(status(&pic, id, alice(), "x"), MessageStatus::Unknown);
+
+    // The new request takes the stuck one's place...
+    let fresh = submit(&pic, id, alice(), "y", 0, "second try");
+    llm_pending(&pic, 2);
+    assert_eq!(status(&pic, id, alice(), "y"), MessageStatus::Pending);
+    llm_release(&pic);
+    // ...and only the new one is saved, whichever answer arrives first.
+    assert_eq!(outcome(&pic, fresh), sent("late", 1));
+    assert!(outcome(&pic, stuck).is_err());
+    assert_eq!(
+        chat_messages(&pic, id, alice()),
+        [("user".to_string(), "second try".to_string()), ("assistant".to_string(), "late".to_string())]
+    );
+    assert_eq!(send(&pic, id, alice(), "x", 0, "first try"), Err(ChatError::Conflict));
 }
 
 #[test]
@@ -350,39 +404,50 @@ fn clearing_bumps_the_revision_and_keeps_the_count_meaningful() {
 #[test]
 #[ignore]
 fn llm_failure_is_an_error_not_a_trap() {
-    // Fresh installs use the on-chain LLM canister, which does not exist in PocketIC: the call is rejected.
-    let (pic, id) = setup(read(NEW_WASM));
+    // No LLM canister at all (as on a local replica): the call is rejected.
+    let (pic, id) = setup_without_llm(read(NEW_WASM));
     assert!(matches!(send(&pic, id, alice(), "r-1", 0, "hello"), Err(ChatError::Failed(_))));
     assert!(chat_messages(&pic, id, alice()).is_empty());
     assert_eq!(status(&pic, id, alice(), "r-1"), MessageStatus::Unknown);
     // Not left locked, and nothing changed the revision.
     assert!(matches!(send(&pic, id, alice(), "r-2", 0, "again"), Err(ChatError::Failed(_))));
 
-    // An unusable LLM response is an error too, and nothing is saved.
-    openai(&pic, id);
-    let call = submit(&pic, id, alice(), "r-3", 0, "hello");
-    let req = pending_http(&pic, "hello");
-    reply_http(&pic, &req, "not json");
-    assert!(matches!(outcome(&pic, call), Err(ChatError::Failed(_))));
-    assert!(chat_messages(&pic, id, alice()).is_empty());
+    // The LLM canister rejects the call, or answers without content: an error too, and nothing is saved.
+    let (pic, id) = setup(read(NEW_WASM));
+    for mode in [Mode::Reject, Mode::Empty] {
+        llm_mode(&pic, mode);
+        assert!(matches!(send(&pic, id, alice(), "r-3", 0, "hello"), Err(ChatError::Failed(_))));
+        assert!(chat_messages(&pic, id, alice()).is_empty());
+        assert_eq!(conversation(&pic, id, alice()).revision, 0);
+    }
+    // The same request succeeds once the model answers.
+    llm_mode(&pic, Mode::Reply("Hi there!".into()));
+    assert_eq!(send(&pic, id, alice(), "r-3", 0, "hello"), sent("Hi there!", 1));
 }
 
 #[test]
 #[ignore]
 fn a_trap_in_the_reply_callback_rolls_back_and_releases_the_lock() {
     let (pic, id) = setup(read(TRAP_WASM));
-    openai(&pic, id);
     let call = submit(&pic, id, alice(), "r-1", 0, "trap after reply");
-    let req = pending_http(&pic, "trap after reply");
-    reply_http(&pic, &req, OPENAI_REPLY);
     assert!(pic.await_call(call).is_err(), "the call is rejected");
+    assert_eq!(llm_seen(&pic).len(), 1, "the model was asked before the trap");
     assert!(chat_messages(&pic, id, alice()).is_empty());
     assert_eq!(status(&pic, id, alice(), "r-1"), MessageStatus::Unknown);
     // The in-flight entry was released by the cleanup callback: not Busy.
-    let next = submit(&pic, id, alice(), "r-2", 0, "next");
-    let req = pending_http(&pic, "next");
-    reply_http(&pic, &req, OPENAI_REPLY);
-    assert_eq!(outcome(&pic, next), sent("Hi there!", 1));
+    assert_eq!(send(&pic, id, alice(), "r-2", 0, "next"), sent("Hi there!", 1));
+}
+
+#[test]
+#[ignore]
+fn the_on_chain_request_is_what_the_llm_canister_expects() {
+    let (pic, id) = setup(read(NEW_WASM));
+    assert_eq!(send(&pic, id, alice(), "r-1", 0, "hello"), sent("Hi there!", 1));
+    let asked = &llm_seen(&pic)[0];
+    assert_eq!(asked.model, "llama3.1:8b");
+    assert_eq!(asked.messages.len(), 2);
+    assert_eq!(asked.messages[0].0, "system");
+    assert_eq!(asked.messages[1], ("user".to_string(), "hello".to_string()));
 }
 
 #[test]
