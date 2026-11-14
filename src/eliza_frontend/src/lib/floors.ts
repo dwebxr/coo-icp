@@ -171,27 +171,30 @@ export async function resetFloor(owner: string, revision: number, expected: Floo
   }
 }
 
+/** Whether the floor is still exactly `floor` (nothing was confirmed, and nothing reset, since it was left there). */
+export function floorIs(owner: string, floor: Floor): boolean {
+  return same(readFloor(owner), floor);
+}
+
 /**
  * A clear answered with `cleared`; `before` is the floor taken before the call. Below the floor, it is a reset if
  * nothing moved meanwhile. If something did, a revision at or above the floor as it is now still raises it (the
- * clear's own answer), and one below it is left: something newer was confirmed. 'behind': the canister holds
- * something newer than this clear.
+ * clear's own answer), and one below it is left: something newer was confirmed.
+ *
+ * Resolves with the floor this left at `cleared`, or null when the canister holds something newer than this clear.
+ * The thread may show the cleared conversation only while the floor is still exactly that (floorIs): the caller
+ * checks after its own await, since another tab can confirm something newer at any time in between.
  */
-export async function settleClear(
-  owner: string,
-  cleared: number,
-  before: Floor,
-): Promise<'raised' | 'reset' | 'behind'> {
-  if (cleared >= floorOf(owner)) {
-    raiseFloorByUpdate(owner, cleared);
-    return 'raised';
-  }
-  if (await resetFloor(owner, cleared, before)) return 'reset';
-  if (cleared >= floorOf(owner)) {
-    raiseFloorByUpdate(owner, cleared);
-    return 'raised';
-  }
-  return 'behind';
+export async function settleClear(owner: string, cleared: number, before: Floor): Promise<Floor | null> {
+  const raiseTo = (): Floor => {
+    const base = current(owner);
+    raise(owner, base, cleared);
+    return { epoch: base.epoch, revision: cleared };
+  };
+  if (cleared >= floorOf(owner)) return raiseTo();
+  if (await resetFloor(owner, cleared, before)) return { epoch: before.epoch + 1, revision: cleared };
+  if (cleared >= floorOf(owner)) return raiseTo();
+  return null;
 }
 
 /** Takes over the floor an earlier version of the app stored for this principal (it knew one canister only). */

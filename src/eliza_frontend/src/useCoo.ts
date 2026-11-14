@@ -5,6 +5,7 @@ import { mergeHistory, nextId, reconcile, turnsKey, type ChatMessage } from './l
 import { BUSY_REASON, DELIVERY_WINDOW_MS, deliver } from './lib/delivery';
 import {
   adoptLegacyFloor,
+  floorIs,
   floorOf,
   floorOwner,
   isCurrent,
@@ -208,20 +209,24 @@ export function useCoo(backend: Backend) {
   /**
    * Loads the conversation and shows it; nothing can be sent meanwhile. Resolves with what it applied, or null when
    * it applied nothing (another session by then, an error).
+   *
+   * 'certified' asks through consensus straight away, never a query: for when a query's answer could be taken for
+   * the truth while it is stale (after a clear whose outcome or timing is not known). Once a load has asked through
+   * consensus — in that mode, or because the queries were behind — every later round of it does too.
    */
-  const loadHistory = useCallback(async (): Promise<Conversation | null> => {
+  const loadHistory = useCallback(async (how: 'any' | 'certified' = 'any'): Promise<Conversation | null> => {
     const myGen = gen.current;
     const who = principalRef.current;
     if (!who) return null;
     setHistory('loading');
+    let certified = how === 'certified';
     try {
       for (let round = 1; round <= LOAD_ROUNDS; round++) {
         // Taken before asking: an answer is judged against what was known when it was asked for (lib/floors).
         const start = readFloor(who);
         let epoch = start.epoch;
-        let certified = false;
         let conversation: Conversation | null = null;
-        for (let attempt = 1; attempt <= STALE_READ_ATTEMPTS; attempt++) {
+        for (let attempt = 1; !certified && attempt <= STALE_READ_ATTEMPTS; attempt++) {
           const read = await within(backend.history(), READ_TIMEOUT_MS);
           if (myGen !== gen.current) return null;
           if (read.revision >= floorOf(who)) {
@@ -233,10 +238,11 @@ export function useCoo(backend: Backend) {
           if (myGen !== gen.current) return null;
         }
         if (!conversation) {
-          // Still behind what this device has seen. Either replicas are slow to catch up, or the canister really
-          // went back (restored from a snapshot, reinstalled). Its own answer, through consensus, settles it.
-          conversation = await within(backend.certifiedHistory(), CERTIFIED_READ_TIMEOUT_MS);
+          // Still behind what this device has seen (or asked for): either replicas are slow to catch up, or the
+          // canister really went back (restored from a snapshot, reinstalled). Its own answer, through consensus,
+          // settles it.
           certified = true;
+          conversation = await within(backend.certifiedHistory(), CERTIFIED_READ_TIMEOUT_MS);
           if (myGen !== gen.current) return null;
           if (conversation.revision < floorOf(who)) {
             const reset = await resetFloor(who, conversation.revision, start);
@@ -666,35 +672,54 @@ export function useCoo(backend: Backend) {
     const call = backend.clear();
     inflight.current += 1;
     setBusy(true);
+    // Once the call has settled, the thread shows either the clear's own result — and only while the floor is still
+    // where the clear left it — or the conversation as the canister reports it through consensus. Never a query's
+    // answer: right after a clear, a replica that is behind still has the conversation from before it. The load
+    // happens in the session that is current then, and nothing can be sent until it is done.
+    const resync = () => loadHistory('certified');
     const applied: Promise<boolean> = call.then(
       async (cleared) => {
         // An update call's answer is the canister's own: history older than the clear must never be applied again
         // (even if the session has ended meanwhile), and if the canister is behind this device's floor — it was
         // restored or reinstalled — the floor follows it, unless something newer was confirmed during the call.
-        const settled = who && before ? await settleClear(who, cleared, before) : 'raised';
+        const left = who && before ? await settleClear(who, cleared, before) : null;
         if (!alive.current) return false;
         if (myGen !== gen.current) {
           // The session the clear was made in has ended. If one is active again (the same user signed back in, say),
-          // what it shows may be from before the clear: it is loaded again, and nothing is sent until it is.
-          if (statusRef.current === 'ready') void loadHistory();
+          // what it shows may be from before the clear.
+          if (statusRef.current === 'ready') await resync();
           return false;
         }
-        update(() => []);
-        revision.current = cleared;
-        setHistory('loaded');
-        // The canister holds something newer than this clear: the thread catches up with it.
-        if (settled === 'behind') void loadHistory();
+        // Checked now, after the await: another tab may have confirmed something newer in between.
+        if (who && left && floorIs(who, left)) {
+          update(() => []);
+          revision.current = cleared;
+          setHistory('loaded');
+        } else {
+          // The canister holds something newer than this clear: the thread shows that.
+          await resync();
+        }
         return true;
       },
       async (err) => {
-        if (!alive.current || myGen !== gen.current) return false;
-        console.error('Clear error:', err);
-        // Refused by the canister, or the session is over: certainly not cleared.
-        if (handleSessionError(err) || isCanisterReject(err)) return false;
-        // Lost in transit: it may have run. The conversation is loaded again (nothing can be sent meanwhile) and
-        // tells: empty, at a revision after the one the clear was made from, means it ran.
-        const loaded = await loadHistory();
-        return !!loaded && loaded.messages.length === 0 && loaded.revision > startRevision;
+        if (!alive.current) return false;
+        const sameSession = myGen === gen.current;
+        if (sameSession) console.error('Clear error:', err);
+        // Refused by the canister: certainly not cleared, and nothing else to do.
+        if (isCanisterReject(err)) return false;
+        // The session is over: the same. (An earlier session's is that session's business, not the current one's.)
+        if (err instanceof SessionInvalid) {
+          if (sameSession) handleSessionError(err);
+          return false;
+        }
+        // Lost in transit: it may have run. The conversation is loaded through consensus in the session that is
+        // current now — also when the clear was made in an earlier one.
+        if (statusRef.current !== 'ready') return false;
+        const loaded = await resync();
+        // Empty, at a revision after the one the clear was made from: the conversation is cleared now — by this
+        // clear or by something else — which is what was asked for.
+        const empty = !!loaded && loaded.messages.length === 0 && loaded.revision > startRevision;
+        return empty && principalRef.current === who;
       },
     );
     const outcome = applied.then(

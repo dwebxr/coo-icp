@@ -64,17 +64,18 @@ export function destinationOf(href: string): string {
 }
 
 /**
- * The authority of a URL as it was typed (between "//" and the next "/", "?", "#" or the end), lower-cased; the
- * URL parser's host is the same unless the parser changed something (an international name, percent-encoding, a
- * default port, an IPv6 form, …).
+ * The authority of a URL as it was typed (between "//" and the next "/", "?", "#" or the end), lower-cased so that it
+ * is compared without regard to case (host names are case-insensitive: EXAMPLE.com is example.com). The URL parser's
+ * host is the same unless the parser changed something else (an international name, percent-encoding, a default
+ * port, an IPv6 form, …).
  */
 const typedAuthority = (href: string) => /^https?:\/\/([^/?#]*)/i.exec(href)?.[1].toLowerCase() ?? null;
 
 /**
  * A link to `href` (already checked by safeHref) showing `label`. Its real destination always follows the label, in
  * parentheses and inside the link — with one exception: the visible text IS the address (a bare URL, or a label that
- * is exactly the URL) and names its host just as the browser will use it. There is no guessing at what a label
- * means, so nothing in a label can hide where a link goes.
+ * is exactly the URL) and names its host, compared without regard to case, just as the browser will use it. There is
+ * no guessing at what a label means, so nothing in a label can hide where a link goes.
  */
 function linkTo(href: string, label: Inline[]): Inline {
   const shown = destinationOf(href);

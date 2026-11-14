@@ -335,7 +335,7 @@ describe("an update call's answer raises the floor of now", () => {
     // … meanwhile a load (after signing in again) finds the canister restored to 3 and resets the floor …
     expect(await floors.resetFloor(ALICE, 3, floors.readFloor(ALICE))).toBe(true);
     // … and then the clear answers: it ran on the restored state, which is at 4 now.
-    expect(await floors.settleClear(ALICE, 4, beforeClear)).toBe('raised');
+    expect(await floors.settleClear(ALICE, 4, beforeClear)).toEqual({ epoch: 1, revision: 4 });
     expect(floors.readFloor(ALICE)).toEqual({ epoch: 1, revision: 4 });
     // A query that answers 3 (from before the clear) is below the floor, so a load does not apply it, and it does not
     // raise anything either.
@@ -347,16 +347,39 @@ describe("an update call's answer raises the floor of now", () => {
   it('a clear: reset if nothing moved, else raise if at or above the floor of now, else leave it', async () => {
     // Nothing moved, and the canister is behind: a reset.
     floors.raiseFloorByUpdate(ALICE, 9);
-    expect(await floors.settleClear(ALICE, 2, floors.readFloor(ALICE))).toBe('reset');
+    expect(await floors.settleClear(ALICE, 2, floors.readFloor(ALICE))).toEqual({ epoch: 1, revision: 2 });
     expect(floors.readFloor(ALICE)).toEqual({ epoch: 1, revision: 2 });
     // At or above the floor: a raise.
-    expect(await floors.settleClear(ALICE, 5, floors.readFloor(ALICE))).toBe('raised');
+    expect(await floors.settleClear(ALICE, 5, floors.readFloor(ALICE))).toEqual({ epoch: 1, revision: 5 });
     expect(floors.readFloor(ALICE)).toEqual({ epoch: 1, revision: 5 });
     // Below the floor, which moved during the call to 7 (another tab's reply): left alone, and reported.
     const before = floors.readFloor(ALICE);
     store.data.set(KEY, '1:7');
-    expect(await floors.settleClear(ALICE, 6, before)).toBe('behind');
+    expect(await floors.settleClear(ALICE, 6, before)).toBeNull();
     expect(floors.readFloor(ALICE)).toEqual({ epoch: 1, revision: 7 });
+  });
+});
+
+// Review round 3, Important ③: between the clear's answer and showing its result, another tab can confirm more.
+describe("a clear's result is shown only while the floor is where the clear left it", () => {
+  it('not after another tab confirmed a newer revision (the reviewer\'s case, no snapshot involved)', async () => {
+    floors.raiseFloorByUpdate(ALICE, 1);
+    const before = floors.readFloor(ALICE);
+    // The clear answers 2: raised to 0:2 …
+    const left = await floors.settleClear(ALICE, 2, before);
+    expect(left).toEqual({ epoch: 0, revision: 2 });
+    expect(floors.floorIs(ALICE, left!)).toBe(true);
+    // … and before this tab shows "empty at 2", another tab's reply is confirmed at 3.
+    store.data.set(KEY, '0:3');
+    expect(floors.floorIs(ALICE, left!)).toBe(false);
+  });
+
+  it('not after a reset that happened meanwhile either', async () => {
+    floors.raiseFloorByUpdate(ALICE, 9);
+    const left = await floors.settleClear(ALICE, 2, floors.readFloor(ALICE)); // a reset to 1:2
+    expect(floors.floorIs(ALICE, left!)).toBe(true);
+    store.data.set(KEY, '2:2'); // another tab reset again, to the same revision
+    expect(floors.floorIs(ALICE, left!)).toBe(false);
   });
 });
 

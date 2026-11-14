@@ -521,6 +521,43 @@ await test('A clear whose answer is lost after it ran is reported as cleared', a
   expect((await userBubbles(p)) === 0, 'the thread follows the canister');
 });
 
+// Review round 3, Important ①: after a lost answer, queries still return the conversation from before the clear.
+await test('A clear whose answer is lost is judged by the canister through consensus, not by a stale query', async (p) => {
+  await open(p, '?mock=clearlost&stale=3');
+  await p.getByRole('button', { name: 'Account' }).click();
+  await p.getByRole('menuitem', { name: /clear/i }).click();
+  await p.getByRole('button', { name: 'Clear', exact: true }).click();
+  await p.waitForSelector('dialog[open]', { state: 'detached', timeout: 8000 });
+  await p.waitForSelector('.empty');
+  expect((await userBubbles(p)) === 0, 'the cleared conversation is not shown again');
+});
+
+// Review round 3, Important ②: the same, for a clear made in the previous session.
+await test('A clear from an earlier session whose answer is lost still brings the thread in line', async (p) => {
+  await p.clock.install();
+  await p.goto(`${BASE}/?mock=clearlost&clear=40000&stale=3`);
+  await p.clock.runFor(1500);
+  await p.waitForSelector('.thread[aria-busy="false"]');
+  await p.getByRole('button', { name: 'Account' }).click();
+  await p.getByRole('menuitem', { name: /clear/i }).click();
+  await p.locator('dialog').getByRole('button', { name: 'Clear' }).click();
+  await p.clock.runFor(31_000);
+  await p.waitForSelector('.dialog-note');
+  await p.locator('dialog').getByRole('button', { name: 'Close' }).click();
+  await p.getByRole('button', { name: 'Account' }).click();
+  await p.getByRole('menuitem', { name: /sign out/i }).click();
+  await p.clock.runFor(500);
+  await p.getByRole('button', { name: /sign in/i }).click();
+  await p.clock.runFor(2000);
+  await p.waitForSelector('.thread[aria-busy="false"]');
+  expect((await userBubbles(p)) > 0, 'the history loaded before the clear ran');
+  // At 41.5 s the clear runs and its answer is lost.
+  await p.clock.runFor(10_000);
+  await p.waitForSelector('.empty', { timeout: 5000 });
+  await p.locator('textarea').fill('after');
+  expect(!(await p.locator('.send-btn').isDisabled()), 'sending is possible again');
+});
+
 await test('A clear lost before it ran is reported as failed, after the conversation was checked', async (p) => {
   await open(p, '?mock=clearfail');
   const reads = (await stats(p)).historyReads;
@@ -643,17 +680,22 @@ for (const [second, ending] of [
 // Review round 2, I7: another tab signed out → this tab signed in → the other tab's notification arrives.
 await test('A sign-out notification older than this session does not end it', async (p) => {
   await open(p, '?mock=signedout');
-  // Another tab signed out before this one signs in …
-  await p.evaluate(() => localStorage.setItem('coo:signed-out', 'before-this-session'));
+  // Other tabs signed out twice before this one signs in …
+  await p.evaluate(() => {
+    localStorage.setItem('coo:signed-out', 'an-older-one');
+    localStorage.setItem('coo:signed-out', 'before-this-session');
+  });
   await p.getByRole('button', { name: /sign in/i }).click();
   await p.waitForSelector('.chat');
-  // … and its notification is delivered only now.
+  // … and their notifications are delivered only now, the older one last (review round 3, Nit ③).
   const deliver = (value) =>
     p.evaluate((v) => window.dispatchEvent(new StorageEvent('storage', { key: 'coo:signed-out', newValue: v, oldValue: null })), value);
   await deliver('before-this-session');
+  await deliver('an-older-one');
   await p.waitForTimeout(500);
   expect((await p.locator('.chat').count()) === 1, 'still signed in');
-  // A sign-out after the session began does end it.
+  // A sign-out after the session began (another tab writes a new generation, and its event arrives) does end it.
+  await p.evaluate(() => localStorage.setItem('coo:signed-out', 'after-this-session'));
   await deliver('after-this-session');
   await p.waitForSelector('.signin', { timeout: 3000 });
   expect((await p.locator('.notice').innerText()).includes('another tab'), 'says why');
@@ -753,7 +795,8 @@ await test('A late refusal replaces "no answer yet" in the dialog with the failu
 // Review round 2, I3: the first read after that late clear comes from a replica that is behind.
 await test('After a late clear from an earlier session, a stale read is not the end of it: nothing is sent until the thread matches', async (p) => {
   await p.clock.install();
-  await p.goto(`${BASE}/?mock=laggy&clear=40000`);
+  // Queries return the conversation from before the clear three times; a read through consensus takes 4 s.
+  await p.goto(`${BASE}/?mock=chat&clear=40000&stale=3&certified=4000`);
   await p.clock.runFor(1500);
   await p.waitForSelector('.thread[aria-busy="false"]');
   await p.getByRole('button', { name: 'Account' }).click();
@@ -768,11 +811,12 @@ await test('After a late clear from an earlier session, a stale read is not the 
   await p.getByRole('button', { name: /sign in/i }).click();
   await p.clock.runFor(2000);
   await p.waitForSelector('.thread[aria-busy="false"]');
-  // The clear answers at 41.5 s; the read after it (at 41.8 s) is from before it, the one after that (43.1 s) is not.
+  // The clear answers at about 41.5 s (the installed clock also runs on while the test clicks, so a little later);
+  // the thread is then loaded again, which takes 4 s.
   await p.clock.runFor(6_700);
   await p.locator('textarea').fill('too early');
   expect(await p.locator('.send-btn').isDisabled(), 'nothing can be sent while the thread may be stale');
-  await p.clock.runFor(5_000);
+  await p.clock.runFor(8_000);
   await p.waitForSelector('.empty', { timeout: 5000 });
   expect(!(await p.locator('.send-btn').isDisabled()), 'sending is possible once the thread matches');
 });
@@ -836,6 +880,19 @@ await test('A late certified read does not bring back a conversation another tab
     localStorage.getItem(Object.keys(localStorage).find((name) => name.startsWith('coo:floor:'))),
   );
   expect(floor === '0:6', `the floor stays at the other tab's clear, not lowered to the late answer (${floor})`);
+});
+
+// Review round 3, Nit ②: once a load has asked through consensus, it does not go back to queries.
+await test('A load that had to ask through consensus does not then accept a stale query', async (p) => {
+  await p.goto(`${BASE}/?mock=racyreset`);
+  await p.waitForSelector('.thread[aria-busy="false"]', { timeout: 20000 });
+  expect((await p.locator('.state-card').count()) === 0, 'no error');
+  // The canister holds two exchanges (revision 4); the replicas' revision 3 has one.
+  expect((await userBubbles(p)) === 2, `the canister's conversation is shown (${await userBubbles(p)} messages)`);
+  const floor = await p.evaluate(() =>
+    localStorage.getItem(Object.keys(localStorage).find((name) => name.startsWith('coo:floor:'))),
+  );
+  expect(floor === '1:4', `the floor is the canister's revision (${floor})`);
 });
 
 await test('A conversation that cannot be loaded can still be cleared', async (p) => {

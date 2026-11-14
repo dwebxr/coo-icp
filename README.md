@@ -70,6 +70,10 @@ Every limit is enforced by the canister (`src/eliza_backend/src/limits.rs`).
   `pre_upgrade` wrote to stable memory at the last upgrade stays there until the next upgrade writes over it (and
   where the next saved state is shorter, the end of the old copy remains after it); snapshots keep theirs. A
   controller can read all of these.
+- **After a snapshot is loaded (a rollback), a tab that was waiting for an answer at that moment** can, in a rare
+  order of events (that answer, from before the rollback, arriving after another tab has noticed the rollback),
+  believe the conversation is further along than it is. It then skips its quick re-syncs after a reply, and reads
+  through consensus when it loads, until it is reloaded or signs in again, when it is put right.
 - **What the browser keeps after sign-out.** In localStorage: the revision floors, keyed by canister and principal
   (`coo:floor:<canister>:<principal>`, and `coo:revision:<principal>` from versions before 0.7.0). They show which
   principals used this browser; they are kept on purpose, so that a conversation older than one this browser has
@@ -177,9 +181,10 @@ What the script does, and what to check:
 
 If any step fails, the script says which one, whether the canister is stopped or running as far as it knows, and
 the command that loads the snapshot (or starts it, when nothing was installed). A failure in step 1 (the build,
-reading the running version) leaves the canister running and unchanged. From the stop in step 2 up to step 5, a
-failure leaves it stopped — before the install also when the snapshot's id or the log's line numbers cannot be read.
-A failure of the checks after the start in step 6 leaves it running.
+reading the running version) leaves the canister running and unchanged. If the stop in step 2 itself fails, the
+canister may be running, stopping or stopped (the script says so and how to look). Once the stop has succeeded, a
+failure up to step 5 leaves it stopped — before the install also when the snapshot's id or the log's line numbers
+cannot be read. A failure of the checks after the start in step 6 leaves it running.
 
 Before the **first upgrade from 0.6.0**, look at the size of what it holds: `health` (conversations) and
 `dfx canister status eliza_backend --network ic` (memory). 0.7.0 reads the whole saved state before cutting it to
@@ -203,7 +208,7 @@ methods it calls kept their types; a test checks this).
 `dfx canister stop eliza_backend --network ic && dfx canister snapshot load eliza_backend <id> --network ic && dfx canister start eliza_backend --network ic`.
 Loading a snapshot restores the code as well as the state; nothing has to be installed afterwards. Everything saved
 after the snapshot is lost, and revisions go back; browsers that saw a newer revision detect that and reload the
-conversation from the canister.
+conversation from the canister (see "Known gaps" for a tab that was waiting for an answer at that moment).
 
 **If a hook traps.** A trap in `pre_upgrade` or `post_upgrade` aborts the upgrade: the old version stays installed
 with its data (stopped, under the script — start it again). Fix the cause and upgrade again. Never use `--skip-pre-upgrade`: it restores the state of the
@@ -331,14 +336,15 @@ new character applies to existing conversations from their next message. Both se
   the destination's host as the browser will use it (with the port when it is not the default, an international
   domain name in its `xn--` form, and `http://` in front when the link is not https). The one exception is a link
   whose text is exactly its own URL (a bare URL, or a label identical to it) with the host typed as the browser will
-  use it: that text already is the destination. No label is read for what it seems to say, so a link cannot show one
-  site while pointing to another without the other one being shown too. The asset canister sends a
-  Content-Security-Policy without inline script or style (`public/.ic-assets.json5`).
+  use it, compared without regard to case: that text already is the destination. No label is read for what it seems
+  to say, so a link cannot show one site while pointing to another without the other one being shown too. The asset
+  canister sends a Content-Security-Policy without inline script or style (`public/.ic-assets.json5`).
 - **Sessions.** The Internet Identity delegation is checked before every call. Ten minutes without activity in any
   tab signs every tab out, as does signing out in one of them — also a tab that is still restoring the session when
   that happens, and a session found idle when a tab opens. A tab in the middle of signing in is left to finish: that
-  is a new, explicit sign-in, and a session that began after a sign-out is not ended when the news of that sign-out
-  arrives late. All of this goes through the browser's localStorage; where it cannot be used, each tab
+  is a new, explicit sign-in, and a session is not ended by the news of sign-outs from before it began, however
+  late or out of order that news arrives (each notification is checked against the sign-out last recorded, not
+  against what it says). All of this goes through the browser's localStorage; where it cannot be used, each tab
   still ends its own session when it is idle or its delegation expires.
 - **Stored data.** Conversations are stored in the canister unencrypted; node providers of the subnet and the
   canister's controllers can read them.

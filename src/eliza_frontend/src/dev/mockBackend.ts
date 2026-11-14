@@ -9,11 +9,15 @@
 //            clearlost (the clear runs, its answer is lost) | clearfail (the clear is lost before it runs) |
 //            historyerror | expiring | badsession |
 //            racyclear (this device has seen revision 5, replicas still say 4, and while the certified read — which
-//            reads 5 — is on its way, another tab clears the conversation: revision 6)
+//            reads 5 — is on its way, another tab clears the conversation: revision 6) |
+//            racyreset (restored from a snapshot to revision 4, this device saw 9, replicas say 3; while the first
+//            certified read — which reads 4 — is on its way, another tab resets the floor to 1:3)
 // Extra params: signin=cancel|error|hang|late (succeeds after 4 s)|lateerror (fails after 4 s); a comma-separated
 //                 list gives each sign-in attempt its own mode (the last one repeats): signin=late,hang
 //               delay=<ms>  restore=<ms> (how long restoring the session takes; 250 by default)
 //               clear=<ms> (the clear call answers, and clears, only after this long)
+//               stale=<n> (the next n queries after a clear return the conversation from before it; laggy is stale=1)
+//               certified=<ms> (how long a read through consensus takes; 600 by default)
 //               relogin=<principal> (who signs in after the first session has ended: someone else at the same tab)
 import {
   SessionInvalid,
@@ -95,6 +99,8 @@ export function createMockBackend(scenario: string): Backend {
   const delay = Number(params.get('delay') ?? (scenario === 'slow' ? 15000 : 1400));
   const restoreMs = Number(params.get('restore') ?? 250);
   const clearMs = params.get('clear') === null ? null : Number(params.get('clear'));
+  const staleReads = scenario === 'laggy' ? 1 : Number(params.get('stale') ?? 0);
+  const certifiedMs = Number(params.get('certified') ?? 600);
 
   let signedIn = scenario !== 'signedout' && scenario !== '';
   let expiresAt = Date.now() + (scenario === 'expiring' ? 4000 : 8 * 3600 * 1000);
@@ -114,8 +120,14 @@ export function createMockBackend(scenario: string): Backend {
     revision = 5;
     localStorage.setItem(floorKey, '0:5');
   }
-  // laggy: what a replica that is behind would still return after a clear.
+  let otherTabReset = false;
+  if (scenario === 'racyreset') {
+    revision = 4;
+    localStorage.setItem(floorKey, '0:9');
+  }
+  // laggy, stale=<n>: what a replica that is behind would still return after a clear, and how many more times.
   let beforeClear: { messages: Message[]; revision: number } | null = null;
+  let staleLeft = 0;
   let inFlight: { id: string; cleared: boolean } | null = null;
   // Tests read how many requests were sent and how many were answered, and whether a delegation is held (what a
   // reload would restore).
@@ -206,13 +218,14 @@ export function createMockBackend(scenario: string): Backend {
       if (scenario === 'badsession') throw new SessionInvalid('mock orphan delegation');
       guard();
       if (scenario === 'historyerror') throw new Error('mock history failure');
-      if (beforeClear) {
-        const stale = beforeClear;
-        beforeClear = null;
-        return stale;
+      if (beforeClear && staleLeft > 0) {
+        staleLeft -= 1;
+        return { messages: beforeClear.messages.map((m) => ({ ...m })), revision: beforeClear.revision };
       }
       // Replicas that have not caught up with revision 5 yet.
       if (scenario === 'racyclear' && !otherTabCleared) return { messages: messages.map((m) => ({ ...m })), revision: 4 };
+      // Replicas still one exchange behind the restored state.
+      if (scenario === 'racyreset') return { messages: messages.slice(0, -2).map((m) => ({ ...m })), revision: 3 };
       return { messages: messages.map((m) => ({ ...m })), revision };
     },
 
@@ -230,7 +243,16 @@ export function createMockBackend(scenario: string): Backend {
         await sleep(300);
         return read;
       }
-      await sleep(600);
+      if (scenario === 'racyreset' && !otherTabReset) {
+        // Read now, answered late: meanwhile another tab resets the floor to 1:3.
+        const read = { messages: messages.map((m) => ({ ...m })), revision };
+        await sleep(300);
+        otherTabReset = true;
+        localStorage.setItem(floorKey, '1:3');
+        await sleep(300);
+        return read;
+      }
+      await sleep(certifiedMs);
       guard();
       return { messages: messages.map((m) => ({ ...m })), revision };
     },
@@ -299,7 +321,10 @@ export function createMockBackend(scenario: string): Backend {
       if (scenario === 'clearerror') throw new Error('Call was rejected: mock clear refused');
       if (scenario === 'clearhang') return new Promise<number>(() => {});
       if (scenario === 'clearfail') throw new Error('Failed to fetch');
-      if (scenario === 'laggy') beforeClear = { messages: messages.map((m) => ({ ...m })), revision };
+      if (staleReads > 0) {
+        beforeClear = { messages: messages.map((m) => ({ ...m })), revision };
+        staleLeft = staleReads;
+      }
       revision += 1;
       messages = [];
       if (inFlight) inFlight.cleared = true;

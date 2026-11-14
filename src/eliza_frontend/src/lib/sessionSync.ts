@@ -3,7 +3,8 @@
 // out (so the others do too).
 
 // The last activity in any tab: "<wall-clock ms>|<tab id>". One rule: it is only ever replaced by a later time, so
-// a write that was held back (or a tab whose clock is behind) cannot push another tab's newer activity back.
+// a write that was held back (or a tab whose clock is behind) cannot push another tab's newer activity back. Each
+// write reads, compares and writes under a cross-tab Web Lock (best effort where there are none).
 const ACTIVITY_KEY = 'coo:last-active';
 /**
  * Changes on every sign-out in any tab. Durable, so a tab that was busy restoring a session when it changed still
@@ -48,19 +49,36 @@ function readStored(): Stored | null {
   }
 }
 
+const webLocks = () => (typeof navigator === 'undefined' ? undefined : navigator.locks);
+
+// Bumped by clearActivity: a write that was waiting for the lock when this tab signed out is dropped.
+let cleared = 0;
+
+/** Only a later time replaces the stored one. A stored time in the future says nothing and may be replaced. */
+function compareAndWrite(time: number) {
+  const stored = readStored();
+  if (stored && stored.wall >= time && stored.wall <= Date.now()) return;
+  try {
+    localStorage.setItem(ACTIVITY_KEY, `${time}|${TAB}`);
+  } catch {
+    // Storage unavailable: this tab's own activity still counts.
+  }
+}
+
 function writeActivity() {
   if (trailing !== null) clearTimeout(trailing);
   trailing = null;
   writtenMono = monotonic();
-  // Read, compare and write in one go: only a later time replaces the stored one. A stored time in the future says
-  // nothing (the clock was set back since, or the writer's clock is ahead) and may be replaced.
-  const stored = readStored();
-  if (stored && stored.wall >= lastWall && stored.wall <= Date.now()) return;
-  try {
-    localStorage.setItem(ACTIVITY_KEY, `${lastWall}|${TAB}`);
-  } catch {
-    // Storage unavailable: this tab's own activity still counts.
-  }
+  const time = lastWall;
+  const generation = cleared;
+  const write = () => {
+    if (generation === cleared) compareAndWrite(time);
+  };
+  // Read, compare and write inside a cross-tab Web Lock, so no other tab can write between this tab's read and its
+  // write. Without Web Locks it is best effort: two tabs writing at the same moment can leave the earlier time.
+  const locks = webLocks();
+  if (locks) locks.request(ACTIVITY_KEY, write).catch(() => {});
+  else write();
 }
 
 /**
@@ -96,6 +114,7 @@ export function idleFor(): number | null {
 export function clearActivity() {
   if (trailing !== null) clearTimeout(trailing);
   trailing = null;
+  cleared += 1;
   lastWall = 0;
   lastMono = 0;
   writtenMono = null;
@@ -127,16 +146,18 @@ export function announceSignOut() {
 }
 
 /**
- * Calls `listener` when another tab signs out. `seen` is the generation the current session started with (see
- * signOutGeneration): a notification of that very generation was written before the session began — it is late, not
- * news — and is ignored. Returns the function that stops listening.
+ * Calls `listener` when another tab has signed out since the current session began. `seen` is the generation the
+ * session started with (see signOutGeneration). A notification only says "look": what is compared is the generation
+ * stored NOW, not the one the event carries — events arrive late and in any order, and one about a sign-out from
+ * before the session began finds the stored generation unchanged. Returns the function that stops listening.
  */
 export function onSignOutElsewhere(listener: () => void, seen: () => string | null): () => void {
   if (typeof window === 'undefined') return () => {};
   // The storage event fires in the other tabs of this origin only, never in the one that wrote.
   const onStorage = (event: StorageEvent) => {
-    if (event.key !== SIGN_OUT_KEY || event.newValue === null || event.newValue === event.oldValue) return;
-    if (event.newValue !== seen()) listener();
+    if (event.key !== SIGN_OUT_KEY) return;
+    const now = signOutGeneration();
+    if (now !== null && now !== seen()) listener();
   };
   window.addEventListener('storage', onStorage);
   return () => window.removeEventListener('storage', onStorage);

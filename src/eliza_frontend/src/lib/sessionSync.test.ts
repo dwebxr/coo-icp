@@ -13,6 +13,34 @@ async function openTab(): Promise<typeof import('./sessionSync')> {
 /** The time part of the stored activity ("<wall ms>|<tab id>"). */
 const storedTime = () => data.get('coo:last-active')?.split('|')[0];
 
+/**
+ * A stand-in for the browser's Web Locks, shared by all "tabs" of a test: a section runs at once unless another one
+ * holds the lock, in which case it runs right after that one (as navigator.locks does, but synchronously).
+ */
+function mutex() {
+  let busy = false;
+  const waiting: (() => void)[] = [];
+  return {
+    request(_name: string, section: () => unknown) {
+      return new Promise((resolve) => {
+        const run = () => {
+          busy = true;
+          let result: unknown;
+          try {
+            result = section();
+          } finally {
+            busy = false;
+          }
+          resolve(result);
+          waiting.shift()?.();
+        };
+        if (busy) waiting.push(run);
+        else run();
+      });
+    },
+  };
+}
+
 /** Moves both clocks forward to `ms` (wall clock, epoch ms), running the timers due on the way. */
 const at = (ms: number) => vi.advanceTimersByTime(ms - Date.now());
 
@@ -27,6 +55,8 @@ beforeEach(async () => {
     },
     removeItem: (key: string) => data.delete(key),
   });
+  // Node has Web Locks of its own (asynchronous); the tests use the stand-in above.
+  vi.stubGlobal('navigator', { locks: mutex() });
   vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date', 'performance'], now: 0 });
   sync = await openTab();
 });
@@ -187,6 +217,61 @@ describe('idle time and the clocks', () => {
     expect(storedTime()).toBe('40000');
   });
 
+  // Review round 3, Important ④: tab A reads the stored time, tab B writes a later one, then A writes. Under the
+  // lock, B's write waits until A's read-and-write is done, and then still finds A's time older than its own.
+  it("another tab's later write is not lost between this tab's read and its write", async () => {
+    const a = sync;
+    const b = await openTab();
+    at(1_000);
+    a.noteActivity(true);
+    let interleaved = false;
+    vi.stubGlobal('localStorage', {
+      getItem: (key: string) => {
+        const value = data.get(key) ?? null;
+        if (key === 'coo:last-active' && !interleaved && Date.now() === 15_000) {
+          // While A is between its read and its write, B (another tab, half a second later) writes.
+          interleaved = true;
+          vi.setSystemTime(15_500);
+          b.noteActivity(true);
+          vi.setSystemTime(15_000);
+        }
+        return value;
+      },
+      setItem: (key: string, value: string) => data.set(key, value),
+      removeItem: (key: string) => data.delete(key),
+    });
+    at(15_000);
+    a.noteActivity(true);
+    expect(interleaved).toBe(true);
+    expect(data.get('coo:last-active')).toMatch(/^15500\|/);
+  });
+
+  it('without Web Locks it still only writes a later time (best effort)', async () => {
+    vi.stubGlobal('navigator', {});
+    const a = await openTab();
+    const b = await openTab();
+    at(1_000);
+    a.noteActivity(true);
+    at(15_000);
+    a.noteActivity(); // held back until 16 s
+    at(15_500);
+    b.noteActivity(true);
+    at(16_000);
+    expect(data.get('coo:last-active')).toMatch(/^15500\|/);
+  });
+
+  it('a write still waiting for the lock when the tab signs out is dropped', () => {
+    const waiting: (() => unknown)[] = [];
+    vi.stubGlobal('navigator', {
+      locks: { request: (_name: string, section: () => unknown) => (waiting.push(section), Promise.resolve()) },
+    });
+    at(1_000);
+    sync.noteActivity(true); // waits for the lock
+    sync.clearActivity(); // signs out
+    for (const section of waiting) section();
+    expect(data.has('coo:last-active')).toBe(false);
+  });
+
   it('a stored time in the future can be replaced (it says nothing)', () => {
     at(1_000_000);
     data.set('coo:last-active', String(1_000_000 + 3600_000));
@@ -221,6 +306,12 @@ describe('sign-out across tabs', () => {
   let target: EventTarget;
   const storageEvent = (key: string | null, newValue: string | null, oldValue: string | null = null) =>
     target.dispatchEvent(Object.assign(new Event('storage'), { key, newValue, oldValue }));
+  /** Another tab signs out: it writes a new generation, and this tab gets the event for it. */
+  const signsOut = (generation: string) => {
+    const old = data.get('coo:signed-out') ?? null;
+    data.set('coo:signed-out', generation);
+    storageEvent('coo:signed-out', generation, old);
+  };
 
   beforeEach(() => {
     target = new EventTarget();
@@ -241,19 +332,23 @@ describe('sign-out across tabs', () => {
 
   it('tells a tab when another tab announces a sign-out', () => {
     const heard = vi.fn();
-    const stop = sync.onSignOutElsewhere(heard, () => null);
-    storageEvent('coo:signed-out', 'g1');
+    let sessionSaw: string | null = null;
+    const stop = sync.onSignOutElsewhere(heard, () => sessionSaw);
+    signsOut('g1');
     expect(heard).toHaveBeenCalledTimes(1);
-    // Other keys, a removal and an unchanged value are not sign-outs.
+    // A new session begins (it sees g1). Other keys, a removal and an event repeating g1 are not sign-outs.
+    sessionSaw = 'g1';
     storageEvent('coo:last-active', '5');
     storageEvent('coo:floor:x', '0:1');
+    data.delete('coo:signed-out');
     storageEvent('coo:signed-out', null, 'g1');
+    data.set('coo:signed-out', 'g1');
     storageEvent('coo:signed-out', 'g1', 'g1');
     expect(heard).toHaveBeenCalledTimes(1);
-    storageEvent('coo:signed-out', 'g2', 'g1');
+    signsOut('g2');
     expect(heard).toHaveBeenCalledTimes(2);
     stop();
-    storageEvent('coo:signed-out', 'g3', 'g2');
+    signsOut('g3');
     expect(heard).toHaveBeenCalledTimes(2);
   });
 
@@ -261,7 +356,7 @@ describe('sign-out across tabs', () => {
     vi.stubGlobal('BroadcastChannel', undefined);
     const heard = vi.fn();
     sync.onSignOutElsewhere(heard, () => null);
-    storageEvent('coo:signed-out', 'g1');
+    signsOut('g1');
     expect(heard).toHaveBeenCalledTimes(1);
   });
 
@@ -274,7 +369,22 @@ describe('sign-out across tabs', () => {
     sessionSaw = sync.signOutGeneration(); // tab B's new session starts, after that
     storageEvent('coo:signed-out', 'g1', null); // A's event, delivered late
     expect(heard).not.toHaveBeenCalled();
-    storageEvent('coo:signed-out', 'g2', 'g1'); // a sign-out after the session began
+    signsOut('g2'); // a sign-out after the session began
+    expect(heard).toHaveBeenCalledTimes(1);
+  });
+
+  // Review round 3, Nit ③: two sign-outs (g1, g2) before the session began; it saw g2; g1's event arrives last.
+  it('ignores a late notification of an older sign-out too: what counts is the generation stored now', () => {
+    const heard = vi.fn();
+    let sessionSaw: string | null = null;
+    sync.onSignOutElsewhere(heard, () => sessionSaw);
+    data.set('coo:signed-out', 'g1');
+    data.set('coo:signed-out', 'g2');
+    sessionSaw = sync.signOutGeneration();
+    storageEvent('coo:signed-out', 'g1', null); // the older event, delivered late
+    storageEvent('coo:signed-out', 'g2', 'g1');
+    expect(heard).not.toHaveBeenCalled();
+    signsOut('g3');
     expect(heard).toHaveBeenCalledTimes(1);
   });
 });
