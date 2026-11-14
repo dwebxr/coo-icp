@@ -1,5 +1,5 @@
 use candid::{CandidType, Deserialize, Principal};
-use ic_cdk_macros::{init, pre_upgrade, post_upgrade, query, update};
+use ic_cdk::{init, post_upgrade, pre_upgrade, query, update};
 use serde::Serialize;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -173,7 +173,7 @@ Your responses should be:
 
 #[init]
 fn init() {
-    let caller = ic_cdk::caller();
+    let caller = ic_cdk::api::msg_caller();
 
     CHARACTER.with(|c| {
         *c.borrow_mut() = Some(default_character());
@@ -232,15 +232,15 @@ fn pre_upgrade() {
 
     // 1 page = 64KB
     let needed_pages = (blob.len() as u64).div_ceil(65536);
-    let current_pages = ic_cdk::api::stable::stable_size();
-    if current_pages < needed_pages && ic_cdk::api::stable::stable_grow(needed_pages - current_pages).is_err() {
+    let current_pages = ic_cdk::stable::stable_size();
+    if current_pages < needed_pages && ic_cdk::stable::stable_grow(needed_pages - current_pages).is_err() {
         ic_cdk::trap(&format!(
             "pre_upgrade: cannot grow stable memory ({} -> {} pages)",
             current_pages, needed_pages
         ));
     }
 
-    ic_cdk::api::stable::stable_write(0, &blob);
+    ic_cdk::stable::stable_write(0, &blob);
     // Same count as post_upgrade logs (the state without its length prefix), so the two can be compared.
     ic_cdk::println!("pre_upgrade: {} bytes serialized to stable memory", blob.len() - 8);
 }
@@ -250,15 +250,15 @@ fn pre_upgrade() {
 #[post_upgrade]
 fn post_upgrade() {
     // pre_upgrade always writes the state, so empty stable memory means it was not saved.
-    if ic_cdk::api::stable::stable_size() == 0 {
+    if ic_cdk::stable::stable_size() == 0 {
         ic_cdk::trap("post_upgrade: no saved state in stable memory");
     }
     {
         let mut prefix = [0u8; 8];
-        ic_cdk::api::stable::stable_read(0, &mut prefix);
+        ic_cdk::stable::stable_read(0, &mut prefix);
         let len = decode_state_len(prefix).unwrap_or_else(|e| ic_cdk::trap(&format!("post_upgrade: {}", e)));
         let mut blob = vec![0u8; 8 + len];
-        ic_cdk::api::stable::stable_read(0, &mut blob);
+        ic_cdk::stable::stable_read(0, &mut blob);
         let state = decode_stable_state(&blob)
             .unwrap_or_else(|e| ic_cdk::trap(&format!("post_upgrade: cannot decode saved state: {}", e)));
 
@@ -288,7 +288,7 @@ fn post_upgrade() {
             *cfg.borrow_mut() = Some(Config {
                 llm_provider: LlmProvider::OnChain,
                 max_conversation_length: 50,
-                admin: ic_cdk::caller(),
+                admin: ic_cdk::api::msg_caller(),
             });
         }
     });
@@ -456,7 +456,7 @@ fn mark_flight_cleared(caller: &Principal) {
 
 /// `request` is the request id and the revision the client last saw.
 async fn run_chat(request: Option<(String, u64)>, user_message: String) -> Result<Sent, ChatError> {
-    let caller = ic_cdk::caller();
+    let caller = ic_cdk::api::msg_caller();
     // Anonymous callers would all share one conversation.
     if caller == Principal::anonymous() {
         return Err(ChatError::Invalid("Sign in to chat.".to_string()));
@@ -527,7 +527,7 @@ async fn send_message(request_id: String, base_revision: u64, content: String) -
 
 #[query]
 fn get_conversation() -> Conversation {
-    let caller = ic_cdk::caller();
+    let caller = ic_cdk::api::msg_caller();
     CONVERSATIONS.with(|c| match c.borrow().get(&caller) {
         Some(state) => Conversation {
             messages: state.messages.clone(),
@@ -539,7 +539,7 @@ fn get_conversation() -> Conversation {
 
 #[query]
 fn get_message_status(request_id: String) -> MessageStatus {
-    let caller = ic_cdk::caller();
+    let caller = ic_cdk::api::msg_caller();
     if let Some((_, reply)) = saved_exchange(&caller, &request_id) {
         MessageStatus::Done(Sent { reply, revision: revision_of(&caller) })
     } else if flight_pending(&caller, &request_id, ic_cdk::api::time()) {
@@ -568,7 +568,7 @@ async fn generate_response(state: &ConversationState) -> Result<String, String> 
 // Option 1: IC LLM Canister (Llama 3.1 8B - fully on-chain)
 // Note: IC LLM Canister only available on mainnet (w36hm-eqaaa-aaaal-qr76a-cai)
 async fn generate_response_onchain(state: &ConversationState) -> Result<String, String> {
-    use ic_llm::{AssistantMessage, ChatMessage, Model};
+    use llm_wire::{AssistantMessage, ChatMessage, Request, Response};
 
     // Convert our messages to IC LLM format
     // IC LLM has a limit of 10 messages, so we take the most recent ones
@@ -594,29 +594,109 @@ async fn generate_response_onchain(state: &ConversationState) -> Result<String, 
         })
         .collect();
 
-    // Called directly rather than through ic_llm::chat(..).send(), which unwraps the call result and so turns a
-    // rejected call into a trap. Same request as ic-llm sends.
     let llm = Principal::from_text(LLM_CANISTER).map_err(|e| e.to_string())?;
-    let request = LlmRequest {
-        model: Model::Llama3_1_8B.to_string(),
+    let request = Request {
+        model: LLM_MODEL.to_string(),
         messages,
         tools: None,
     };
-    let (response,): (ic_llm::Response,) = ic_cdk::call(llm, "v1_chat", (request,))
+    // A rejected call is an error here, never a trap.
+    let response = ic_cdk::call::Call::unbounded_wait(llm, "v1_chat")
+        .with_arg(&request)
         .await
-        .map_err(|(code, msg)| format!("LLM call failed ({:?}): {}", code, msg))?;
+        .map_err(|e| format!("LLM call failed: {}", e))?;
+    let response: Response = response.candid().map_err(|e| format!("LLM reply not understood: {}", e))?;
 
     response.message.content.ok_or_else(|| "No response content from LLM".to_string())
 }
 
 const LLM_CANISTER: &str = "w36hm-eqaaa-aaaal-qr76a-cai";
+const LLM_MODEL: &str = "llama3.1:8b";
 
-/// The request type of the LLM canister's `v1_chat` (private in ic-llm).
-#[derive(CandidType)]
-struct LlmRequest {
-    model: String,
-    messages: Vec<ic_llm::ChatMessage>,
-    tools: Option<Vec<ic_llm::Tool>>,
+/// The candid types of the LLM canister's `v1_chat`, as the `ic-llm` 1.1.0 crate declares them (that crate is not
+/// used: it is built on an older ic-cdk, and its `send()` traps when the call is rejected).
+mod llm_wire {
+    use candid::{CandidType, Deserialize};
+
+    #[derive(CandidType, Deserialize, Clone, Debug)]
+    pub enum ChatMessage {
+        #[serde(rename = "user")]
+        User { content: String },
+        #[serde(rename = "system")]
+        System { content: String },
+        #[serde(rename = "assistant")]
+        Assistant(AssistantMessage),
+        #[serde(rename = "tool")]
+        Tool { content: String, tool_call_id: String },
+    }
+
+    #[derive(CandidType, Deserialize, Clone, Debug)]
+    pub struct AssistantMessage {
+        pub content: Option<String>,
+        pub tool_calls: Vec<ToolCall>,
+    }
+
+    #[derive(CandidType, Deserialize, Clone, Debug)]
+    pub struct ToolCall {
+        pub id: String,
+        pub function: FunctionCall,
+    }
+
+    #[derive(CandidType, Deserialize, Clone, Debug)]
+    pub struct FunctionCall {
+        pub name: String,
+        pub arguments: Vec<ToolCallArgument>,
+    }
+
+    #[derive(CandidType, Deserialize, Clone, Debug)]
+    pub struct ToolCallArgument {
+        pub name: String,
+        pub value: String,
+    }
+
+    // Tools are never sent; the types exist so `tools = null` is encoded with the same type as before.
+    #[derive(CandidType, Deserialize, Clone, Debug)]
+    pub enum Tool {
+        #[serde(rename = "function")]
+        Function(Function),
+    }
+
+    #[derive(CandidType, Deserialize, Clone, Debug)]
+    pub struct Function {
+        pub name: String,
+        pub description: Option<String>,
+        pub parameters: Option<Parameters>,
+    }
+
+    #[derive(CandidType, Deserialize, Clone, Debug)]
+    pub struct Parameters {
+        #[serde(rename = "type")]
+        pub type_: String,
+        pub properties: Option<Vec<Property>>,
+        pub required: Option<Vec<String>>,
+    }
+
+    #[derive(CandidType, Deserialize, Clone, Debug)]
+    pub struct Property {
+        #[serde(rename = "type")]
+        pub type_: String,
+        pub name: String,
+        pub description: Option<String>,
+        #[serde(rename = "enum")]
+        pub enum_: Option<Vec<String>>,
+    }
+
+    #[derive(CandidType, Deserialize, Clone, Debug)]
+    pub struct Request {
+        pub model: String,
+        pub messages: Vec<ChatMessage>,
+        pub tools: Option<Vec<Tool>>,
+    }
+
+    #[derive(CandidType, Deserialize, Clone, Debug)]
+    pub struct Response {
+        pub message: AssistantMessage,
+    }
 }
 
 // Fallback for local development (simple pattern matching)
@@ -705,7 +785,7 @@ fn get_config() -> Option<Config> {
 /// Returns the new revision (older clients that expect no result ignore it).
 #[update]
 fn clear_conversation() -> u64 {
-    let caller = ic_cdk::caller();
+    let caller = ic_cdk::api::msg_caller();
     if caller == Principal::anonymous() {
         return 0;
     }
@@ -777,14 +857,14 @@ fn get_metrics() -> CanisterMetrics {
     CanisterMetrics {
         version: VERSION.to_string(),
         conversations: conversation_count(),
-        stable_memory_pages: ic_cdk::api::stable::stable_size(),
+        stable_memory_pages: ic_cdk::stable::stable_size(),
         heap_memory_bytes: get_heap_memory_bytes(),
     }
 }
 
 /// Administration is for the canister's controllers (those who can also replace its code).
 fn require_controller() -> Result<(), String> {
-    if ic_cdk::api::is_controller(&ic_cdk::caller()) {
+    if ic_cdk::api::is_controller(&ic_cdk::api::msg_caller()) {
         Ok(())
     } else {
         Err("Only a controller of the canister can do this".to_string())

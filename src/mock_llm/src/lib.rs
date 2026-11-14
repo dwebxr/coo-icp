@@ -107,7 +107,7 @@ fn answer(text: Option<String>) -> Response {
 async fn hold() {
     let started = RELEASES.with(Cell::get);
     while RELEASES.with(Cell::get) == started {
-        let _: Result<(), _> = ic_cdk::call(ic_cdk::id(), "mock_noop", ()).await;
+        let _ = ic_cdk::call::Call::unbounded_wait(ic_cdk::api::canister_self(), "mock_noop").await;
     }
 }
 
@@ -154,7 +154,9 @@ fn mock_seen() -> Vec<Seen> {
 /// (inter-canister calls do not pass through `canister_inspect_message`).
 #[ic_cdk::update]
 async fn mock_proxy(canister: Principal, method: String, arg: Vec<u8>) -> Result<Vec<u8>, String> {
-    ic_cdk::api::call::call_raw(canister, &method, arg, 0)
+    ic_cdk::call::Call::unbounded_wait(canister, &method)
+        .with_raw_args(&arg)
         .await
-        .map_err(|(code, message)| format!("{code:?}: {message}"))
+        .map(|response| response.into_bytes())
+        .map_err(|e| e.to_string())
 }

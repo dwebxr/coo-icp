@@ -12,10 +12,15 @@ type Character = record {
 };
 type ChatError = variant {
   Invalid : text;
+  // The model could not reply. Nothing was saved.
   Failed : text;
+  // Another message from this caller is being answered. Nothing was saved; retry later with the same id.
   Busy;
+  // The conversation was cleared while the reply was generated. Nothing was saved.
   Cleared;
+  // This request id is already being answered; poll `get_message_status`.
   InProgress;
+  // The conversation changed since the client's revision. Nothing was run; reload and send again.
   Conflict;
 };
 type Config = record {
@@ -23,13 +28,34 @@ type Config = record {
   llm_provider : LlmProvider;
   max_conversation_length : nat64;
 };
+// A conversation and its revision, for clients of send_message.
 type Conversation = record { messages : vec Message; revision : nat64 };
-type LlmProvider = variant { Fallback; OpenAI; OnChain };
-type Message = record { request_id : opt text; content : text; role : text };
-type MessageStatus = variant { Done : Sent; Unknown; Pending };
+type LlmProvider = variant {
+  Fallback;
+  // Removed in 0.7.0 (it could not reach consensus on mainnet). Still listed so saved state decodes; treated as
+  // OnChain.
+  OpenAI;
+  OnChain;
+};
+type Message = record {
+  // The request id of a user message sent with send_message. Absent in state saved before v0.6.0.
+  request_id : opt text;
+  content : text;
+  role : text;
+};
+type MessageStatus = variant {
+  Done : Sent;
+  // Not being answered and not in the conversation (never received, failed, cleared, or trimmed away).
+  Unknown;
+  Pending;
+};
 type Result = variant { Ok : Sent; Err : ChatError };
 type Result_1 = variant { Ok; Err : text };
-type Sent = record { revision : nat64; reply : text };
+type Sent = record {
+  // The conversation's revision now.
+  revision : nat64;
+  reply : text;
+};
 service : () -> {
   // Also cancels saving a reply that is still being generated. The conversation is replaced by an empty one with
   // the next revision (even if there was none yet), so no request sent before the clear can run afterwards.

@@ -9,6 +9,6 @@ description = "Test double for the LLM canister. Installed at its canister id in
 crate-type = ["cdylib"]
 
 [dependencies]
-ic-cdk = "0.17"
+ic-cdk = "0.20"
 candid = "0.10"
 serde = { version = "1", features = ["derive"] }

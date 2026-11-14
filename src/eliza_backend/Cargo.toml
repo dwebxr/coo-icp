@@ -8,13 +8,9 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 # IC CDK
-ic-cdk = "0.17"
-ic-cdk-macros = "0.17"
+ic-cdk = "0.20"
 candid = "0.10"
 serde = { version = "1", features = ["derive"] }
-
-# IC LLM Canister
-ic-llm = "1.1"
 
 [dev-dependencies]
 # Must match the PocketIC server version (dfx 0.30.2 ships pocket-ic-server 10.0.0)
