@@ -6,6 +6,12 @@
 //! conversation, so with any entry saved its `post_upgrade` traps and the downgrade is refused (and with none it
 //! would drop the revision floor). Going back to 0.6.0 means restoring the canister snapshot taken before the
 //! upgrade, which loses everything saved after that snapshot: every exchange, clear and eviction since.
+//!
+//! Memory: the saved value is decoded as a whole before anything is cut, so reading needs the payload plus what it
+//! decodes to. For state this version wrote that is bounded by the store budget (the tests measure it). A 0.6.0
+//! state has no such bound: made of long messages it needs about twice its size, made of millions of tiny entries
+//! several times its size — near 0.6.0's 100 MB maximum that is close to 1 GiB. `post_upgrade` then traps under a
+//! lower Wasm memory limit and the upgrade is rolled back; nothing is lost, but the limit has to be raised for it.
 
 use crate::api::{Character, LlmProvider};
 use crate::limits::{MAX_READ_STATE_BYTES, MAX_WRITTEN_STATE_BYTES};

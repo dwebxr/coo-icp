@@ -195,9 +195,11 @@ impl Store {
 
     /// Makes room for `extra_bytes` more and, with `new_entry`, for one more entry, by removing entries that
     /// `protected` does not name and `evict` allows, in eviction order (see `eviction_order`). It frees down to the
-    /// eviction target, so that it is needed again only a tenth of the budget later. If removing every entry it may
-    /// remove would still not be enough, it removes nothing and returns false: a request that cannot get in does
-    /// not cost anyone their conversation.
+    /// eviction target when the entries it may remove reach that far, so that it is then needed again only a tenth
+    /// of the budget later; when they do not (few entries without turns for a clear, say) it frees what is needed
+    /// and runs again at the next request that needs room. If removing every entry it may remove would still not be
+    /// enough, it removes nothing and returns false: a request that cannot get in does not cost anyone their
+    /// conversation.
     ///
     /// Free while both limits hold. When one is reached it lists and sorts every entry it may remove — O(n log n) in
     /// the number of entries, inside the update call that hit the limit. The PocketIC test
@@ -297,9 +299,11 @@ impl Store {
     }
 }
 
-/// Keeps the newest `MAX_TURNS` turns, and never starts with a reply whose question is gone.
+/// Keeps a conversation within its limits after an exchange was added: the newest `MAX_TURNS` turns, at most
+/// MAX_CONVERSATION_BYTES (turns kept from 0.6.0 can be longer than this version accepts, so the turn count alone
+/// would not bound it), and never starting with a reply whose question is gone.
 pub fn trim(turns: &mut Vec<Turn>) {
-    cut(turns, usize::MAX);
+    cut(turns, MAX_CONVERSATION_BYTES);
 }
 
 /// Drops the oldest turns until at most `MAX_TURNS` are left and, with their entry, they count at most `max_bytes`;
@@ -357,6 +361,32 @@ mod tests {
         let mut only_replies = vec![assistant(0), assistant(1)];
         trim(&mut only_replies);
         assert!(only_replies.is_empty());
+    }
+
+    #[test]
+    fn a_conversation_with_long_turns_from_before_stays_within_its_byte_limit() {
+        // A reply 0.6.0 saved, far longer than this version accepts, but within the conversation limit on its own.
+        let long = "y".repeat(MAX_CONVERSATION_BYTES - 1_000);
+        let mut entries = HashMap::new();
+        entries.insert(
+            who(1),
+            Entry {
+                turns: vec![user(0), Turn { role: Role::Assistant, content: long, request_id: None }],
+                revision: 1,
+                created_at: 0,
+                updated_at: 0,
+            },
+        );
+        let mut store = Store::from_parts(entries, 0);
+        assert!(store.bytes() <= MAX_CONVERSATION_BYTES);
+        // The next exchange would take it over the limit: the old one makes way.
+        let revision = store.append_exchange(who(1), "x".repeat(4_000), "z".repeat(2_000), "new".into(), 1);
+        assert_eq!(revision, 2);
+        assert!(store.bytes() <= MAX_CONVERSATION_BYTES, "{}", store.bytes());
+        assert_eq!(store.turns(&who(1)).len(), 2);
+        assert_eq!(store.saved_exchange(&who(1), "r0"), None);
+        assert!(store.saved_exchange(&who(1), "new").is_some());
+        assert_eq!(store.bytes(), store.recount());
     }
 
     #[test]

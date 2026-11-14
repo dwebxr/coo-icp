@@ -448,8 +448,10 @@ fn an_oversized_state_from_the_deployed_version_is_cut_to_the_limits() {
     let cut = last_line(&pic, id, "Brought the state of schema version 2 within this version's limits: ");
     assert_eq!(number_after(&cut, "limits: "), 2 * CALLERS as u64, "{cut}");
     assert_eq!(number_after(&cut, "turns and "), 0, "{cut}");
-    // Reading needs the saved state and its decoding at once, about twice the payload: at the most 0.6.0 could have
-    // saved (100 000 000 bytes) still under half the recommended limit (which post_upgrade is held to; it was set).
+    // Reading needs the saved state and what it decodes to at once: about twice the payload for a state made of
+    // long messages, as here. (That ratio is for this shape only. A 0.6.0 state near its 100 000 000-byte maximum
+    // made of millions of tiny entries decodes to several times its size and does not fit under the recommended
+    // limit; the README tells operators to look at the state's size before the first upgrade.)
     let post = hook_cost(&last_line(&pic, id, POST_UPGRADE_LINE));
     eprintln!("0.6.0 state of {saved} bytes with {CALLERS} oversized conversations: post_upgrade {post:?}");
     assert!(post.memory < 2 * saved + 16 * 1024 * 1024, "{post:?}");

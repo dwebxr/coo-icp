@@ -142,13 +142,20 @@ What the script does, and what to check:
    used — the only place where the memory needed by `pre_upgrade` can be seen.
 6. Starts the canister and shows `health` and `get_metrics` again.
 
+Before the **first upgrade from 0.6.0**, look at the size of what it holds: `health` (conversations) and
+`dfx canister status eliza_backend --network ic` (memory). 0.7.0 reads the whole saved state before cutting it to
+its limits, which takes about twice the state's size in memory for ordinary conversations and several times that
+for a state made of very many tiny entries (close to 1 GiB near 0.6.0's 100 MB maximum). So do not set the Wasm
+memory limit before this upgrade; set it afterwards, and only if `get_metrics` shows `wasm_memory_bytes` well
+below it (memory a canister has grown into is not given back until the next upgrade).
+
 Then, by hand:
 
 - **Send one real message** through the frontend. The model call is a bounded-wait call since 0.7.0; this first
   message is the test that the LLM canister answers it. If it does not, roll back.
 - `make upgrade-frontend-ic` deploys the frontend, and
   `cd src/eliza_frontend && node e2e/headers.mjs https://4res3-liaaa-aaaas-qdqcq-cai.icp0.io/` checks its headers.
-- `dfx canister update-settings eliza_backend --wasm-memory-limit 512MiB --network ic` if not set yet.
+- `dfx canister update-settings eliza_backend --wasm-memory-limit 512MiB --network ic` if not set yet (see above).
 
 Deploy the backend first. A browser tab still running the 0.6.0 frontend keeps working against 0.7.0 (the four
 methods it calls kept their types; a test checks this).
