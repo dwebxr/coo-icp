@@ -696,6 +696,13 @@ a {
   text-decoration-color: currentColor;
 }
 
+/* Where a link goes, after its text (lib/markdown): secondary, but part of the link. */
+.md-link-host {
+  color: var(--text-2);
+  unicode-bidi: isolate;
+  overflow-wrap: anywhere;
+}
+
 .md code {
   font-family: var(--mono);
   font-size: 0.875em;
@@ -877,6 +884,12 @@ a {
   margin-top: 12px;
   font-size: 13.5px;
   color: var(--danger);
+}
+
+.dialog .dialog-note {
+  margin-top: 12px;
+  font-size: 13.5px;
+  color: var(--text);
 }
 
 /* ============ Composer ============ */

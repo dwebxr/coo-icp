@@ -17,12 +17,13 @@ export interface Network {
   local: boolean;
   /** Undefined when running locally without canister ids (no local deployment yet). */
   backendCanisterId: string | undefined;
-  /** Where the agent sends calls; undefined = this page's origin (the dev server proxies /api to the replica). */
-  host: string | undefined;
+  /** Where the agent sends calls. */
+  host: string;
   identityProvider: string;
 }
 
-export function networkFor(hostname: string): Network {
+/** `origin`: this page's origin (scheme, host and port), where a local deployment's API is served. */
+export function networkFor(hostname: string, origin: string): Network {
   if (!isLocalHost(hostname)) {
     return {
       local: false,
@@ -37,9 +38,15 @@ export function networkFor(hostname: string): Network {
   return {
     local: true,
     backendCanisterId: import.meta.env.CANISTER_ID_ELIZA_BACKEND || undefined,
-    host: undefined,
+    // The page's own origin, never the agent's guess: the agent knows "localhost" and "127.0.0.1" but would send the
+    // calls of a page opened on [::1] to mainnet. Locally the API is served on every origin the app can be on: the
+    // replica's gateway answers /api on the frontend canister's own host, and the dev server passes /api on to it.
+    host: origin,
     identityProvider: `http://${internetIdentity}.localhost:${LOCAL_REPLICA_PORT}`,
   };
 }
 
-export const network: Network = networkFor(typeof window === 'undefined' ? 'localhost' : window.location.hostname);
+export const network: Network =
+  typeof window === 'undefined'
+    ? networkFor('localhost', 'http://localhost:4943')
+    : networkFor(window.location.hostname, window.location.origin);

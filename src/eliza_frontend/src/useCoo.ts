@@ -3,13 +3,25 @@ import { SessionInvalid, SignInCancelled, type Backend, type Conversation, type 
 import { sleep, within } from './lib/async';
 import { mergeHistory, nextId, reconcile, turnsKey, type ChatMessage } from './lib/thread';
 import { BUSY_REASON, DELIVERY_WINDOW_MS, deliver } from './lib/delivery';
-import { adoptLegacyFloor, floorOf, floorOwner, raiseFloor, resetFloor } from './lib/floors';
+import { adoptLegacyFloor, floorOf, floorOwner, raiseFloor, readFloor, resetFloor } from './lib/floors';
 import { MAX_MESSAGE_BYTES, byteLength } from './lib/limits';
-import { announceSignOut, clearActivity, idleFor, noteActivity, onSignOutElsewhere } from './lib/sessionSync';
+import {
+  announceSignOut,
+  clearActivity,
+  idleFor,
+  noteActivity,
+  onSignOutElsewhere,
+  signOutGeneration,
+} from './lib/sessionSync';
 import { network } from './network';
 
 export type Status = 'checking' | 'signedOut' | 'signingIn' | 'ready';
 export type HistoryState = 'loading' | 'loaded' | 'error';
+/**
+ * What became of a clear: done; not done (refused, or failed for certain); or no answer yet — the call is still out,
+ * so the conversation may still be cleared, and nothing can be sent until the canister answers.
+ */
+export type ClearOutcome = 'cleared' | 'failed' | 'pending';
 
 export type { ChatMessage };
 
@@ -31,6 +43,9 @@ const CLEAR_TIMEOUT_MS = 30_000;
 // A history read older than what this device already saw is asked again this many times, this far apart.
 const STALE_READ_ATTEMPTS = 3;
 const STALE_READ_DELAY_MS = 1000;
+// A load whose answer turned out to be older than something confirmed while it was on its way starts over, at most
+// this many times in all.
+const LOAD_ROUNDS = 3;
 const CONNECTION_ERROR = 'Connection lost.';
 const CONFLICT_ERROR = 'Conversation changed.';
 
@@ -93,6 +108,9 @@ export function useCoo(backend: Backend) {
   const historyRef = useRef<HistoryState>('loading');
   historyRef.current = history;
   const signInAttempt = useRef(0);
+  // A cancelled sign-in completed while a newer attempt was in progress: its delegation was kept for the newer
+  // attempt's sake, and is discarded if that one ends without a session.
+  const abandonedSignIn = useRef(false);
   const alive = useRef(true);
   // The revision of the saved conversation the thread shows; new messages are sent after it.
   const revision = useRef(0);
@@ -179,29 +197,48 @@ export function useCoo(backend: Backend) {
     if (!who) return;
     setHistory('loading');
     try {
-      let conversation: Conversation | null = null;
-      for (let attempt = 1; attempt <= STALE_READ_ATTEMPTS; attempt++) {
-        const read = await within(backend.history(), READ_TIMEOUT_MS);
-        if (myGen !== gen.current) return;
-        if (read.revision >= floorOf(who)) {
-          conversation = read;
-          break;
+      for (let round = 1; round <= LOAD_ROUNDS; round++) {
+        // Taken before asking: an answer is judged against what was known when it was asked for (lib/floors).
+        const start = readFloor(who);
+        let epoch = start.epoch;
+        let conversation: Conversation | null = null;
+        for (let attempt = 1; attempt <= STALE_READ_ATTEMPTS; attempt++) {
+          const read = await within(backend.history(), READ_TIMEOUT_MS);
+          if (myGen !== gen.current) return;
+          if (read.revision >= floorOf(who)) {
+            conversation = read;
+            break;
+          }
+          // From a replica that has not caught up yet; ask again.
+          if (attempt < STALE_READ_ATTEMPTS) await sleep(STALE_READ_DELAY_MS);
+          if (myGen !== gen.current) return;
         }
-        // From a replica that has not caught up yet; ask again.
-        if (attempt < STALE_READ_ATTEMPTS) await sleep(STALE_READ_DELAY_MS);
-        if (myGen !== gen.current) return;
+        if (!conversation) {
+          // Still behind what this device has seen. Either replicas are slow to catch up, or the canister really
+          // went back (restored from a snapshot, reinstalled). Its own answer, through consensus, settles it.
+          const certified = await within(backend.certifiedHistory(), CERTIFIED_READ_TIMEOUT_MS);
+          if (myGen !== gen.current) return;
+          if (certified.revision < floorOf(who)) {
+            const reset = await resetFloor(who, certified.revision, start);
+            if (myGen !== gen.current) return;
+            // Refused: the floor moved while the canister was asked (a clear or a reply was confirmed meanwhile,
+            // here or in another tab), so this answer is older than that — not a sign that the canister went back.
+            if (!reset) continue;
+            epoch = start.epoch + 1;
+          }
+          conversation = certified;
+        }
+        // An answer from before a reset (another tab's, or one in between) belongs to the state that was replaced.
+        if (readFloor(who).epoch !== epoch) continue;
+        const loaded = conversation;
+        update((prev) => mergeHistory(prev, loaded.messages));
+        revision.current = loaded.revision;
+        raiseFloor(who, loaded.revision, epoch);
+        setHistory('loaded');
+        return;
       }
-      if (!conversation) {
-        // Still behind what this device has seen. Either replicas are slow to catch up, or the canister really
-        // went back (restored from a snapshot, reinstalled). Its own answer, through consensus, settles it.
-        conversation = await within(backend.certifiedHistory(), CERTIFIED_READ_TIMEOUT_MS);
-        if (myGen !== gen.current) return;
-        if (conversation.revision < floorOf(who)) resetFloor(who, conversation.revision);
-      }
-      update((prev) => mergeHistory(prev, conversation.messages));
-      revision.current = conversation.revision;
-      raiseFloor(who, conversation.revision);
-      setHistory('loaded');
+      console.error('History error: the conversation kept changing while it was loaded');
+      setHistory('error');
     } catch (err) {
       if (myGen !== gen.current) return;
       console.error('History error:', err);
@@ -218,13 +255,17 @@ export function useCoo(backend: Backend) {
       const myGen = gen.current;
       const myRev = rev.current;
       const who = principalRef.current;
+      if (!who) return null;
+      const start = readFloor(who);
       try {
         const conversation = await within(backend.history(), timeoutMs);
-        if (myGen !== gen.current || myRev !== rev.current || historyRef.current !== 'loaded' || !who) return null;
-        if (conversation.revision < floorOf(who)) return null;
+        if (myGen !== gen.current || myRev !== rev.current || historyRef.current !== 'loaded') return null;
+        // Behind what was confirmed, or from before a reset: not applied.
+        const now = readFloor(who);
+        if (now.epoch !== start.epoch || conversation.revision < now.revision) return null;
         update((prev) => reconcile(prev, conversation.messages, activeId));
         revision.current = conversation.revision;
-        raiseFloor(who, conversation.revision);
+        raiseFloor(who, conversation.revision, start.epoch);
         return conversation;
       } catch (err) {
         console.error('History refresh error:', err);
@@ -246,7 +287,7 @@ export function useCoo(backend: Backend) {
       setPrincipal(session.principal);
       principalRef.current = owner;
       setNotice(null);
-      noteActivity(Date.now(), true);
+      noteActivity(true);
       go('ready');
       void loadHistory();
     },
@@ -257,6 +298,24 @@ export function useCoo(backend: Backend) {
   // error after a while, and recover quietly if it finishes later.
   useEffect(() => {
     let active = true;
+    // A sign-out in another tab while this one restores must not be undone by the restore finishing: the session it
+    // read is the one that was signed out.
+    const generation = signOutGeneration();
+    // Discards the restored session instead of using it.
+    const discard = (notice: Notice, announce: boolean) => {
+      setNotice(notice);
+      go('signedOut');
+      markAuthReady(false);
+      clearActivity();
+      if (announce) announceSignOut();
+      backend.signOut().then(
+        () => active && markAuthReady(true),
+        (err) => {
+          console.error('Sign-out error:', err);
+          if (active) setNotice(NOTICES.startFailed);
+        },
+      );
+    };
     const timer = setTimeout(() => {
       if (!active || statusRef.current !== 'checking') return;
       setNotice(NOTICES.startFailed);
@@ -269,21 +328,12 @@ export function useCoo(backend: Backend) {
         markAuthReady(true);
         if (statusRef.current === 'checking' || statusRef.current === 'signedOut') {
           setNotice((n) => (n === NOTICES.startFailed ? null : n));
-          const idle = idleFor(Date.now());
-          if (session && idle !== null && idle >= IDLE_TIMEOUT_MS) {
-            // The stored session outlived the idle limit while no tab was open (or the computer slept).
-            setNotice(NOTICES.idle);
-            go('signedOut');
-            markAuthReady(false);
-            clearActivity();
-            backend.signOut().then(
-              () => active && markAuthReady(true),
-              (err) => {
-                console.error('Sign-out error:', err);
-                if (active) setNotice(NOTICES.startFailed);
-              },
-            );
-          } else if (session) startSession(session);
+          const idle = idleFor();
+          if (session && signOutGeneration() !== generation) discard(NOTICES.elsewhere, false);
+          // The stored session outlived the idle limit while no tab was open (or the computer slept). The other tabs
+          // are told too: one that is restoring the same session right now must not keep it.
+          else if (session && idle !== null && idle >= IDLE_TIMEOUT_MS) discard(NOTICES.idle, true);
+          else if (session) startSession(session);
           else go('signedOut');
         }
       },
@@ -319,17 +369,17 @@ export function useCoo(backend: Backend) {
     let timer = 0;
     const check = () => {
       window.clearTimeout(timer);
-      const idle = idleFor(Date.now()) ?? 0;
+      const idle = idleFor() ?? 0;
       if (idle >= IDLE_TIMEOUT_MS) void endSession('idle');
       else timer = window.setTimeout(check, IDLE_TIMEOUT_MS - idle);
     };
-    const active = () => noteActivity(Date.now());
+    const active = () => noteActivity();
     const visible = () => {
       if (document.visibilityState === 'visible') check();
     };
     IDLE_EVENTS.forEach((name) => window.addEventListener(name, active, { capture: true, passive: true }));
     document.addEventListener('visibilitychange', visible);
-    noteActivity(Date.now(), true);
+    noteActivity(true);
     check();
     return () => {
       window.clearTimeout(timer);
@@ -338,11 +388,35 @@ export function useCoo(backend: Backend) {
     };
   }, [status, pending, endSession]);
 
-  // Signing out in one tab signs out the others: they hold the same identity in memory.
-  useEffect(() => {
-    if (status !== 'ready') return;
-    return onSignOutElsewhere(() => void endSession('elsewhere'));
-  }, [status, endSession]);
+  // Signing out in one tab signs out the others: they hold the same identity in memory. Listened to from the start:
+  // a tab that is restoring a session compares the sign-out generation when the restore finishes (above); one that
+  // is signing in is left alone (finishing a sign-in after a sign-out elsewhere is a new, explicit sign-in).
+  useEffect(
+    () =>
+      onSignOutElsewhere(() => {
+        if (statusRef.current === 'ready') void endSession('elsewhere');
+      }),
+    [endSession],
+  );
+
+  /** Throws away the delegation a sign-in produced, without a session ever using it. */
+  const discardDelegation = useCallback(() => {
+    markAuthReady(false);
+    backend.signOut().then(
+      () => alive.current && markAuthReady(true),
+      (err) => {
+        console.error('Sign-out error:', err);
+        if (alive.current) setNotice(NOTICES.startFailed);
+      },
+    );
+  }, [backend]);
+
+  /** A sign-in attempt ended without a session: a cancelled one that completed meanwhile is discarded now. */
+  const discardAbandoned = useCallback(() => {
+    if (!abandonedSignIn.current) return;
+    abandonedSignIn.current = false;
+    discardDelegation();
+  }, [discardDelegation]);
 
   const signIn = useCallback(() => {
     if (statusRef.current !== 'signedOut' || !authReadyRef.current) return;
@@ -354,22 +428,17 @@ export function useCoo(backend: Backend) {
       (session) => {
         if (!alive.current) return;
         if (attempt === signInAttempt.current && statusRef.current === 'signingIn') {
+          // This attempt's session is the one in use now.
+          abandonedSignIn.current = false;
           startSession(session);
           return;
         }
         // The user cancelled this attempt and it completed anyway (the identity window was still open). Cancel
         // means cancel: the delegation it produced is discarded rather than used. If a newer attempt is under
-        // way, signing out now would break it, and its own outcome decides.
-        if (statusRef.current === 'signedOut') {
-          markAuthReady(false);
-          backend.signOut().then(
-            () => alive.current && markAuthReady(true),
-            (err) => {
-              console.error('Sign-out error:', err);
-              if (alive.current) setNotice(NOTICES.startFailed);
-            },
-          );
-        }
+        // way, signing out now would break it: its own outcome decides, and if it ends without a session, this
+        // delegation is discarded then.
+        if (statusRef.current === 'signedOut') discardDelegation();
+        else if (statusRef.current === 'signingIn') abandonedSignIn.current = true;
       },
       (err) => {
         if (!alive.current || attempt !== signInAttempt.current || statusRef.current !== 'signingIn') return;
@@ -378,15 +447,17 @@ export function useCoo(backend: Backend) {
           setNotice(NOTICES.signInFailed);
         }
         go('signedOut');
+        discardAbandoned();
       },
     );
-  }, [backend, startSession]);
+  }, [backend, startSession, discardDelegation, discardAbandoned]);
 
   const cancelSignIn = useCallback(() => {
     if (statusRef.current !== 'signingIn') return;
     signInAttempt.current += 1;
     go('signedOut');
-  }, []);
+    discardAbandoned();
+  }, [discardAbandoned]);
 
   const signOut = useCallback(() => endSession('user'), [endSession]);
 
@@ -398,9 +469,11 @@ export function useCoo(backend: Backend) {
       const current = () => alive.current && myGen === gen.current;
       const mark = (patch: Partial<ChatMessage>) =>
         update((prev) => prev.map((m) => (m.id === id ? { ...m, ...patch } : m)));
-      // A confirmed revision counts for the sender even if the session has ended by the time it arrives.
-      const confirm = (revision: number) => {
-        if (who) raiseFloor(who, revision);
+      // A confirmed revision counts for the sender even if the session has ended by the time it arrives — but only
+      // in the epoch its call started in (lib/floors): a confirmation from before a reset is of the replaced state.
+      const epochNow = () => (who ? readFloor(who).epoch : 0);
+      const confirm = (revision: number, epoch: number) => {
+        if (who) raiseFloor(who, revision, epoch);
       };
       inflight.current += 1;
       setBusy(true);
@@ -418,13 +491,15 @@ export function useCoo(backend: Backend) {
             {
               // Confirmations are recorded from the call itself, so one that arrives after the timeout still counts.
               send: (rid, base, t, ms) => {
+                const epoch = epochNow();
                 const call = backend.send(rid, base, t);
-                call.then((outcome) => 'ok' in outcome && confirm(outcome.ok.revision), () => {});
+                call.then((outcome) => 'ok' in outcome && confirm(outcome.ok.revision, epoch), () => {});
                 return within(call, ms);
               },
               status: (rid, ms) => {
+                const epoch = epochNow();
                 const call = backend.status(rid);
-                call.then((status) => typeof status === 'object' && confirm(status.done.revision), () => {});
+                call.then((status) => typeof status === 'object' && confirm(status.done.revision, epoch), () => {});
                 return within(call, ms);
               },
               sleep,
@@ -549,30 +624,42 @@ export function useCoo(backend: Backend) {
   );
 
   /**
-   * Resolves true when the conversation was cleared, false when it was not or when the canister has not answered
-   * in time. In the last case the call is still out: nothing can be sent until it settles, and if it did clear,
-   * the thread follows.
+   * Clears the conversation (see ClearOutcome). When the canister has not answered in time, the call is still out:
+   * nothing can be sent until it settles, and if it did clear, the thread follows.
    */
-  const clear = useCallback(async () => {
-    if (inflight.current > 0) return false;
+  const clear = useCallback(async (): Promise<ClearOutcome> => {
+    if (inflight.current > 0) return 'failed';
     const myGen = gen.current;
     const who = principalRef.current;
+    // Taken before the call: its answer is judged against what was known when it was made (lib/floors).
+    const before = who ? readFloor(who) : null;
     const call = backend.clear();
     inflight.current += 1;
     setBusy(true);
     const applied = call.then(
-      (cleared) => {
+      async (cleared) => {
         // An update call's answer is the canister's own: history older than the clear must never be applied
         // again (even if the session has ended meanwhile), and if the canister is behind this device's floor —
-        // it was restored or reinstalled — the floor follows it.
-        if (who) {
-          if (cleared < floorOf(who)) resetFloor(who, cleared);
-          else raiseFloor(who, cleared);
+        // it was restored or reinstalled — the floor follows it. Unless the floor moved during the call: then
+        // something newer than this clear was confirmed meanwhile (another tab's clear or reply), and the floor is
+        // left alone.
+        let behind = false;
+        if (who && before) {
+          if (cleared >= floorOf(who)) raiseFloor(who, cleared, before.epoch);
+          else behind = !(await resetFloor(who, cleared, before));
         }
-        if (!alive.current || myGen !== gen.current) return false;
+        if (!alive.current) return false;
+        if (myGen !== gen.current) {
+          // The session the clear was made in has ended. If one is active again (the same user signed back in, say),
+          // the history it loaded may be from before the clear: it is loaded again.
+          if (statusRef.current === 'ready') void refreshHistory();
+          return false;
+        }
         update(() => []);
         revision.current = cleared;
         setHistory('loaded');
+        // Something newer than the clear exists: the thread catches up with it.
+        if (behind) void refreshHistory();
         return true;
       },
       (err) => {
@@ -587,12 +674,12 @@ export function useCoo(backend: Backend) {
       if (alive.current && inflight.current === 0) setBusy(false);
     });
     try {
-      return await within(applied, CLEAR_TIMEOUT_MS);
+      return (await within(applied, CLEAR_TIMEOUT_MS)) ? 'cleared' : 'failed';
     } catch {
-      // No answer yet. The dialog reports a failure and can be closed; `applied` finishes the job when it comes.
-      return false;
+      // No answer yet. The dialog says so and can be closed; `applied` finishes the job when it comes.
+      return 'pending';
     }
-  }, [backend, handleSessionError]);
+  }, [backend, handleSessionError, refreshHistory]);
 
   return {
     status,

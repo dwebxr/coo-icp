@@ -1,6 +1,7 @@
 // Development only: signs in with an identity made in this browser, so the real canister client (backend.ts) can
-// be run against a local replica without Internet Identity. Loaded from main.tsx only when import.meta.env.DEV is
-// true and the URL has ?dev-identity; it is not part of a production build.
+// be run against a local replica without Internet Identity. Loaded from main.tsx only on a local host, when the URL
+// has ?dev-identity, in the dev server or in the bundle `make e2e-local` builds for itself; it is not part of any
+// other build.
 import { DelegationChain, DelegationIdentity, Ed25519KeyIdentity } from '@dfinity/identity';
 import type { Identity } from '@dfinity/agent';
 import type { Auth } from '../backend';

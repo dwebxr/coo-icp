@@ -2,12 +2,14 @@
 // The mock is not involved: every message goes through the agent, candid, canister_inspect_message and the
 // canister's own checks. Sign-in uses the development-only `?dev-identity` (Internet Identity needs a passkey).
 //
-// Run `make e2e-local`, or by hand:
-//   dfx start --background && dfx deploy eliza_backend
-//   dfx canister call eliza_backend set_llm_provider '(variant { Fallback })'
+// `make e2e-local` runs them against the local asset canister, which serves a bundle built for this test (with
+// ?dev-identity) under the security headers it sends in production: any Content-Security-Policy violation, and any
+// console error, fails the test it happens in. By hand, against the dev server (no CSP there):
+//   dfx start --background && dfx deploy eliza_backend --network local
+//   dfx canister call eliza_backend set_llm_provider '(variant { Fallback })' --network local
 //   npm run dev        (start it after the deploy: it reads the canister id from the repository's .env)
 //   npm run e2e:local
-// Usage: node e2e/local.mjs   BASE=<dev server url>   PW_CHANNEL=chrome to use an installed Chrome
+// Usage: node e2e/local.mjs   BASE=<url of the app>   PW_CHANNEL=chrome to use an installed Chrome
 import { chromium } from 'playwright';
 
 const BASE = process.env.BASE ?? 'http://localhost:5173';
@@ -17,15 +19,26 @@ const results = [];
 /** Each test gets its own browser context, and so its own identity. */
 async function test(name, fn) {
   const ctx = await browser.newContext({ viewport: { width: 1280, height: 800 } });
-  const page = await ctx.newPage();
   const errors = [];
+  // Violations of the Content-Security-Policy, reported from every page and every reload of the context.
+  await ctx.exposeBinding('__cspViolation', (_source, text) => errors.push(`CSP violation: ${text}`));
+  await ctx.addInitScript(() =>
+    document.addEventListener('securitypolicyviolation', (e) =>
+      window.__cspViolation(`${e.effectiveDirective} blocked ${e.blockedURI || '(inline)'}`),
+    ),
+  );
+  const page = await ctx.newPage();
   page.on('pageerror', (e) => errors.push(e.message));
+  page.on('console', (m) => m.type() === 'error' && errors.push(`console error: ${m.text()}`));
   try {
     await fn(page, ctx);
     if (errors.length) throw new Error('page errors: ' + errors.join('; '));
     results.push(`PASS ${name}`);
   } catch (e) {
-    results.push(`FAIL ${name}: ${e.message.split('\n')[0]}`);
+    const first = e.message.split('\n')[0];
+    // A timeout is often only the consequence: say what went wrong on the page first.
+    const cause = errors.length && !first.startsWith('page errors') ? ` (on the page: ${errors[0]})` : '';
+    results.push(`FAIL ${name}: ${first}${cause}`);
   } finally {
     await ctx.close();
   }
@@ -92,10 +105,18 @@ await test('Clear empties the conversation on the canister', async (p) => {
 
 await test('The longest message the canister accepts is accepted; the composer stops a longer one', async (p) => {
   await signIn(p);
+  // Exactly the limit, in ASCII: a canister whose limit were lower would refuse it.
+  await p.locator('textarea').fill('x'.repeat(4001));
+  expect(await p.locator('.send-btn').isDisabled(), '4 001 bytes cannot be sent');
+  await send(p, 'x'.repeat(4000));
+  expect((await p.locator('.msg-failed').count()) === 0, '4 000 bytes are not refused');
+  expect((await userBubbles(p)) === 1, '4 000 bytes went through');
+  // In UTF-8: bytes, not characters.
   await p.locator('textarea').fill('あ'.repeat(1334));
   expect(await p.locator('.send-btn').isDisabled(), '4 002 bytes cannot be sent');
   await send(p, 'あ'.repeat(1333));
-  expect((await userBubbles(p)) === 1, '3 999 bytes went through');
+  expect((await p.locator('.msg-failed').count()) === 0, '3 999 bytes are not refused');
+  expect((await userBubbles(p)) === 2, '3 999 bytes went through');
 });
 
 await test('A floor above the canister\'s revision is settled by a certified read', async (p) => {

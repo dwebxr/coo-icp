@@ -1,13 +1,16 @@
 // Interaction tests against the dev server's mock backend (`npm run dev`, then `npm run e2e`).
 // Usage: node e2e/smoke.mjs [--webkit]   BASE=<dev server url>   PW_CHANNEL=chrome to use an installed Chrome
+//        ONLY=<text> runs only the tests whose name contains it
 import { chromium, webkit } from 'playwright';
 
 const BASE = process.env.BASE ?? 'http://localhost:5173';
+const ONLY = process.env.ONLY;
 const engine = process.argv.includes('--webkit') ? webkit : chromium;
 const browser = await engine.launch(engine === chromium && process.env.PW_CHANNEL ? { channel: process.env.PW_CHANNEL } : {});
 const results = [];
 
 async function test(name, fn, ctxOpts = {}) {
+  if (ONLY && !name.includes(ONLY)) return;
   const ctx = await browser.newContext({ viewport: { width: 1280, height: 800 }, ...ctxOpts });
   const page = await ctx.newPage();
   const errors = [];
@@ -463,6 +466,15 @@ await test('Links are safe (http/https only, new tab, noopener)', async (p) => {
   }
 });
 
+await test('A link shows where it goes after a text that does not say it, inside the link', async (p) => {
+  await open(p, '?mock=rich');
+  const labelled = p.locator('.md a', { hasText: 'the canister overview' });
+  expect((await labelled.innerText()) === 'the canister overview (internetcomputer.org)', await labelled.innerText());
+  expect((await labelled.locator('.md-link-host').count()) === 1, 'the destination is part of the link');
+  // A bare URL already shows its destination.
+  expect((await p.locator('.md a', { hasText: 'https://internetcomputer.org/docs' }).locator('.md-link-host').count()) === 0, 'no suffix on a bare URL');
+});
+
 await test('Mobile: Return inserts newline; send button sends', async (p) => {
   await open(p, '?mock=empty&delay=200');
   await p.locator('textarea').fill('x');
@@ -536,11 +548,66 @@ await test('Cancel during sign-in is final: a sign-in that completes afterwards 
   // The mock completes the sign-in about a second later.
   await p.waitForTimeout(2500);
   expect((await p.locator('.chat').count()) === 0, 'still signed out');
+  expect((await p.evaluate(() => window.__mock.session)) === false, 'its delegation is discarded');
   await p.waitForFunction(() => !document.querySelector('.btn-primary')?.disabled, null, { timeout: 3000 });
   // A sign-in the user does not cancel still works.
   await p.getByRole('button', { name: /sign in/i }).click();
   await p.waitForSelector('.chat', { timeout: 8000 });
 });
+
+await test('A tab that is still restoring its session when another tab signs out does not keep it', async (p, ctx) => {
+  await open(p, '?mock=chat');
+  const other = await ctx.newPage();
+  // Restoring the session takes 3 s in this tab.
+  await other.goto(`${BASE}/?mock=chat&restore=3000`);
+  await p.getByRole('button', { name: 'Account' }).click();
+  await p.getByRole('menuitem', { name: /sign out/i }).click();
+  await p.waitForSelector('.signin');
+  await other.waitForSelector('.signin-actions:not(.is-hidden)', { timeout: 6000 });
+  expect((await other.locator('.notice').innerText()).includes('another tab'), 'says why');
+  expect((await other.locator('.chat').count()) === 0, 'not signed in');
+  await other.waitForFunction(() => window.__mock.session === false, null, { timeout: 3000 });
+});
+
+await test('A tab that finds the stored session idle at start-up signs out a tab that is restoring it', async (p, ctx) => {
+  // This tab restores slowly; meanwhile the last recorded activity is 11 minutes old.
+  await p.goto(`${BASE}/?mock=chat&restore=3000`);
+  await p.evaluate(() => localStorage.setItem('coo:last-active', String(Date.now() - 11 * 60 * 1000)));
+  // Another tab opens, finds the session idle, signs out (which forgets the recorded activity) and says so.
+  const other = await ctx.newPage();
+  await other.goto(`${BASE}/?mock=chat`);
+  await other.waitForSelector('.signin-actions:not(.is-hidden)');
+  expect((await other.locator('.notice').innerText()).includes('inactivity'), 'idle notice in the tab that found it');
+  // The first tab's restore then finds no recorded activity at all — but the sign-out was announced.
+  await p.waitForSelector('.signin-actions:not(.is-hidden)', { timeout: 6000 });
+  expect((await p.locator('.chat').count()) === 0, 'not signed in');
+  expect((await p.locator('.notice').innerText()).includes('another tab'), 'says why');
+});
+
+for (const [second, ending] of [
+  ['hang', 'is cancelled'],
+  ['lateerror', 'fails'],
+]) {
+  await test(`A cancelled sign-in that completes during a newer one is discarded when the newer one ${ending}`, async (p) => {
+    await open(p, `?mock=signedout&signin=late,${second}`);
+    await p.getByRole('button', { name: /sign in/i }).click();
+    await p.waitForSelector('text=Allow pop-ups', { timeout: 5000 });
+    await p.getByRole('button', { name: 'Cancel' }).click();
+    // A newer attempt, still in progress when the first one completes (4 s after it began).
+    await p.getByRole('button', { name: /sign in/i }).click();
+    await p.waitForFunction(() => window.__mock.session === true, null, { timeout: 4000 });
+    expect((await p.locator('.chat').count()) === 0, 'the cancelled attempt is not used');
+    if (second === 'hang') {
+      await p.waitForSelector('text=Allow pop-ups', { timeout: 5000 });
+      await p.getByRole('button', { name: 'Cancel' }).click();
+    } else {
+      await p.waitForSelector('.notice-error', { timeout: 6000 });
+    }
+    // The delegation the cancelled attempt left behind is thrown away: a reload would not restore it.
+    await p.waitForFunction(() => window.__mock.session === false, null, { timeout: 3000 });
+    expect((await p.locator('.chat').count()) === 0, 'still signed out');
+  });
+}
 
 await test('Signing out in one tab signs out the other', async (p, ctx) => {
   await open(p, '?mock=chat');
@@ -579,7 +646,7 @@ await test('Activity in another tab keeps this one signed in', async (p) => {
   await p.waitForSelector('.signin');
 });
 
-await test('A clear that gets no answer can be left, blocks sending, and is not reported as done', async (p) => {
+await test('A clear that gets no answer can be left, blocks sending, and is reported as neither done nor failed', async (p) => {
   await p.clock.install();
   await open(p, '?mock=clearhang');
   await p.clock.runFor(1500);
@@ -588,12 +655,44 @@ await test('A clear that gets no answer can be left, blocks sending, and is not 
   await p.getByRole('menuitem', { name: /clear/i }).click();
   await p.locator('dialog').getByRole('button', { name: 'Clear' }).click();
   await p.clock.runFor(31_000);
-  await p.waitForSelector('.dialog-error');
-  await p.locator('dialog').getByRole('button', { name: 'Cancel' }).click();
+  // No answer is not a failure: the conversation may still be cleared.
+  await p.waitForSelector('.dialog-note');
+  const note = await p.locator('.dialog-note').innerText();
+  expect(/may still be cleared/.test(note) && /nothing can be sent/i.test(note) && /close/i.test(note), note);
+  expect((await p.locator('.dialog-error').count()) === 0, 'not reported as a failure');
+  expect(await p.locator('dialog').getByRole('button', { name: 'Clear' }).isDisabled(), 'not offered again while it is out');
+  await p.locator('dialog').getByRole('button', { name: 'Close' }).click();
   expect((await p.locator('dialog[open]').count()) === 0, 'dialog closed');
   expect((await userBubbles(p)) > 0, 'the thread is not emptied on a guess');
   await p.locator('textarea').fill('next');
   expect(await p.locator('.send-btn').isDisabled(), 'nothing is sent while the clear is still out');
+});
+
+await test('A clear from an earlier session that succeeds late brings the thread up to date after signing back in', async (p) => {
+  await p.clock.install();
+  // The clear answers (and clears) 40 s after it is sent.
+  await p.goto(`${BASE}/?mock=chat&clear=40000`);
+  await p.clock.runFor(1500);
+  await p.waitForSelector('.thread[aria-busy="false"]');
+  await p.getByRole('button', { name: 'Account' }).click();
+  await p.getByRole('menuitem', { name: /clear/i }).click();
+  await p.locator('dialog').getByRole('button', { name: 'Clear' }).click();
+  await p.clock.runFor(31_000);
+  await p.waitForSelector('.dialog-note');
+  await p.locator('dialog').getByRole('button', { name: 'Close' }).click();
+  // Sign out and back in (the same user) while the clear is still out.
+  await p.getByRole('button', { name: 'Account' }).click();
+  await p.getByRole('menuitem', { name: /sign out/i }).click();
+  await p.clock.runFor(500);
+  await p.getByRole('button', { name: /sign in/i }).click();
+  await p.clock.runFor(2000);
+  await p.waitForSelector('.thread[aria-busy="false"]');
+  expect((await userBubbles(p)) > 0, 'the history loaded before the clear answered');
+  await p.clock.runFor(10_000);
+  await p.waitForSelector('.empty', { timeout: 5000 });
+  expect((await userBubbles(p)) === 0, 'the thread follows the clear');
+  await p.locator('textarea').fill('after');
+  expect(!(await p.locator('.send-btn').isDisabled()), 'and sending is possible again');
 });
 
 await test('History behind what this device saw is settled by asking the canister through consensus', async (p) => {
@@ -615,6 +714,19 @@ await test('History behind what this device saw is settled by asking the caniste
   expect((await userBubbles(p)) === 2, 'the conversation is shown');
   const stored = await p.evaluate((k) => localStorage.getItem(k), key);
   expect(stored === '1:0', `the floor follows the canister in a new epoch (${stored})`);
+});
+
+await test('A late certified read does not bring back a conversation another tab cleared meanwhile', async (p) => {
+  // Floor 0:5; replicas say 4; the certified read reads 5 but answers after another tab's clear (revision 6).
+  await p.goto(`${BASE}/?mock=racyclear`);
+  await p.waitForSelector('.thread[aria-busy="false"]', { timeout: 15000 });
+  expect((await p.locator('.state-card').count()) === 0, 'no error');
+  expect((await userBubbles(p)) === 0, 'the cleared conversation is not shown');
+  await p.waitForSelector('.empty');
+  const floor = await p.evaluate(() =>
+    localStorage.getItem(Object.keys(localStorage).find((name) => name.startsWith('coo:floor:'))),
+  );
+  expect(floor === '0:6', `the floor stays at the other tab's clear, not lowered to the late answer (${floor})`);
 });
 
 await test('A conversation that cannot be loaded can still be cleared', async (p) => {

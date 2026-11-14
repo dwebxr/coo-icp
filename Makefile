@@ -1,10 +1,28 @@
 # Coo — build, test, deploy.  `make help` lists the targets.
 #
-# NETWORK selects the network for the targets that talk to a canister (default: local). Nothing here passes --yes
-# to dfx or touches mainnet without NETWORK=ic or an explicit *-ic target.
+# NETWORK selects the network for the targets that talk to a canister (default: local); it is local or ic. The local
+# targets name the local network in every dfx call, so a DFX_NETWORK in the environment cannot send them anywhere
+# else. Nothing here passes --yes to dfx or touches mainnet without NETWORK=ic or an explicit *-ic target, and each
+# of those asks before it changes anything.
 
 SHELL := /bin/bash
 NETWORK ?= local
+
+# The variables an operator sets end up in command lines, so they are checked here, by make, before any shell sees
+# them (`make upgrade 'NETWORK=ic; echo INJECTED'` stops here).
+ifneq ($(NETWORK),local)
+ifneq ($(NETWORK),ic)
+$(error NETWORK must be local or ic)
+endif
+endif
+ifneq ($(origin PROVIDER),undefined)
+ifneq ($(PROVIDER),OnChain)
+ifneq ($(PROVIDER),Fallback)
+$(error PROVIDER must be OnChain or Fallback)
+endif
+endif
+endif
+
 FRONTEND := src/eliza_frontend
 # dfx and cargo must find rustup's toolchain (it has the wasm32 target), also where another cargo is first in PATH.
 CARGO := PATH="$$HOME/.cargo/bin:$$PATH" cargo
@@ -12,8 +30,8 @@ DFX := PATH="$$HOME/.cargo/bin:$$PATH" dfx
 WASM_BUILD := $(CARGO) build --target wasm32-unknown-unknown --release --locked
 
 .PHONY: help setup start stop deploy-local build build-ic candid declarations check test test-canister e2e \
-        e2e-local install-ic upgrade upgrade-ic upgrade-frontend upgrade-frontend-ic status logs set-provider \
-        set-character clean
+        e2e-local build-e2e install-ic upgrade upgrade-ic upgrade-frontend upgrade-frontend-ic status logs \
+        set-provider set-character clean
 
 help:
 	@echo "Coo — an AI chat agent in an Internet Computer canister"
@@ -27,7 +45,7 @@ help:
 	@echo "  make test               canister unit tests, frontend type check and unit tests"
 	@echo "  make test-canister      canister unit tests + PocketIC integration tests (incl. upgrade from mainnet's version)"
 	@echo "  make e2e                browser tests against the mock + accessibility (needs 'npm run dev' running)"
-	@echo "  make e2e-local          browser tests of the real client on a local replica + deployed security headers"
+	@echo "  make e2e-local          the real client, served by the local asset canister under its security headers"
 	@echo "  make check              formatting, clippy, Candid file and generated bindings up to date"
 	@echo
 	@echo "Generated files"
@@ -35,8 +53,8 @@ help:
 	@echo "  make declarations       the frontend's Candid bindings from that file"
 	@echo
 	@echo "Mainnet (each asks before it changes anything)"
-	@echo "  make install-ic         first installation"
-	@echo "  make upgrade-ic         upgrade the backend: stop, snapshot, upgrade, verify, start (scripts/upgrade.sh)"
+	@echo "  make install-ic         first installation; refuses if the canisters already have code"
+	@echo "  make upgrade-ic         upgrade the backend: stop, snapshot, upgrade, check, start (scripts/upgrade.sh)"
 	@echo "  make upgrade-frontend-ic  build and upload the frontend"
 	@echo
 	@echo "Operating (NETWORK=local by default; add NETWORK=ic for mainnet)"
@@ -50,11 +68,12 @@ help:
 setup:
 	@command -v dfx >/dev/null || { echo "dfx not found: https://internetcomputer.org/docs/building-apps/getting-started/install"; exit 1; }
 	@command -v rustup >/dev/null || { echo "rustup not found: https://rustup.rs"; exit 1; }
-	@command -v node >/dev/null || { echo "node not found (22 or newer; .nvmrc says 24)"; exit 1; }
+	@command -v node >/dev/null || { echo "node not found (22.12+, 24 or 26+; .nvmrc says 24)"; exit 1; }
 	PATH="$$HOME/.cargo/bin:$$PATH" rustup target add wasm32-unknown-unknown
 	cd $(FRONTEND) && npm ci
 
 # Starts the local replica unless one is running. (State of an earlier run is kept; `dfx start --clean` wipes it.)
+# `dfx start` and `dfx stop` only ever act on the local replica.
 start:
 	@$(DFX) ping local >/dev/null 2>&1 || $(DFX) start --background
 
@@ -62,26 +81,37 @@ stop:
 	$(DFX) stop
 
 # The frontend is built after the backend is deployed: the build reads the local canister ids from .env.
+# (`dfx deps pull` downloads Internet Identity's Wasm from mainnet, which is where it is published; it changes nothing
+# there. Everything else is deployed to the local replica.)
 deploy-local: start
-	$(DFX) deps pull
-	$(DFX) deps init
-	$(DFX) deps deploy
-	$(DFX) deploy eliza_backend
+	$(DFX) deps pull --network ic
+	$(DFX) deps init --network local
+	$(DFX) deps deploy --network local
+	$(DFX) deploy eliza_backend --network local
 	$(MAKE) set-provider PROVIDER=Fallback NETWORK=local
 	$(MAKE) build
-	$(DFX) deploy eliza_frontend
+	$(DFX) deploy eliza_frontend --network local
 	@echo
-	@echo "Frontend: http://$$($(DFX) canister id eliza_frontend).localhost:4943/"
+	@echo "Frontend: http://$$($(DFX) canister id eliza_frontend --network local).localhost:4943/"
 	@echo "The LLM canister exists on mainnet only; this deployment answers with the fallback provider."
 
-# Production build of the frontend for a LOCAL deployment (it contains the local canister ids from .env).
+# Production build of the frontend for a LOCAL deployment (it contains the local canister ids from .env). Fails if
+# development-only code got into it.
 build:
 	cd $(FRONTEND) && npm run build
+	scripts/check-bundle.sh $(FRONTEND)/dist
 
 # Production build for mainnet: the same, with no local canister ids in it, so it does not depend on what was
 # last deployed locally.
 build-ic:
 	cd $(FRONTEND) && CANISTER_ID_ELIZA_BACKEND= CANISTER_ID_INTERNET_IDENTITY= npm run build
+	scripts/check-bundle.sh $(FRONTEND)/dist
+
+# For `make e2e-local` only: a production build in which ?dev-identity works on a local host (src/main.tsx), so the
+# real client can be tested without Internet Identity under the deployed Content-Security-Policy. It is deployed to
+# the local replica only, and replaced by the normal bundle afterwards.
+build-e2e:
+	cd $(FRONTEND) && VITE_ALLOW_DEV_IDENTITY=1 npm run build
 
 # ---------------------------------------------------------------------------------------------- generated files
 
@@ -93,7 +123,7 @@ candid:
 # The frontend's bindings from the Candid file. dfx also writes an index.js that creates an actor from process.env;
 # the app creates its own (src/backend.ts), so that file is not kept.
 declarations:
-	$(DFX) generate eliza_backend
+	$(DFX) generate eliza_backend --network local
 	rm -f $(FRONTEND)/src/declarations/generated/index.js $(FRONTEND)/src/declarations/generated/index.d.ts
 
 check:
@@ -134,26 +164,37 @@ test-canister: $(DEPLOYED_WASM)
 e2e:
 	cd $(FRONTEND) && npm run e2e && npm run a11y
 
-# The real client against a canister on the local replica (fallback provider), and the headers of a frontend
-# deployed there. Starts its own dev server on port 5199 for the duration.
+# The real client against a canister on the local replica (fallback provider), served by the local asset canister
+# under the security headers it sends: sign-in, queries, update calls and the certified read all run under the
+# deployed Content-Security-Policy, and a violation fails the tests. The test bundle (build-e2e) is replaced by the
+# normal one afterwards, whatever the result. (The tests' exit status waits in a file while that happens, so that
+# the bundle is put back in recipe lines of their own: a line that runs $(MAKE) is run even by `make -n`, and the
+# tests must not be.)
+E2E_STATUS := target/e2e-local.status
 e2e-local: start
-	$(DFX) deploy eliza_backend
+	$(DFX) deploy eliza_backend --network local
 	$(MAKE) set-provider PROVIDER=Fallback NETWORK=local
+	$(MAKE) build-e2e
+	$(DFX) deploy eliza_frontend --network local
+	@mkdir -p $(dir $(E2E_STATUS)) && echo 1 > $(E2E_STATUS)
+	url="http://$$($(DFX) canister id eliza_frontend --network local).localhost:4943"; \
+		( cd $(FRONTEND) && node e2e/headers.mjs "$$url/" && BASE="$$url" node e2e/local.mjs ); \
+		echo $$? > $(E2E_STATUS)
+	@echo; echo "Putting the normal bundle back on the local frontend canister"
 	$(MAKE) build
-	$(DFX) deploy eliza_frontend
-	cd $(FRONTEND) && node e2e/headers.mjs "http://$$($(DFX) canister id eliza_frontend).localhost:4943/"
-	cd $(FRONTEND) && { npx vite --port 5199 --strictPort >/dev/null 2>&1 & server=$$!; \
-		trap 'kill $$server 2>/dev/null' EXIT; \
-		for i in $$(seq 1 50); do curl -s -o /dev/null http://localhost:5199/ && break; sleep 0.2; done; \
-		BASE=http://localhost:5199 node e2e/local.mjs; }
+	$(DFX) deploy eliza_frontend --network local
+	@if [ "$$(cat $(E2E_STATUS))" = 0 ]; then echo "e2e-local: all passed"; else echo "e2e-local: FAILED (above)"; exit 1; fi
 
 # ---------------------------------------------------------------------------------------------- mainnet
 
-# First installation only. A canister that holds conversations is upgraded with `make upgrade-ic`.
+# First installation only. A canister that holds conversations is upgraded with `make upgrade-ic`; this refuses to
+# run when the canisters named in canister_ids.json already have code on mainnet.
 install-ic:
-	@echo "This creates and installs the canisters on MAINNET with the identity '$$(dfx identity whoami)' and spends cycles."
+	scripts/require-no-code.sh ic eliza_backend eliza_frontend
+	@echo "This creates and installs the canisters on MAINNET with the identity '$$($(DFX) identity whoami)' and spends cycles."
 	@read -r -p "Type 'install' to continue: " answer && [ "$$answer" = "install" ] || { echo "Aborted."; exit 1; }
 	$(MAKE) build-ic
+	scripts/require-no-code.sh ic eliza_backend eliza_frontend
 	$(DFX) deploy --network ic
 	@echo "Now set the Wasm memory limit:  dfx canister update-settings eliza_backend --wasm-memory-limit 512MiB --network ic"
 
@@ -165,7 +206,12 @@ upgrade-ic:
 
 # Uploads the frontend only (`dfx deploy eliza_frontend` would also redeploy the backend it depends on).
 upgrade-frontend:
+ifeq ($(NETWORK),ic)
+	@echo "This uploads the frontend to MAINNET with the identity '$$($(DFX) identity whoami)'."
+	@read -r -p "Type 'upgrade' to continue: " answer && [ "$$answer" = "upgrade" ] || { echo "Aborted; nothing was changed."; exit 1; }
+endif
 	$(MAKE) $(if $(filter ic,$(NETWORK)),build-ic,build)
+	$(DFX) build eliza_frontend --network $(NETWORK)
 	$(DFX) canister install eliza_frontend --mode upgrade --network $(NETWORK)
 
 upgrade-frontend-ic:
@@ -182,17 +228,20 @@ logs:
 	$(DFX) canister logs eliza_backend --network $(NETWORK)
 
 # Fails unless the canister answers Ok (a non-controller gets Err, which dfx alone would report as success).
+# PROVIDER was checked at the top.
 set-provider:
-	@[ "$(PROVIDER)" = "OnChain" ] || [ "$(PROVIDER)" = "Fallback" ] || { echo "usage: make set-provider PROVIDER=OnChain|Fallback [NETWORK=ic]"; exit 1; }
+	$(if $(PROVIDER),,$(error usage: make set-provider PROVIDER=OnChain|Fallback [NETWORK=ic]))
 	@result="$$($(DFX) canister call eliza_backend set_llm_provider '(variant { $(PROVIDER) })' --network $(NETWORK))"; \
 		echo "$$result"; echo "$$result" | grep -q 'Ok' || { echo "The provider was NOT changed."; exit 1; }
 	@$(DFX) canister call eliza_backend get_config --query --network $(NETWORK)
 
 # FILE holds one Candid record, e.g.
 #   (record { name = "Coo"; system_prompt = "You are Coo."; bio = vec { "..." }; style = vec { "Friendly" } })
+# The file name reaches the shell as data (an environment variable), never as part of the command line.
+set-character: export COO_CHARACTER_FILE = $(value FILE)
 set-character:
-	@[ -f "$(FILE)" ] || { echo "usage: make set-character FILE=<file with a Candid Character record> [NETWORK=ic]"; exit 1; }
-	@result="$$($(DFX) canister call eliza_backend update_character --argument-file "$(FILE)" --network $(NETWORK))"; \
+	@[ -n "$$COO_CHARACTER_FILE" ] && [ -f "$$COO_CHARACTER_FILE" ] || { echo "usage: make set-character FILE=<file with a Candid Character record> [NETWORK=ic]"; exit 1; }
+	@result="$$($(DFX) canister call eliza_backend update_character --argument-file "$$COO_CHARACTER_FILE" --network $(NETWORK))"; \
 		echo "$$result"; echo "$$result" | grep -q 'Ok' || { echo "The character was NOT changed."; exit 1; }
 
 clean:

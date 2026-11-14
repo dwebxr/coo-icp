@@ -9,11 +9,13 @@
       // The app loads its own script, stylesheet and images, and talks to the Internet Computer's API — nothing
       // else. No inline script or style, no eval, no frames, no forms; it may not be framed (clickjacking).
       // Sign-in opens Internet Identity in its own window, which this policy does not govern.
-      // http://localhost:* and http://127.0.0.1:* are for a local replica (the same file is deployed there).
-      "Content-Security-Policy": "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self' https://icp-api.io http://localhost:* http://127.0.0.1:*; manifest-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; object-src 'none'",
-      // Everything off except writing to the clipboard, which the Copy buttons need. (The standard policy turns
-      // that off too, which would break them without any visible error.)
-      "Permissions-Policy": "accelerometer=(), ambient-light-sensor=(), autoplay=(), battery=(), camera=(), cross-origin-isolated=(), display-capture=(), document-domain=(), encrypted-media=(), execution-while-not-rendered=(), execution-while-out-of-viewport=(), fullscreen=(), geolocation=(), gyroscope=(), keyboard-map=(), magnetometer=(), microphone=(), midi=(), navigation-override=(), payment=(), picture-in-picture=(), publickey-credentials-get=(), screen-wake-lock=(), sync-xhr=(), usb=(), web-share=(), xr-spatial-tracking=(), clipboard-read=(), clipboard-write=(self), gamepad=(), speaker-selection=(), conversion-measurement=(), focus-without-user-activation=(), hid=(), idle-detection=(), interest-cohort=(), serial=(), sync-script=(), trust-token-redemption=(), window-placement=(), vertical-scroll=()",
+      // On a local replica (the same file is deployed there) the app calls the API on its own origin ('self'):
+      // the replica's gateway serves /api on the frontend canister's host (src/network.ts).
+      "Content-Security-Policy": "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self' https://icp-api.io; manifest-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; object-src 'none'",
+      // The features listed are turned off, except writing to the clipboard, which the Copy buttons need (the
+      // standard policy turns that off too, which would break them without any visible error). A feature that is
+      // not listed keeps the browser's default.
+      "Permissions-Policy": "accelerometer=(), ambient-light-sensor=(), autoplay=(), battery=(), camera=(), cross-origin-isolated=(), display-capture=(), document-domain=(), encrypted-media=(), execution-while-not-rendered=(), execution-while-out-of-viewport=(), fullscreen=(), geolocation=(), gyroscope=(), keyboard-map=(), magnetometer=(), microphone=(), midi=(), navigation-override=(), payment=(), picture-in-picture=(), publickey-credentials-create=(), publickey-credentials-get=(), screen-wake-lock=(), sync-xhr=(), usb=(), web-share=(), xr-spatial-tracking=(), clipboard-read=(), clipboard-write=(self), gamepad=(), speaker-selection=(), conversion-measurement=(), focus-without-user-activation=(), hid=(), idle-detection=(), interest-cohort=(), serial=(), sync-script=(), trust-token-redemption=(), window-management=(), window-placement=(), vertical-scroll=()",
       "Referrer-Policy": "no-referrer"
     },
     // The uncertified *.raw.icp0.io domain redirects to the certified one.

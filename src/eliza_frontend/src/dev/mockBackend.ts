@@ -5,8 +5,13 @@
 //
 // Scenarios: signedout | empty | chat | long | rich | slow | error | busy | offline | lostreply | inprogress | hang |
 //            latesave | conflict | stale | laggy (one history read from before the last clear) | clearerror |
-//            clearhang (the clear call never returns) | historyerror | expiring | badsession
-// Extra params: signin=cancel|error|hang|late (succeeds after 4 s)  delay=<ms>
+//            clearhang (the clear call never returns) | historyerror | expiring | badsession |
+//            racyclear (this device has seen revision 5, replicas still say 4, and while the certified read — which
+//            reads 5 — is on its way, another tab clears the conversation: revision 6)
+// Extra params: signin=cancel|error|hang|late (succeeds after 4 s)|lateerror (fails after 4 s); a comma-separated
+//                 list gives each sign-in attempt its own mode (the last one repeats): signin=late,hang
+//               delay=<ms>  restore=<ms> (how long restoring the session takes; 250 by default)
+//               clear=<ms> (the clear call answers, and clears, only after this long)
 //               relogin=<principal> (who signs in after the first session has ended: someone else at the same tab)
 import {
   SessionInvalid,
@@ -18,10 +23,12 @@ import {
   type Sent,
   type Session,
 } from '../backend';
+// What the canister accepts (UTF-8 bytes); a unit test checks it against the canister's own constant.
+import { MAX_MESSAGE_BYTES } from '../lib/limits';
+import { floorOwner } from '../lib/floors';
+import { network } from '../network';
 
 const PRINCIPAL = 'h7xqe-2mlpn-aaaab-qbm3a-cai4f-ufp5q-tdqbv-wv6jf-3pgv3-zkm4p-aqe';
-// What the canister accepts (UTF-8 bytes).
-const MAX_MESSAGE_BYTES = 4000;
 
 const SAMPLE: Message[] = [
   { role: 'user', content: 'What is the Internet Computer?' },
@@ -39,8 +46,8 @@ const SAMPLE: Message[] = [
   {
     role: 'assistant',
     content:
-      'I run inside a canister. Each message I get is sent to the on-chain LLM canister:\n\n' +
-      '```rust\nlet reply = ic_llm::chat(Model::Llama3_1_8B)\n    .with_messages(messages)\n    .send()\n    .await;\n```\n\n' +
+      'I run inside a canister. Each message I get is sent to the LLM canister in a bounded-wait call:\n\n' +
+      '```rust\nlet response = Call::bounded_wait(llm, "v1_chat")\n    .change_timeout(MODEL_CALL_TIMEOUT_SECS)\n    .with_arg(&request)\n    .await;\n```\n\n' +
       'Your conversation is stored per Internet Identity principal, so only you see it. ' +
       'Learn more at https://internetcomputer.org.',
   },
@@ -64,6 +71,7 @@ const RICH: Message[] = [
       '- **Web**: canisters serve HTTP directly\n' +
       '- **Cost**: the `reverse gas` model\n\n' +
       '> Canisters are WebAssembly modules bundled with their memory.\n\n' +
+      'More in [the canister overview](https://internetcomputer.org/docs/building-apps/essentials/canisters-overview).\n\n' +
       '---\n\n' +
       'Docs: https://internetcomputer.org/docs/building-apps/essentials/canisters-overview-and-a-very-long-path-segment',
   },
@@ -79,8 +87,11 @@ const MAX_TURNS = 50;
 
 export function createMockBackend(scenario: string): Backend {
   const params = new URLSearchParams(window.location.search);
-  const signInMode = params.get('signin');
+  const signInModes = (params.get('signin') ?? '').split(',');
+  let signIns = 0;
   const delay = Number(params.get('delay') ?? (scenario === 'slow' ? 15000 : 1400));
+  const restoreMs = Number(params.get('restore') ?? 250);
+  const clearMs = params.get('clear') === null ? null : Number(params.get('clear'));
 
   let signedIn = scenario !== 'signedout' && scenario !== '';
   let expiresAt = Date.now() + (scenario === 'expiring' ? 4000 : 8 * 3600 * 1000);
@@ -93,11 +104,26 @@ export function createMockBackend(scenario: string): Backend {
           ? [...RICH]
           : [...SAMPLE];
   let revision = 0;
+  // racyclear: the floor this device stored, and whether the other tab has cleared yet.
+  const floorKey = `coo:floor:${floorOwner(network.backendCanisterId ?? 'local', PRINCIPAL)}`;
+  let otherTabCleared = false;
+  if (scenario === 'racyclear') {
+    revision = 5;
+    localStorage.setItem(floorKey, '0:5');
+  }
   // laggy: what a replica that is behind would still return after a clear.
   let beforeClear: { messages: Message[]; revision: number } | null = null;
   let inFlight: { id: string; cleared: boolean } | null = null;
-  // Tests read how many requests were sent and how many were answered.
-  const stats = { sends: 0, answered: 0, ids: [] as string[] };
+  // Tests read how many requests were sent and how many were answered, and whether a delegation is held (what a
+  // reload would restore).
+  const stats = {
+    sends: 0,
+    answered: 0,
+    ids: [] as string[],
+    get session() {
+      return signedIn;
+    },
+  };
   (window as unknown as { __mock: typeof stats }).__mock = stats;
 
   let principal = PRINCIPAL;
@@ -149,15 +175,16 @@ export function createMockBackend(scenario: string): Backend {
 
   return {
     async restore() {
-      await sleep(250);
+      await sleep(restoreMs);
       return signedIn ? session() : null;
     },
 
     async signIn() {
-      await sleep(signInMode === 'late' ? 4000 : 1200);
-      if (signInMode === 'hang') return new Promise<Session>(() => {});
-      if (signInMode === 'cancel') throw new SignInCancelled();
-      if (signInMode === 'error') throw new Error('mock sign-in failure');
+      const mode = signInModes[Math.min(signIns++, signInModes.length - 1)];
+      await sleep(mode === 'late' || mode === 'lateerror' ? 4000 : 1200);
+      if (mode === 'hang') return new Promise<Session>(() => {});
+      if (mode === 'cancel') throw new SignInCancelled();
+      if (mode === 'error' || mode === 'lateerror') throw new Error('mock sign-in failure');
       signedIn = true;
       expiresAt = Date.now() + 8 * 3600 * 1000;
       principal = params.get('relogin') ?? principal;
@@ -179,11 +206,24 @@ export function createMockBackend(scenario: string): Backend {
         beforeClear = null;
         return stale;
       }
+      // Replicas that have not caught up with revision 5 yet.
+      if (scenario === 'racyclear' && !otherTabCleared) return { messages: messages.map((m) => ({ ...m })), revision: 4 };
       return { messages: messages.map((m) => ({ ...m })), revision };
     },
 
     async certifiedHistory() {
       // Through consensus: slower, and never the stale copy a lagging replica returns.
+      if (scenario === 'racyclear' && !otherTabCleared) {
+        // Read now, answered late: meanwhile another tab clears, and stores the floor it was confirmed.
+        const read = { messages: messages.map((m) => ({ ...m })), revision };
+        await sleep(300);
+        messages = [];
+        revision += 1;
+        otherTabCleared = true;
+        localStorage.setItem(floorKey, `0:${revision}`);
+        await sleep(300);
+        return read;
+      }
       await sleep(600);
       guard();
       return { messages: messages.map((m) => ({ ...m })), revision };
@@ -248,7 +288,7 @@ export function createMockBackend(scenario: string): Backend {
 
     async clear() {
       guard();
-      await sleep(300);
+      await sleep(clearMs ?? 300);
       if (scenario === 'clearerror') throw new Error('mock clear failure');
       if (scenario === 'clearhang') return new Promise<number>(() => {});
       if (scenario === 'laggy') beforeClear = { messages: messages.map((m) => ({ ...m })), revision };

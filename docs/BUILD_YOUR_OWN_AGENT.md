@@ -69,18 +69,35 @@ rule lists well.
 
 `npm run dev` with `?mock=chat` (or `empty`, `signedout`, …) shows the UI states without a canister.
 The Content-Security-Policy in `public/.ic-assets.json5` allows only the app's own files and the Internet
-Computer's API; if you add fonts, images or requests from elsewhere, add their origins there, and run
-`make e2e-local` to see that the policy still lets the app work.
+Computer's API; if you add fonts, images or requests from elsewhere, add their origins there. `make e2e-local` then
+shows whether the policy still lets the app work locally: it deploys the app to a local asset canister, which sends
+that policy, and runs the real client there — sign-in with a locally made identity, queries, update calls, the
+certified read — failing on any violation. What only happens on mainnet is not run: calls to
+`https://icp-api.io` (`e2e/headers.mjs` checks only that the policy allows them) and the Internet Identity window
+(which the policy does not govern).
 
 ## 4. Deploy
 
+`canister_ids.json` holds the ids of **this project's** canisters on mainnet, and `MAINNET_BACKEND` in
+`src/network.ts` is this project's backend. A fork must not install into them (`make install-ic` refuses anyway:
+they have code) nor build a frontend that talks to them. So, before your first installation:
+
 ```bash
-make install-ic          # first installation; asks before it does anything
+rm canister_ids.json                             # this project's ids; dfx writes yours
+dfx canister create eliza_backend --network ic   # empty canisters of your own (spends cycles)
+dfx canister create eliza_frontend --network ic
+dfx canister id eliza_backend --network ic       # put this id into MAINNET_BACKEND in src/network.ts
 ```
 
-Put the backend id that dfx prints (also in `canister_ids.json`) into `src/network.ts`, then
-`make upgrade-frontend-ic`. From then on use `make upgrade-ic` for the backend: it stops the canister, takes a
-snapshot and verifies the state after the upgrade (README, "Upgrading a canister that holds conversations").
+Then:
+
+```bash
+make install-ic          # first installation; refuses canisters that have code, and asks before it does anything
+```
+
+From then on use `make upgrade-ic` for the backend: it stops the canister, takes a snapshot, upgrades and checks
+the upgrade before it starts the canister again (README, "Upgrading a canister that holds conversations"), and
+`make upgrade-frontend-ic` for the frontend.
 
 ## 5. Change the canister
 
@@ -107,7 +124,8 @@ Rules that keep it safe:
 - **"Only a controller of the canister can do this"** — `update_character` and `set_llm_provider` are for the
   canister's controllers: `dfx canister info eliza_backend --network ic` lists them.
 - **"not accepted: sign in, call queries as queries…"** — an update call was refused at ingress: anonymous caller,
-  a query method sent as an update, or an argument that is too large.
+  a query method sent as an update (only `get_conversation` and `get_message_status` may be, by a signed-in
+  caller), or an argument that is too large.
 - **Replies are "[Local fallback: …]"** — the provider is `Fallback`. On mainnet: `make set-provider PROVIDER=OnChain NETWORK=ic`.
 - **"The model did not answer."** — the LLM canister rejected the call or did not answer within five minutes;
   `make logs NETWORK=ic` shows the reason. Nothing was saved; the same message can be sent again.

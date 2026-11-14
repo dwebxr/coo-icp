@@ -25,6 +25,14 @@ function renderInline(nodes: Inline[], keyPrefix = ''): ReactNode[] {
             {renderInline(node.children, `${key}.`)}
           </a>
         );
+      case 'linkHost':
+        // Where the link goes, inside it. Isolated left-to-right, so bidirectional controls in the link's text
+        // cannot reorder it.
+        return (
+          <span key={key} className="md-link-host" dir="ltr">
+            {` (${node.text})`}
+          </span>
+        );
     }
   });
 }

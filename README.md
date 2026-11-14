@@ -45,7 +45,7 @@ Every limit is enforced by the canister (`src/eliza_backend/src/limits.rs`).
 | Saved reply | 16 000 bytes | cut |
 | Conversation | 50 turns (25 exchanges) | oldest turns are dropped |
 | Model request | 10 messages, 9 000 bytes; system message always first | older turns are left out or shortened |
-| Stored conversations | 32 MiB counted, 100 000 entries | least recently used conversations are removed |
+| Stored conversations | 32 MiB counted, 100 000 entries | the conversations changed least recently are removed (reading one does not count) |
 | Chats in progress, all callers | 20 | `Busy` |
 | Model calls per minute, all callers | 60 | `Busy` |
 | One model call | 300 s | `Failed`; nothing is saved |
@@ -60,11 +60,21 @@ Every limit is enforced by the canister (`src/eliza_backend/src/limits.rs`).
   an allow-list or payment would be needed to stop the rest; none is implemented.
 - **The limits bound model calls and storage, not cycles.** The canister pays for every update call it accepts.
   `canister_inspect_message` refuses anonymous callers, oversized arguments, non-controller administration and
-  queries sent as updates before they are paid for; a signed-in caller's well-formed calls are paid for even when
-  they end in `Busy`.
+  queries sent as updates before they are paid for — except `get_conversation` and `get_message_status` from a
+  signed-in caller, which may be sent as updates to get an answer certified by the subnet (the frontend reads its
+  conversation that way when a query's answer is older than what it has seen). A signed-in caller's well-formed
+  calls are paid for even when they end in `Busy`.
 - **History is best effort.** When storage is full, cleared conversations go first, then the conversation that has
-  not been used for the longest time. Its owner then finds it empty.
-- **`Clear` empties the conversation in the canister.** It does not reach snapshots or backups the operator took.
+  not changed for the longest time (reading it does not count). Its owner then finds it empty.
+- **`Clear` empties the conversation in the canister's working state, nothing else.** The copy of the state that
+  `pre_upgrade` wrote to stable memory at the last upgrade stays there until the next upgrade writes over it (and
+  where the next saved state is shorter, the end of the old copy remains after it); snapshots keep theirs. A
+  controller can read all of these.
+- **What the browser keeps after sign-out.** In localStorage: the revision floors, keyed by canister and principal
+  (`coo:floor:<canister>:<principal>`, and `coo:revision:<principal>` from versions before 0.7.0). They show which
+  principals used this browser; they are kept on purpose, so that a conversation older than one this browser has
+  seen is never shown, and are not removed by signing out. Also a random marker that changes on every sign-out
+  (`coo:signed-out`). Internet Identity's client keeps a fresh, unused session key in IndexedDB.
 - **The JavaScript SDK is deprecated.** The frontend uses `@dfinity/agent` and `@dfinity/auth-client` 2.4.1 (pinned);
   their successor is `@icp-sdk`. The send/re-send logic depends on the exact behaviour of 2.4.1, so the migration is
   a project of its own and has not been done.
@@ -77,7 +87,8 @@ Every limit is enforced by the canister (`src/eliza_backend/src/limits.rs`).
 ## Run it locally
 
 Needs [dfx](https://internetcomputer.org/docs/building-apps/getting-started/install) 0.30.2, Rust (the toolchain in
-`rust-toolchain.toml` is installed by rustup on first use) and Node 22 or newer (`.nvmrc` says 24).
+`rust-toolchain.toml` is installed by rustup on first use) and Node 22.12 or a later 22, 24, or 26 and newer — what
+the test runner (vitest) supports; 23 and 25 are not (`.nvmrc` says 24).
 
 ```bash
 make setup           # wasm target, npm ci
@@ -90,8 +101,10 @@ of your message and says so.
 Just the UI, without a replica: `cd src/eliza_frontend && npm run dev`, then open
 `http://localhost:5173/?mock=chat` (other states: `signedout`, `empty`, `rich`, `slow`, `error`, `busy`, `offline`,
 `lostreply`, `inprogress`, `historyerror`, `expiring`, …; see `src/dev/mockBackend.ts`). The real client against a
-local canister, without Internet Identity: `http://localhost:5173/?dev-identity`. Both exist in development builds
-only.
+local canister, without Internet Identity: `http://localhost:5173/?dev-identity`. The mock exists in the dev server
+only. `?dev-identity` works on a local host only, in the dev server and in the bundle that `make e2e-local` builds for
+its own test (and deploys to the local replica only); `make build`, `make build-ic` and CI fail if a bundle contains
+either.
 
 ### Tests
 
@@ -100,7 +113,7 @@ only.
 | `make test` | canister unit tests, frontend type check and unit tests |
 | `make test-canister` | the above for the canister plus PocketIC integration tests, including the upgrade from the version deployed on mainnet (built from its commit) and an upgrade at the full storage budget |
 | `make e2e` | browser tests against the mock (Chromium and WebKit) and the accessibility check; needs `npm run dev` running |
-| `make e2e-local` | browser tests of the real client against a canister on a local replica, and the security headers of a locally deployed frontend |
+| `make e2e-local` | the real client, served by the local asset canister under the security headers it sends in production: sign-in (with a locally made identity), queries, update calls and the certified read, failing on any Content-Security-Policy violation or console error; and the headers themselves |
 | `make check` | formatting, clippy, and that the Candid file and the generated bindings match the code |
 
 First time: `cd src/eliza_frontend && npx playwright install chromium webkit`.
@@ -110,9 +123,14 @@ First time: `cd src/eliza_frontend && npx playwright install chromium webkit`.
 ### First installation
 
 ```bash
-make install-ic      # builds, asks for confirmation, runs `dfx deploy --network ic`
+make install-ic      # refuses if the canisters already have code; asks; builds; runs `dfx deploy --network ic`
 dfx canister update-settings eliza_backend --wasm-memory-limit 512MiB --network ic
 ```
+
+`make install-ic` first asks mainnet (read only) whether the canisters in `canister_ids.json` already have code, and
+stops if they do: a first installation would replace them without a snapshot. A canister that runs is upgraded with
+`make upgrade-ic`. The ids in this repository's `canister_ids.json` are this project's own; a fork removes them before
+its first installation (`docs/BUILD_YOUR_OWN_AGENT.md`).
 
 A fresh canister uses the on-chain model and the default character. The Wasm memory limit keeps a runaway heap
 from reaching the point where the canister can no longer be upgraded. It applies to update calls and to
@@ -130,17 +148,30 @@ make upgrade-ic      # scripts/upgrade.sh ic — the steps below, stopping at th
 
 What the script does, and what to check:
 
-1. Builds the backend and shows `health` and `get_metrics` of the running canister.
+1. Builds the backend and shows `health` of the running canister and the hash of its module. If the canister
+   already runs this build, it stops here: there is nothing to upgrade (and dfx would skip the install). (`get_metrics`
+   comes after the upgrade: 0.6.0 has none with these fields.)
 2. **Stops** the canister. A version before 0.7.0 can take minutes to stop while a model call is outstanding.
-3. Takes a **snapshot** (a canister holds a limited number; delete an old one first if it is refused).
-4. Installs the new code in upgrade mode. dfx warns that the Candid interface changed incompatibly when methods
-   were removed; that is expected for 0.6.0 → 0.7.0.
-5. Compares two log lines: `pre_upgrade: N bytes serialized to stable memory; …` and
-   `State restored from stable memory successfully (N bytes; …)`. The same `N` proves the state written just before
-   the upgrade is the one restored. If they differ or one is missing, the script leaves the canister stopped and
-   prints the command that loads the snapshot. Both lines end with the Wasm memory and the instructions the hook
-   used — the only place where the memory needed by `pre_upgrade` can be seen.
-6. Starts the canister and shows `health` and `get_metrics` again.
+3. Takes a **snapshot** (a canister holds a limited number — 10 on a local replica; delete an old one first if it is
+   refused). It reads the snapshot's id from dfx's output and goes no further without it.
+4. Notes the newest line of the canister log, then installs the new code in upgrade mode. dfx warns that the Candid
+   interface changed incompatibly when methods were removed; that is expected for 0.6.0 → 0.7.0.
+5. Checks the result, with the canister still stopped:
+   - the module now installed is the Wasm it built (both hashes are printed);
+   - the log has, after the line noted in step 4, exactly one `pre_upgrade: N bytes serialized to stable memory…`
+     and one `State restored from stable memory successfully (N bytes; …)`, with the same `N`. So the hooks of this
+     upgrade ran, `post_upgrade` decoded what `pre_upgrade` wrote without trapping (it traps, and the upgrade is
+     undone, when it cannot), and what it read back has the length that was written. Equal lengths are a length
+     check, not proof that the contents are identical.
+
+   From 0.7.0 on, both lines end with the Wasm memory and the instructions the hook used — the only place where the
+   memory needed by `pre_upgrade` can be seen. In the first upgrade from 0.6.0 only `post_upgrade`'s line has them
+   (0.6.0's `pre_upgrade` logs the byte count only).
+6. Starts the canister and shows `health` and `get_metrics`.
+
+If any step fails, the script says which one, whether the canister is stopped or running as far as it knows, and
+the command that loads the snapshot. A failure up to step 5 leaves the canister stopped; a failure of the checks
+after the start in step 6 leaves it running.
 
 Before the **first upgrade from 0.6.0**, look at the size of what it holds: `health` (conversations) and
 `dfx canister status eliza_backend --network ic` (memory). 0.7.0 reads the whole saved state before cutting it to
@@ -153,7 +184,7 @@ Then, by hand:
 
 - **Send one real message** through the frontend. The model call is a bounded-wait call since 0.7.0; this first
   message is the test that the LLM canister answers it. If it does not, roll back.
-- `make upgrade-frontend-ic` deploys the frontend, and
+- `make upgrade-frontend-ic` deploys the frontend (it asks first), and
   `cd src/eliza_frontend && node e2e/headers.mjs https://4res3-liaaa-aaaas-qdqcq-cai.icp0.io/` checks its headers.
 - `dfx canister update-settings eliza_backend --wasm-memory-limit 512MiB --network ic` if not set yet (see above).
 
@@ -161,20 +192,21 @@ Deploy the backend first. A browser tab still running the 0.6.0 frontend keeps w
 methods it calls kept their types; a test checks this).
 
 **Rolling back.** 0.6.0 cannot read the state 0.7.0 writes, so the only way back is the snapshot:
-`dfx canister stop eliza_backend --network ic && dfx canister snapshot load eliza_backend <id> --network ic`, then
-install the old Wasm and start. Everything saved after the snapshot is lost, and revisions go back; browsers that
-saw a newer revision detect that and reload the conversation from the canister.
+`dfx canister stop eliza_backend --network ic && dfx canister snapshot load eliza_backend <id> --network ic && dfx canister start eliza_backend --network ic`.
+Loading a snapshot restores the code as well as the state; nothing has to be installed afterwards. Everything saved
+after the snapshot is lost, and revisions go back; browsers that saw a newer revision detect that and reload the
+conversation from the canister.
 
-**If a hook traps.** A trap in `pre_upgrade` or `post_upgrade` aborts the upgrade and the old version keeps running
-with its data. Fix the cause and upgrade again. Never use `--skip-pre-upgrade`: it restores the state of the
+**If a hook traps.** A trap in `pre_upgrade` or `post_upgrade` aborts the upgrade: the old version stays installed
+with its data (stopped, under the script — start it again). Fix the cause and upgrade again. Never use `--skip-pre-upgrade`: it restores the state of the
 previous upgrade, or none.
 
 **What the 0.6.0 → 0.7.0 upgrade changes in the state.** The system message and the character copy stored in every
 conversation are dropped. A stored OpenAI API key is dropped. The default character is replaced by the new default
 if it was never customised. Conversations larger than the new limits are cut from the oldest turn; if the total is
-over the storage budget, the least recently used conversations are removed. When anything was cut, `post_upgrade`
-logs `Brought the state of schema version 2 within this version's limits: N turns and M entries dropped`; on a
-canister whose conversations are ordinary chat messages this line does not appear.
+over the storage budget, the conversations changed least recently are removed. On this upgrade `post_upgrade` logs
+`Brought the state of schema version 2 within this version's limits: N turns and M entries dropped` — with 0 and 0
+on a canister whose conversations are ordinary chat messages.
 
 ### Operating it
 
@@ -206,9 +238,9 @@ get_message_status : (request_id : text) -> (variant { Unknown; Pending; Done : 
 clear_conversation : () -> (nat64);   // the new revision
 ```
 
-The client picks a request id (1–64 printable ASCII bytes, e.g. a UUID) and names the revision of the conversation
-it continues, as it got it from `get_conversation`. Every saved exchange and every clear moves the revision on, and
-a caller's revision never goes back — also when its conversation is removed to make room.
+The client picks a request id (1–64 printable ASCII characters, no spaces — e.g. a UUID) and names the revision of
+the conversation it continues, as it got it from `get_conversation`. Every saved exchange and every clear moves the
+revision on, and a caller's revision never goes back — also when its conversation is removed to make room.
 
 - Repeating a request id returns the saved reply; the model is not asked again. So after a lost response the same
   request can simply be sent again.
@@ -249,6 +281,8 @@ new character applies to existing conversations from their next message. Both se
 ```
 ├── dfx.json, canister_ids.json, Cargo.toml, rust-toolchain.toml, Makefile
 ├── scripts/upgrade.sh                 # the upgrade runbook
+├── scripts/require-no-code.sh         # install-ic: refuses canisters that already have code
+├── scripts/check-bundle.sh            # no development-only code in a production bundle
 ├── src/
 │   ├── eliza_backend/                 # the canister
 │   │   ├── eliza_backend.did          # Candid interface (generated: make candid)
@@ -283,11 +317,18 @@ new character applies to existing conversations from their next message. Both se
 - **Callers.** Chat methods require a non-anonymous caller; each caller sees only its own conversation.
   `update_character` and `set_llm_provider` require a controller of the canister.
 - **Model output is untrusted.** The frontend renders replies with its own Markdown subset as React elements —
-  no HTML is interpreted, images are not loaded, links are `http(s)` only and cannot show one site while pointing
-  to another. The asset canister sends a Content-Security-Policy without inline script or style
-  (`public/.ic-assets.json5`).
-- **Sessions.** The Internet Identity delegation is checked before every call; ten minutes without activity in any
-  tab signs every tab out, as does signing out in one of them.
+  no HTML is interpreted, images are not loaded (an image becomes a link), and links are `http(s)` only, never with a
+  user name or password in them. Every link shows where it really goes: its text is followed, inside the link, by
+  the destination's host as the browser will use it (with the port when it is not the default, an international
+  domain name in its `xn--` form, and `http://` in front when the link is not https) — unless the text already names
+  exactly that, as a name of its own and without invisible characters. So a link cannot show one site while pointing
+  to another without the other one being shown too. The asset canister sends a Content-Security-Policy without
+  inline script or style (`public/.ic-assets.json5`).
+- **Sessions.** The Internet Identity delegation is checked before every call. Ten minutes without activity in any
+  tab signs every tab out, as does signing out in one of them — also a tab that is still restoring the session when
+  that happens, and a session found idle when a tab opens. A tab in the middle of signing in is left to finish: that
+  is a new, explicit sign-in. All of this goes through the browser's localStorage; where it cannot be used, each tab
+  still ends its own session when it is idle or its delegation expires.
 - **Stored data.** Conversations are stored in the canister unencrypted; node providers of the subnet and the
   canister's controllers can read them.
 

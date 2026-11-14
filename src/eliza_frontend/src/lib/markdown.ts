@@ -7,6 +7,8 @@ export type Inline =
   | { type: 'em'; children: Inline[] }
   | { type: 'code'; text: string }
   | { type: 'link'; href: string; children: Inline[] }
+  /** The last child of a link whose text does not name where it goes: that destination (see `linkTo`). */
+  | { type: 'linkHost'; text: string }
   | { type: 'br' };
 
 export interface ListItem {
@@ -51,29 +53,51 @@ export function safeHref(url: string): string | null {
   }
 }
 
-// A host name (at least one dot, alphabetic TLD) with optional scheme, port and path. Labels are at most 300
-// characters and segments are separated by a mandatory dot that the segment class excludes, so it is linear.
-const URL_LABEL = /^(?:https?:\/\/)?[\p{L}\p{N}-]+(?:\.[\p{L}\p{N}-]+)*\.\p{L}{2,}(?::\d{1,5})?(?:[/?#]\S*)?$/iu;
-
-/** True when a link label reads as a URL or host name (so it must not be trusted to name the target). */
-export function looksLikeUrl(label: string): boolean {
-  return URL_LABEL.test(label.trim());
+/**
+ * Where a link really goes, as it is shown next to its text: the host as the browser will use it (a port other than
+ * the default included, an international domain name in its punycode form), with `http://` in front when the link is
+ * not https.
+ */
+export function destinationOf(href: string): string {
+  const url = new URL(href);
+  return url.protocol === 'https:' ? url.host : `http://${url.host}`;
 }
 
-const hostOf = (url: string): string | null => {
-  try {
-    return new URL(/^https?:\/\//i.test(url) ? url : `https://${url}`).hostname.replace(/^www\./, '');
-  } catch {
-    return null;
-  }
+// Around a destination named in a link's text, these would make it part of a longer name: "evil.com" inside
+// "evil.com.good.example", "good.example" inside "good.example:444" or "me@good.example".
+const NAME_BEFORE = /[\p{L}\p{N}.@-]/u;
+const NAME_AFTER = /[\p{L}\p{N}.:-]/u;
+// Invisible characters (zero-width spaces and joiners, bidirectional controls, …) can make text read as something
+// other than what it contains, so a label with any of them never counts as naming the destination.
+const INVISIBLE = /[\p{Cf}\p{Zl}\p{Zp}]/u;
+
+const codePointBefore = (text: string, at: number) => Array.from(text.slice(Math.max(at - 2, 0), at)).pop();
+const codePointAt = (text: string, at: number) => {
+  const cp = text.codePointAt(at);
+  return cp === undefined ? undefined : String.fromCodePoint(cp);
 };
 
-/** Children to show for a link: a URL-like label that names another host is replaced by the real target. */
-function linkChildren(label: Inline[], href: string): Inline[] {
-  const plain = inlineText(label).trim();
-  if (!looksLikeUrl(plain)) return label;
-  const shown = hostOf(plain);
-  return shown !== null && shown === hostOf(href) ? label : [{ type: 'text', text: href }];
+/** True when the text of a link names `shown` (see destinationOf) exactly, as a complete name of its own. */
+export function namesDestination(label: string, shown: string): boolean {
+  if (INVISIBLE.test(label)) return false;
+  const text = label.toLowerCase();
+  for (let at = text.indexOf(shown); at !== -1; at = text.indexOf(shown, at + 1)) {
+    const before = codePointBefore(text, at);
+    const after = codePointAt(text, at + shown.length);
+    if (!(before && NAME_BEFORE.test(before)) && !(after && NAME_AFTER.test(after))) return true;
+  }
+  return false;
+}
+
+/**
+ * A link to `href` (already checked by safeHref) showing `label`. Unless the label already names the destination,
+ * the destination follows it, inside the link: a link cannot show one site while pointing to another without the
+ * other one being shown too. No attempt is made to tell whether a label "looks like" an address.
+ */
+function linkTo(href: string, label: Inline[]): Inline {
+  const shown = destinationOf(href);
+  const named = namesDestination(inlineText(label), shown);
+  return { type: 'link', href, children: named ? label : [...label, { type: 'linkHost', text: shown }] };
 }
 
 // Drops trailing sentence punctuation from an autolink with a scan; an unanchored /[.,;:!?]+$/ is quadratic on long runs.
@@ -85,7 +109,8 @@ function trimUrlEnd(url: string): string {
 
 const isWordChar = (ch: string | undefined) => !!ch && /[\p{L}\p{N}_]/u.test(ch);
 
-// Span patterns are length-bounded so a reply full of unmatched markers cannot cause quadratic scans.
+// Span patterns are length-bounded (and a code span's closer is looked for in a window of its own), so the work for
+// each marker is bounded and a reply full of unmatched markers cannot cause quadratic scans.
 const MAX_CODE_SPAN = 1000;
 const IMAGE = /^!\[([^\]\n]{0,300})\]\(([^)\s]{1,2000})\)/;
 const LINK = /^\[([^\]\n]{1,300})\]\(([^)\s]{1,2000})\)/;
@@ -135,24 +160,28 @@ export function parseInline(src: string, depth = 0, inLabel = false): Inline[] {
       continue;
     }
     if (ch === '`') {
-      // Measure the opening run once and look for a closing run of the same length within a bounded window.
-      // An unmatched run is emitted as text in one step, so long runs of backticks stay linear.
+      // Measure the opening run once and look for a closing run of the same length in the window that follows it
+      // (MAX_CODE_SPAN characters, plus room for the closing run) — only there: the scan stops at the window's end,
+      // so each opening run costs at most its own length plus the window. An unmatched run is emitted as text in
+      // one step.
       let run = 1;
       while (src[i + run] === '`') run += 1;
       const fence = '`'.repeat(run);
       const limit = Math.min(src.length, i + run + MAX_CODE_SPAN + run);
       let close = -1;
-      let from = i + run;
-      while (from < limit) {
-        const at = src.indexOf(fence, from);
-        if (at === -1 || at + run > limit) break;
-        let end = at + run;
-        if (src[end] !== '`') {
-          close = at;
+      for (let k = i + run; k < limit; ) {
+        if (src[k] !== '`') {
+          k += 1;
+          continue;
+        }
+        let end = k + 1;
+        while (end < limit && src[end] === '`') end += 1;
+        // A run that reaches the window's end and goes on past it is longer than it looks here: not a match.
+        if (end - k === run && src[end] !== '`') {
+          close = k;
           break;
         }
-        while (src[end] === '`') end += 1;
-        from = end;
+        k = end;
       }
       if (close > i + run) {
         const body = src.slice(i + run, close);
@@ -168,14 +197,14 @@ export function parseInline(src: string, depth = 0, inLabel = false): Inline[] {
     if (ch === '!' && (m = IMAGE.exec(rest))) {
       const href = safeHref(m[2]);
       const label = m[1] || 'image';
-      if (href && !inLabel) push({ type: 'link', href, children: [{ type: 'text', text: label }] }, m[0].length);
+      if (href && !inLabel) push(linkTo(href, [{ type: 'text', text: label }]), m[0].length);
       else push({ type: 'text', text: label }, m[0].length);
       continue;
     }
     if (ch === '[' && !inLabel && (m = LINK.exec(rest))) {
       const href = safeHref(m[2]);
       const children = parseInline(m[1], depth + 1, true);
-      if (href) push({ type: 'link', href, children: linkChildren(children, href) }, m[0].length);
+      if (href) push(linkTo(href, children), m[0].length);
       else {
         flush();
         out.push(...children);
@@ -185,10 +214,14 @@ export function parseInline(src: string, depth = 0, inLabel = false): Inline[] {
     }
     if (ch === 'h' && !inLabel && !isWordChar(prev) && (m = /^https?:\/\/[^\s<>()[\]{}"']+/i.exec(rest))) {
       const url = trimUrlEnd(m[0]);
-      if (safeHref(url)) {
-        push({ type: 'link', href: url, children: [{ type: 'text', text: url }] }, url.length);
-        continue;
+      if (safeHref(url)) push(linkTo(url, [{ type: 'text', text: url }]), url.length);
+      // A refused candidate (userinfo, say) is text as a whole. Going on from its next character would match the
+      // rest of it again from every "http" inside, which is quadratic ('http://a@' repeated).
+      else {
+        buf += m[0];
+        i += m[0].length;
       }
+      continue;
     }
     if (ch === '*' || ch === '_') {
       const canOpen = ch === '*' || !isWordChar(prev);
@@ -426,6 +459,8 @@ export function inlineText(nodes: Inline[]): string {
           return n.text;
         case 'br':
           return '\n';
+        case 'linkHost':
+          return ` (${n.text})`;
         default:
           return inlineText(n.children);
       }

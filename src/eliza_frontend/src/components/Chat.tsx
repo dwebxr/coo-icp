@@ -3,7 +3,7 @@ import type { Coo } from '../useCoo';
 import { SUPPORT_URL } from '../links';
 import { AccountMenu } from './AccountMenu';
 import { Composer } from './Composer';
-import { ConfirmDialog } from './ConfirmDialog';
+import { ConfirmDialog, type ConfirmOutcome } from './ConfirmDialog';
 import { AlertIcon, ArrowDownIcon, RetryIcon } from './icons';
 import { CooAvatar } from './CooAvatar';
 import { MessageItem, Thinking } from './MessageItem';
@@ -82,6 +82,11 @@ export function Chat({ coo }: { coo: Coo }) {
   }, [pending]);
 
   const showEmpty = history === 'loaded' && messages.length === 0 && !pending;
+
+  const clearConversation = async (): Promise<ConfirmOutcome> => {
+    const outcome = await coo.clear();
+    return outcome === 'cleared' ? 'done' : outcome;
+  };
 
   // Ids that arrived with the history load; only later messages animate in.
   const initialIds = useRef<Set<string> | null>(null);
@@ -189,8 +194,10 @@ export function Chat({ coo }: { coo: Coo }) {
         title="Clear conversation?"
         body="This deletes your conversation with Coo. It cannot be undone."
         confirmLabel="Clear"
-        errorText="Couldn't clear the conversation. Try again."
-        onConfirm={coo.clear}
+        failedText="Couldn't clear the conversation. Try again."
+        pendingText="No answer from Coo yet. The conversation may still be cleared; nothing can be sent until Coo answers. You can close this window."
+        canConfirm={!busy}
+        onConfirm={clearConversation}
         onClose={() => setConfirmClear(false)}
       />
     </div>
