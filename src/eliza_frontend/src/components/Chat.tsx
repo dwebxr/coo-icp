@@ -84,8 +84,9 @@ export function Chat({ coo }: { coo: Coo }) {
   const showEmpty = history === 'loaded' && messages.length === 0 && !pending;
 
   const clearConversation = async (): Promise<ConfirmOutcome> => {
+    const toDialog = (outcome: 'cleared' | 'failed') => (outcome === 'cleared' ? 'done' : 'failed');
     const outcome = await coo.clear();
-    return outcome === 'cleared' ? 'done' : outcome;
+    return typeof outcome === 'string' ? toDialog(outcome) : { pending: outcome.pending.then(toDialog) };
   };
 
   // Ids that arrived with the history load; only later messages animate in.

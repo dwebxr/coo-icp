@@ -7,7 +7,7 @@ export type Inline =
   | { type: 'em'; children: Inline[] }
   | { type: 'code'; text: string }
   | { type: 'link'; href: string; children: Inline[] }
-  /** The last child of a link whose text does not name where it goes: that destination (see `linkTo`). */
+  /** The last child of a link whose text is not its own address: where it really goes (see `linkTo`). */
   | { type: 'linkHost'; text: string }
   | { type: 'br' };
 
@@ -63,41 +63,23 @@ export function destinationOf(href: string): string {
   return url.protocol === 'https:' ? url.host : `http://${url.host}`;
 }
 
-// Around a destination named in a link's text, these would make it part of a longer name: "evil.com" inside
-// "evil.com.good.example", "good.example" inside "good.example:444" or "me@good.example".
-const NAME_BEFORE = /[\p{L}\p{N}.@-]/u;
-const NAME_AFTER = /[\p{L}\p{N}.:-]/u;
-// Invisible characters (zero-width spaces and joiners, bidirectional controls, …) can make text read as something
-// other than what it contains, so a label with any of them never counts as naming the destination.
-const INVISIBLE = /[\p{Cf}\p{Zl}\p{Zp}]/u;
-
-const codePointBefore = (text: string, at: number) => Array.from(text.slice(Math.max(at - 2, 0), at)).pop();
-const codePointAt = (text: string, at: number) => {
-  const cp = text.codePointAt(at);
-  return cp === undefined ? undefined : String.fromCodePoint(cp);
-};
-
-/** True when the text of a link names `shown` (see destinationOf) exactly, as a complete name of its own. */
-export function namesDestination(label: string, shown: string): boolean {
-  if (INVISIBLE.test(label)) return false;
-  const text = label.toLowerCase();
-  for (let at = text.indexOf(shown); at !== -1; at = text.indexOf(shown, at + 1)) {
-    const before = codePointBefore(text, at);
-    const after = codePointAt(text, at + shown.length);
-    if (!(before && NAME_BEFORE.test(before)) && !(after && NAME_AFTER.test(after))) return true;
-  }
-  return false;
-}
+/**
+ * The authority of a URL as it was typed (between "//" and the next "/", "?", "#" or the end), lower-cased; the
+ * URL parser's host is the same unless the parser changed something (an international name, percent-encoding, a
+ * default port, an IPv6 form, …).
+ */
+const typedAuthority = (href: string) => /^https?:\/\/([^/?#]*)/i.exec(href)?.[1].toLowerCase() ?? null;
 
 /**
- * A link to `href` (already checked by safeHref) showing `label`. Unless the label already names the destination,
- * the destination follows it, inside the link: a link cannot show one site while pointing to another without the
- * other one being shown too. No attempt is made to tell whether a label "looks like" an address.
+ * A link to `href` (already checked by safeHref) showing `label`. Its real destination always follows the label, in
+ * parentheses and inside the link — with one exception: the visible text IS the address (a bare URL, or a label that
+ * is exactly the URL) and names its host just as the browser will use it. There is no guessing at what a label
+ * means, so nothing in a label can hide where a link goes.
  */
 function linkTo(href: string, label: Inline[]): Inline {
   const shown = destinationOf(href);
-  const named = namesDestination(inlineText(label), shown);
-  return { type: 'link', href, children: named ? label : [...label, { type: 'linkHost', text: shown }] };
+  const itself = inlineText(label) === href && typedAuthority(href) === new URL(href).host;
+  return { type: 'link', href, children: itself ? label : [...label, { type: 'linkHost', text: shown }] };
 }
 
 // Drops trailing sentence punctuation from an autolink with a scan; an unanchored /[.,;:!?]+$/ is quadratic on long runs.

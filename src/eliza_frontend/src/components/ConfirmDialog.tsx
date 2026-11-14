@@ -1,16 +1,19 @@
 import { useEffect, useRef, useState } from 'react';
 
-/** done: closes the dialog. failed: it did not happen. pending: no answer yet, so it may still happen. */
-export type ConfirmOutcome = 'done' | 'failed' | 'pending';
+/**
+ * done: closes the dialog. failed: it did not happen. pending: no answer yet, so it may still happen; the promise
+ * resolves with what happened in the end, and the dialog follows (closes, or says it failed) if it is still open.
+ */
+export type ConfirmOutcome = 'done' | 'failed' | { pending: Promise<'done' | 'failed'> };
 
 interface Props {
   open: boolean;
   title: string;
   body: string;
   confirmLabel: string;
-  /** Shown inside the dialog when onConfirm resolves 'failed'. */
+  /** Shown inside the dialog when it did not happen. */
   failedText: string;
-  /** Shown inside the dialog when onConfirm resolves 'pending'. */
+  /** Shown inside the dialog while there is no answer yet. */
   pendingText: string;
   /** False while confirming cannot be tried again (an earlier attempt is still out). */
   canConfirm?: boolean;
@@ -32,12 +35,15 @@ export function ConfirmDialog({
 }: Props) {
   const ref = useRef<HTMLDialogElement>(null);
   const [busy, setBusy] = useState(false);
-  const [outcome, setOutcome] = useState<ConfirmOutcome | null>(null);
+  const [outcome, setOutcome] = useState<'failed' | 'pending' | null>(null);
+  // Bumped when the dialog opens and on every confirmation, so a late answer only changes the dialog it belongs to.
+  const attempt = useRef(0);
 
   useEffect(() => {
     const dialog = ref.current;
     if (!dialog) return;
     if (open && !dialog.open) {
+      attempt.current += 1;
       setOutcome(null);
       dialog.showModal();
     }
@@ -45,12 +51,21 @@ export function ConfirmDialog({
   }, [open]);
 
   const confirm = async () => {
+    const mine = ++attempt.current;
     setBusy(true);
     setOutcome(null);
     try {
       const result = await onConfirm();
       if (result === 'done') onClose();
-      else setOutcome(result);
+      else if (result === 'failed') setOutcome('failed');
+      else {
+        setOutcome('pending');
+        void result.pending.then((final) => {
+          if (mine !== attempt.current || !ref.current?.open) return;
+          if (final === 'done') onClose();
+          else setOutcome('failed');
+        });
+      }
     } finally {
       setBusy(false);
     }

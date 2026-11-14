@@ -10,6 +10,9 @@ async function openTab(): Promise<typeof import('./sessionSync')> {
   return import('./sessionSync');
 }
 
+/** The time part of the stored activity ("<wall ms>|<tab id>"). */
+const storedTime = () => data.get('coo:last-active')?.split('|')[0];
+
 /** Moves both clocks forward to `ms` (wall clock, epoch ms), running the timers due on the way. */
 const at = (ms: number) => vi.advanceTimersByTime(ms - Date.now());
 
@@ -138,11 +141,11 @@ describe('idle time and the clocks', () => {
     sync.noteActivity(); // written
     at(114_000);
     sync.noteActivity(); // held back
-    expect(data.get('coo:last-active')).toBe('100000');
+    expect(storedTime()).toBe('100000');
     at(114_999);
-    expect(data.get('coo:last-active')).toBe('100000');
+    expect(storedTime()).toBe('100000');
     at(115_000);
-    expect(data.get('coo:last-active')).toBe('114000');
+    expect(storedTime()).toBe('114000');
     // A sign-out in between cancels it.
     at(120_000);
     sync.noteActivity(true);
@@ -151,6 +154,44 @@ describe('idle time and the clocks', () => {
     sync.clearActivity();
     at(200_000);
     expect(data.has('coo:last-active')).toBe(false);
+  });
+
+  // Review round 2, I5.
+  it("a clock set back five minutes after this tab's own activity does not stretch it to fifteen", () => {
+    const start = 10 * 3600_000;
+    at(start);
+    sync.noteActivity(true); // stored, by this tab
+    vi.setSystemTime(start - 5 * 60_000);
+    vi.advanceTimersByTime(10 * 60_000);
+    // The stored time (this tab's own) looks five minutes old by the wall clock; this tab knows better.
+    expect(sync.idleFor()).toBe(10 * 60_000);
+  });
+
+  // Review round 2, I9.
+  it("a write the throttle held back does not replace another tab's later activity", async () => {
+    const a = sync;
+    const b = await openTab();
+    at(1_000);
+    a.noteActivity(true);
+    at(15_000);
+    a.noteActivity(); // held back until 16 s
+    at(15_500);
+    b.noteActivity(true); // B, later
+    expect(data.get('coo:last-active')).toMatch(/^15500\|/);
+    const bWrote = data.get('coo:last-active');
+    at(16_000); // A's trailing write: 15 s is older than B's 15.5 s
+    expect(data.get('coo:last-active')).toBe(bWrote);
+    // A later activity of A's does replace it.
+    at(40_000);
+    a.noteActivity();
+    expect(storedTime()).toBe('40000');
+  });
+
+  it('a stored time in the future can be replaced (it says nothing)', () => {
+    at(1_000_000);
+    data.set('coo:last-active', String(1_000_000 + 3600_000));
+    sync.noteActivity(true);
+    expect(storedTime()).toBe('1000000');
   });
 
   it("the reviewer's 14 seconds: neither tab signs out before its own ten minutes", async () => {
@@ -200,7 +241,7 @@ describe('sign-out across tabs', () => {
 
   it('tells a tab when another tab announces a sign-out', () => {
     const heard = vi.fn();
-    const stop = sync.onSignOutElsewhere(heard);
+    const stop = sync.onSignOutElsewhere(heard, () => null);
     storageEvent('coo:signed-out', 'g1');
     expect(heard).toHaveBeenCalledTimes(1);
     // Other keys, a removal and an unchanged value are not sign-outs.
@@ -219,8 +260,21 @@ describe('sign-out across tabs', () => {
   it('works without BroadcastChannel', () => {
     vi.stubGlobal('BroadcastChannel', undefined);
     const heard = vi.fn();
-    sync.onSignOutElsewhere(heard);
+    sync.onSignOutElsewhere(heard, () => null);
     storageEvent('coo:signed-out', 'g1');
+    expect(heard).toHaveBeenCalledTimes(1);
+  });
+
+  // Review round 2, I7: A signs out (writes g1) → B's sign-in completes (its session saw g1) → the event reaches B.
+  it('ignores a notification of the generation the current session started with', () => {
+    const heard = vi.fn();
+    let sessionSaw: string | null = null;
+    sync.onSignOutElsewhere(heard, () => sessionSaw);
+    data.set('coo:signed-out', 'g1'); // tab A signs out
+    sessionSaw = sync.signOutGeneration(); // tab B's new session starts, after that
+    storageEvent('coo:signed-out', 'g1', null); // A's event, delivered late
+    expect(heard).not.toHaveBeenCalled();
+    storageEvent('coo:signed-out', 'g2', 'g1'); // a sign-out after the session began
     expect(heard).toHaveBeenCalledTimes(1);
   });
 });

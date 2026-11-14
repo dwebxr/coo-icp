@@ -2,6 +2,8 @@
 // minutes of inactivity" also holds when the tab was closed or the computer slept), and that one of them signed
 // out (so the others do too).
 
+// The last activity in any tab: "<wall-clock ms>|<tab id>". One rule: it is only ever replaced by a later time, so
+// a write that was held back (or a tab whose clock is behind) cannot push another tab's newer activity back.
 const ACTIVITY_KEY = 'coo:last-active';
 /**
  * Changes on every sign-out in any tab. Durable, so a tab that was busy restoring a session when it changed still
@@ -21,12 +23,28 @@ let trailing: ReturnType<typeof setTimeout> | null = null;
 
 const monotonic = () => performance.now();
 
-function readStored(): number {
+function randomId(): string {
+  return typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function'
+    ? Array.from(crypto.getRandomValues(new Uint32Array(2)), (n) => n.toString(36)).join('')
+    : Math.random().toString(36).slice(2);
+}
+
+/** This page load, as the writer of the stored activity. */
+const TAB = randomId();
+
+interface Stored {
+  wall: number;
+  tab: string;
+}
+
+/** Null when nothing (or nothing readable) is stored. A value without a tab id is another tab's. */
+function readStored(): Stored | null {
   try {
-    const stored = Number(localStorage.getItem(ACTIVITY_KEY));
-    return Number.isFinite(stored) && stored > 0 ? stored : 0;
+    const [time, tab = ''] = (localStorage.getItem(ACTIVITY_KEY) ?? '').split('|');
+    const wall = Number(time);
+    return Number.isFinite(wall) && wall > 0 ? { wall, tab } : null;
   } catch {
-    return 0;
+    return null;
   }
 }
 
@@ -34,8 +52,12 @@ function writeActivity() {
   if (trailing !== null) clearTimeout(trailing);
   trailing = null;
   writtenMono = monotonic();
+  // Read, compare and write in one go: only a later time replaces the stored one. A stored time in the future says
+  // nothing (the clock was set back since, or the writer's clock is ahead) and may be replaced.
+  const stored = readStored();
+  if (stored && stored.wall >= lastWall && stored.wall <= Date.now()) return;
   try {
-    localStorage.setItem(ACTIVITY_KEY, String(lastWall));
+    localStorage.setItem(ACTIVITY_KEY, `${lastWall}|${TAB}`);
   } catch {
     // Storage unavailable: this tab's own activity still counts.
   }
@@ -60,10 +82,12 @@ export function idleFor(): number | null {
   // This tab's own idle time: the larger of the two clocks' readings, so setting the wall clock back cannot shorten
   // it, and a computer that slept (the wall clock ran on) cannot either.
   const own = lastWall === 0 ? null : Math.max(wall - lastWall, monotonic() - lastMono, 0);
-  // Another tab's activity, by the wall clock. A time in the future (this clock was set back since, or the other
-  // tab's clock is ahead) says nothing about how long ago it was, and is ignored rather than read as "active now".
+  // Another tab's activity, by the wall clock. What this tab wrote itself is left out: its own two clocks above know
+  // better (a clock set back after the write would make the stored time look recent). A time in the future (this
+  // clock was set back since, or the other tab's clock is ahead) says nothing about how long ago it was, and is
+  // ignored rather than read as "active now".
   const stored = readStored();
-  const theirs = stored === 0 || stored > wall ? null : wall - stored;
+  const theirs = !stored || stored.tab === TAB || stored.wall > wall ? null : wall - stored.wall;
   if (own === null) return theirs;
   return theirs === null ? own : Math.min(own, theirs);
 }
@@ -91,13 +115,7 @@ export function signOutGeneration(): string | null {
   }
 }
 
-function newGeneration(): string {
-  const random =
-    typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function'
-      ? Array.from(crypto.getRandomValues(new Uint32Array(2)), (n) => n.toString(36)).join('')
-      : Math.random().toString(36).slice(2);
-  return `${Date.now().toString(36)}-${random}`;
-}
+const newGeneration = () => `${Date.now().toString(36)}-${randomId()}`;
 
 /** Tells the other tabs, now and later, that this one signed out. */
 export function announceSignOut() {
@@ -108,12 +126,17 @@ export function announceSignOut() {
   }
 }
 
-/** Calls `listener` when another tab signs out. Returns the function that stops listening. */
-export function onSignOutElsewhere(listener: () => void): () => void {
+/**
+ * Calls `listener` when another tab signs out. `seen` is the generation the current session started with (see
+ * signOutGeneration): a notification of that very generation was written before the session began — it is late, not
+ * news — and is ignored. Returns the function that stops listening.
+ */
+export function onSignOutElsewhere(listener: () => void, seen: () => string | null): () => void {
   if (typeof window === 'undefined') return () => {};
   // The storage event fires in the other tabs of this origin only, never in the one that wrote.
   const onStorage = (event: StorageEvent) => {
-    if (event.key === SIGN_OUT_KEY && event.newValue !== null && event.newValue !== event.oldValue) listener();
+    if (event.key !== SIGN_OUT_KEY || event.newValue === null || event.newValue === event.oldValue) return;
+    if (event.newValue !== seen()) listener();
   };
   window.addEventListener('storage', onStorage);
   return () => window.removeEventListener('storage', onStorage);

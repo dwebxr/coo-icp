@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { destinationOf, namesDestination, parseBlocks, parseInline, safeHref, type Inline } from './markdown';
+import { destinationOf, parseBlocks, parseInline, safeHref, type Inline } from './markdown';
 
 describe('parseInline', () => {
   it('parses bold, italic and code', () => {
@@ -201,6 +201,8 @@ describe('regex denial of service', () => {
     'refused autolinks': 'http://a@'.repeat(2221) + 'evil.example',
     // Review finding 5: backtick runs of decreasing length, none of which has a closer.
     'backtick runs of decreasing length': 'x ' + Array.from({ length: 198 }, (_, i) => '`'.repeat(198 - i) + 'a').join(''),
+    // Review round 2, N3: a percent-encoded host whose decoded form repeats in the path.
+    'percent-encoded host repeated in the path': 'https://' + '%61'.repeat(3998) + '/' + 'a'.repeat(2 * 3998),
     'unclosed fence, many lines': '```\n' + 'x\n'.repeat(9990),
   };
   for (const [name, input] of Object.entries(cases)) {
@@ -341,21 +343,51 @@ describe('link safety', () => {
     ]);
   });
 
-  it('shows the destination after an ordinary label too, and not after one that names it', () => {
+  // Review round 2: no label is read for a host any more. Every label that is not the address itself gets the
+  // destination, also one that seems to name it.
+  it('shows the destination after every label that is not the address itself', () => {
     expect(labelOf('[the docs](https://evil.example)')).toEqual([
       { type: 'text', text: 'the docs' },
       { type: 'linkHost', text: 'evil.example' },
     ]);
     expect(labelOf('[internetcomputer.org](https://internetcomputer.org/docs)')).toEqual([
       { type: 'text', text: 'internetcomputer.org' },
+      { type: 'linkHost', text: 'internetcomputer.org' },
     ]);
     expect(labelOf('[See INTERNETCOMPUTER.ORG](https://internetcomputer.org/docs)')).toEqual([
       { type: 'text', text: 'See INTERNETCOMPUTER.ORG' },
+      { type: 'linkHost', text: 'internetcomputer.org' },
     ]);
-    // "www.example.com" is another name than "example.com" (the earlier version dropped "www." before comparing).
     expect(labelOf('[www.example.com](https://example.com)')).toEqual([
       { type: 'text', text: 'www.example.com' },
       { type: 'linkHost', text: 'example.com' },
+    ]);
+  });
+
+  it('adds nothing only when the text is exactly the URL and names its host as the browser will use it', () => {
+    // A label identical to the URL is the address itself (as a bare URL is).
+    expect(labelOf('[https://good.example/a](https://good.example/a)')).toEqual([{ type: 'text', text: 'https://good.example/a' }]);
+    expect(labelOf('[**https://good.example/a**](https://good.example/a)')).toEqual([
+      { type: 'strong', children: [{ type: 'text', text: 'https://good.example/a' }] },
+    ]);
+    // Anything the URL parser writes differently from how it was typed gets the destination.
+    for (const [url, shown] of [
+      ['https://good.example:443/', 'good.example'],
+      ['http://good.example:80/', 'http://good.example'],
+      ['https://%67ood.example/', 'good.example'],
+      ['https://[0:0:0:0:0:0:0:1]/', '[::1]'],
+      ['https://ドメイン.example/', 'xn--eckwd4c7c.example'],
+      ['https://good.example\\@evil.example/', 'good.example'],
+    ]) {
+      // (A URL with "[" — IPv6 — is neither autolinked nor possible as a label, so only as a link to it.)
+      const children = labelOf(`see ${url} now`) ?? labelOf(`[${url}](${url})`) ?? labelOf(`[ip](${url})`);
+      expect(children, url).not.toBeNull();
+      expect(children![children!.length - 1], url).toEqual({ type: 'linkHost', text: shown });
+    }
+    // A label that is almost the URL is not the URL.
+    expect(labelOf('[https://good.example/a ](https://good.example/a)')).toEqual([
+      { type: 'text', text: 'https://good.example/a ' },
+      { type: 'linkHost', text: 'good.example' },
     ]);
   });
 
@@ -389,6 +421,12 @@ describe('link safety', () => {
       ['[gооd.example](https://good.example)', 'good.example'], // Cyrillic о
       ['[ドメイン.example](https://ドメイン.example)', 'xn--eckwd4c7c.example'],
       ['[click](https://ドメイン.example)', 'xn--eckwd4c7c.example'],
+      // Review round 2, I6: a default-ignorable that is not a format character, a combining mark, a host in the
+      // path, and a fake host next to the real one.
+      ['[good.example\u034Fevil.com](https://evil.com)', 'evil.com'],
+      ['[evil.com\u0301](https://evil.com)', 'evil.com'],
+      ['[good.example/evil.com](https://evil.com)', 'evil.com'],
+      ['[**good.example** (evil.com)](https://evil.com)', 'evil.com'],
     ];
     for (const [src, shown] of cases) {
       const children = labelOf(src);
@@ -397,21 +435,10 @@ describe('link safety', () => {
     }
   });
 
-  it('counts a destination as named only as a complete name of its own', () => {
+  it('shows the destination as the browser will use it', () => {
     expect(destinationOf('https://Good.Example:443/x')).toBe('good.example');
     expect(destinationOf('http://good.example/')).toBe('http://good.example');
     expect(destinationOf('https://good.example:8443/')).toBe('good.example:8443');
-    expect(namesDestination('Go to good.example now', 'good.example')).toBe(true);
-    expect(namesDestination('(good.example)', 'good.example')).toBe(true);
-    expect(namesDestination('https://good.example/path', 'good.example')).toBe(true);
-    expect(namesDestination('good.example.evil.com and good.example', 'good.example')).toBe(true);
-    expect(namesDestination('good.example.evil.com', 'good.example')).toBe(false);
-    expect(namesDestination('not-good.example', 'good.example')).toBe(false);
-    expect(namesDestination('good.example:80', 'good.example')).toBe(false);
-    expect(namesDestination('agood.example', 'good.example')).toBe(false);
-    expect(namesDestination('ägood.example', 'good.example')).toBe(false);
-    expect(namesDestination('\u{1D41A}good.example', 'good.example')).toBe(false); // a letter outside the BMP
-    expect(namesDestination('good.example\u200b', 'good.example')).toBe(false);
   });
 
   it('never nests a link in a link', () => {

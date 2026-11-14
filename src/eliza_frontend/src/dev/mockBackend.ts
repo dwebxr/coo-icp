@@ -4,8 +4,10 @@
 // repeated request id replays the saved reply. (Taking over a chat stuck for 5 minutes is not modelled.)
 //
 // Scenarios: signedout | empty | chat | long | rich | slow | error | busy | offline | lostreply | inprogress | hang |
-//            latesave | conflict | stale | laggy (one history read from before the last clear) | clearerror |
-//            clearhang (the clear call never returns) | historyerror | expiring | badsession |
+//            latesave | conflict | stale | laggy (one history read from before the last clear) |
+//            clearerror (the canister refuses the clear) | clearhang (the clear call never returns) |
+//            clearlost (the clear runs, its answer is lost) | clearfail (the clear is lost before it runs) |
+//            historyerror | expiring | badsession |
 //            racyclear (this device has seen revision 5, replicas still say 4, and while the certified read — which
 //            reads 5 — is on its way, another tab clears the conversation: revision 6)
 // Extra params: signin=cancel|error|hang|late (succeeds after 4 s)|lateerror (fails after 4 s); a comma-separated
@@ -71,7 +73,8 @@ const RICH: Message[] = [
       '- **Web**: canisters serve HTTP directly\n' +
       '- **Cost**: the `reverse gas` model\n\n' +
       '> Canisters are WebAssembly modules bundled with their memory.\n\n' +
-      'More in [the canister overview](https://internetcomputer.org/docs/building-apps/essentials/canisters-overview).\n\n' +
+      'More in [the canister overview](https://internetcomputer.org/docs/building-apps/essentials/canisters-overview), ' +
+      'or start at [internetcomputer.org](https://internetcomputer.org).\n\n' +
       '---\n\n' +
       'Docs: https://internetcomputer.org/docs/building-apps/essentials/canisters-overview-and-a-very-long-path-segment',
   },
@@ -120,6 +123,7 @@ export function createMockBackend(scenario: string): Backend {
     sends: 0,
     answered: 0,
     ids: [] as string[],
+    historyReads: 0,
     get session() {
       return signedIn;
     },
@@ -197,6 +201,7 @@ export function createMockBackend(scenario: string): Backend {
     },
 
     async history() {
+      stats.historyReads += 1;
       await sleep(scenario === 'historyerror' ? 600 : 300);
       if (scenario === 'badsession') throw new SessionInvalid('mock orphan delegation');
       guard();
@@ -212,6 +217,7 @@ export function createMockBackend(scenario: string): Backend {
     },
 
     async certifiedHistory() {
+      stats.historyReads += 1;
       // Through consensus: slower, and never the stale copy a lagging replica returns.
       if (scenario === 'racyclear' && !otherTabCleared) {
         // Read now, answered late: meanwhile another tab clears, and stores the floor it was confirmed.
@@ -289,12 +295,15 @@ export function createMockBackend(scenario: string): Backend {
     async clear() {
       guard();
       await sleep(clearMs ?? 300);
-      if (scenario === 'clearerror') throw new Error('mock clear failure');
+      // What the agent reports when the canister rejects a call: certainly not run.
+      if (scenario === 'clearerror') throw new Error('Call was rejected: mock clear refused');
       if (scenario === 'clearhang') return new Promise<number>(() => {});
+      if (scenario === 'clearfail') throw new Error('Failed to fetch');
       if (scenario === 'laggy') beforeClear = { messages: messages.map((m) => ({ ...m })), revision };
       revision += 1;
       messages = [];
       if (inFlight) inFlight.cleared = true;
+      if (scenario === 'clearlost') throw new Error('Failed to fetch');
       return revision;
     },
 

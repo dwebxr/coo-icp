@@ -2,8 +2,10 @@
 #
 # NETWORK selects the network for the targets that talk to a canister (default: local); it is local or ic. The local
 # targets name the local network in every dfx call, so a DFX_NETWORK in the environment cannot send them anywhere
-# else. Nothing here passes --yes to dfx or touches mainnet without NETWORK=ic or an explicit *-ic target, and each
-# of those asks before it changes anything.
+# else. Nothing here passes --yes to dfx or touches mainnet without NETWORK=ic or an explicit *-ic target. Every
+# target that changes something on mainnet asks first: install-ic, upgrade-ic (and upgrade NETWORK=ic),
+# upgrade-frontend-ic (and upgrade-frontend NETWORK=ic), and set-provider and set-character with NETWORK=ic.
+# (status and logs with NETWORK=ic only read.)
 
 SHELL := /bin/bash
 NETWORK ?= local
@@ -29,6 +31,9 @@ CARGO := PATH="$$HOME/.cargo/bin:$$PATH" cargo
 DFX := PATH="$$HOME/.cargo/bin:$$PATH" dfx
 WASM_BUILD := $(CARGO) build --target wasm32-unknown-unknown --release --locked
 
+# The question a target asks before it changes mainnet: $(call confirm-ic,<what it does>,<word to type>).
+confirm-ic = @read -r -p "This $(1) on MAINNET with the identity '$$($(DFX) identity whoami)'. Type '$(2)' to continue: " answer && [ "$$answer" = "$(2)" ] || { echo "Aborted; nothing was changed."; exit 1; }
+
 .PHONY: help setup start stop deploy-local build build-ic candid declarations check test test-canister e2e \
         e2e-local build-e2e install-ic upgrade upgrade-ic upgrade-frontend upgrade-frontend-ic status logs \
         set-provider set-character clean
@@ -52,7 +57,7 @@ help:
 	@echo "  make candid             src/eliza_backend/eliza_backend.did from the code"
 	@echo "  make declarations       the frontend's Candid bindings from that file"
 	@echo
-	@echo "Mainnet (each asks before it changes anything)"
+	@echo "Mainnet (each asks before it changes anything; so do set-provider and set-character with NETWORK=ic)"
 	@echo "  make install-ic         first installation; refuses if the canisters already have code"
 	@echo "  make upgrade-ic         upgrade the backend: stop, snapshot, upgrade, check, start (scripts/upgrade.sh)"
 	@echo "  make upgrade-frontend-ic  build and upload the frontend"
@@ -166,36 +171,24 @@ e2e:
 
 # The real client against a canister on the local replica (fallback provider), served by the local asset canister
 # under the security headers it sends: sign-in, queries, update calls and the certified read all run under the
-# deployed Content-Security-Policy, and a violation fails the tests. The test bundle (build-e2e) is replaced by the
-# normal one afterwards, whatever the result. (The tests' exit status waits in a file while that happens, so that
-# the bundle is put back in recipe lines of their own: a line that runs $(MAKE) is run even by `make -n`, and the
-# tests must not be.)
-E2E_STATUS := target/e2e-local.status
+# deployed Content-Security-Policy, and a violation fails the tests. scripts/e2e-local.sh deploys the test bundle
+# (build-e2e) and puts the normal one back on any exit, an interruption included.
 e2e-local: start
 	$(DFX) deploy eliza_backend --network local
 	$(MAKE) set-provider PROVIDER=Fallback NETWORK=local
-	$(MAKE) build-e2e
-	$(DFX) deploy eliza_frontend --network local
-	@mkdir -p $(dir $(E2E_STATUS)) && echo 1 > $(E2E_STATUS)
-	url="http://$$($(DFX) canister id eliza_frontend --network local).localhost:4943"; \
-		( cd $(FRONTEND) && node e2e/headers.mjs "$$url/" && BASE="$$url" node e2e/local.mjs ); \
-		echo $$? > $(E2E_STATUS)
-	@echo; echo "Putting the normal bundle back on the local frontend canister"
-	$(MAKE) build
-	$(DFX) deploy eliza_frontend --network local
-	@if [ "$$(cat $(E2E_STATUS))" = 0 ]; then echo "e2e-local: all passed"; else echo "e2e-local: FAILED (above)"; exit 1; fi
+	scripts/e2e-local.sh
 
 # ---------------------------------------------------------------------------------------------- mainnet
 
-# First installation only. A canister that holds conversations is upgraded with `make upgrade-ic`; this refuses to
-# run when the canisters named in canister_ids.json already have code on mainnet.
+# First installation only. A canister that holds conversations is upgraded with `make upgrade-ic`. The check says
+# early, and in words, when the canisters named in canister_ids.json already have code on mainnet; the deploy itself
+# is in install mode, which the Internet Computer refuses for a canister that has code (so code installed between
+# the check and the deploy is not replaced either).
 install-ic:
 	scripts/require-no-code.sh ic eliza_backend eliza_frontend
-	@echo "This creates and installs the canisters on MAINNET with the identity '$$($(DFX) identity whoami)' and spends cycles."
-	@read -r -p "Type 'install' to continue: " answer && [ "$$answer" = "install" ] || { echo "Aborted."; exit 1; }
+	$(call confirm-ic,creates and installs the canisters and spends cycles,install)
 	$(MAKE) build-ic
-	scripts/require-no-code.sh ic eliza_backend eliza_frontend
-	$(DFX) deploy --network ic
+	$(DFX) deploy --network ic --mode install
 	@echo "Now set the Wasm memory limit:  dfx canister update-settings eliza_backend --wasm-memory-limit 512MiB --network ic"
 
 upgrade:
@@ -207,8 +200,7 @@ upgrade-ic:
 # Uploads the frontend only (`dfx deploy eliza_frontend` would also redeploy the backend it depends on).
 upgrade-frontend:
 ifeq ($(NETWORK),ic)
-	@echo "This uploads the frontend to MAINNET with the identity '$$($(DFX) identity whoami)'."
-	@read -r -p "Type 'upgrade' to continue: " answer && [ "$$answer" = "upgrade" ] || { echo "Aborted; nothing was changed."; exit 1; }
+	$(call confirm-ic,uploads the frontend,upgrade)
 endif
 	$(MAKE) $(if $(filter ic,$(NETWORK)),build-ic,build)
 	$(DFX) build eliza_frontend --network $(NETWORK)
@@ -231,6 +223,9 @@ logs:
 # PROVIDER was checked at the top.
 set-provider:
 	$(if $(PROVIDER),,$(error usage: make set-provider PROVIDER=OnChain|Fallback [NETWORK=ic]))
+ifeq ($(NETWORK),ic)
+	$(call confirm-ic,sets the model provider to $(PROVIDER),$(PROVIDER))
+endif
 	@result="$$($(DFX) canister call eliza_backend set_llm_provider '(variant { $(PROVIDER) })' --network $(NETWORK))"; \
 		echo "$$result"; echo "$$result" | grep -q 'Ok' || { echo "The provider was NOT changed."; exit 1; }
 	@$(DFX) canister call eliza_backend get_config --query --network $(NETWORK)
@@ -241,6 +236,9 @@ set-provider:
 set-character: export COO_CHARACTER_FILE = $(value FILE)
 set-character:
 	@[ -n "$$COO_CHARACTER_FILE" ] && [ -f "$$COO_CHARACTER_FILE" ] || { echo "usage: make set-character FILE=<file with a Candid Character record> [NETWORK=ic]"; exit 1; }
+ifeq ($(NETWORK),ic)
+	$(call confirm-ic,replaces the character,character)
+endif
 	@result="$$($(DFX) canister call eliza_backend update_character --argument-file "$$COO_CHARACTER_FILE" --network $(NETWORK))"; \
 		echo "$$result"; echo "$$result" | grep -q 'Ok' || { echo "The character was NOT changed."; exit 1; }
 

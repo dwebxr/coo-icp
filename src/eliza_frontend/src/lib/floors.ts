@@ -6,12 +6,14 @@
 // starts a new epoch, and a higher epoch beats any revision of a lower one, so a tab that still remembers the old,
 // higher floor adopts the reset instead of writing its value back.
 //
-// Answers arrive late. An answer is only as new as the moment the canister produced it, and by the time it arrives
-// another tab (or this one) may have confirmed something newer. So every caller takes a snapshot of the floor before
-// it asks, and hands it back with the answer:
-// - a reset is compare-and-set: it happens only if the floor is still exactly that snapshot, in memory and (inside
-//   the Web Lock) in storage; otherwise the answer is older than what is known and nothing is lowered;
-// - a raise counts only in the epoch it started in: an answer from before a reset is never carried into the new one.
+// Answers arrive late, and what they may do depends on what kind of answer they are:
+// - An UPDATE call's answer (a send's reply, a clear's revision, a read through consensus) is the canister's own
+//   state when it answered: it raises the floor of the current epoch (raiseFloorByUpdate), whatever happened since.
+// - A QUERY's answer comes from one replica and can be stale: it only counts in the epoch the query started in
+//   (raiseFloorByQuery), so an answer from before a reset is never carried into the new epoch.
+// - A reset (lowering the floor) is compare-and-set: the caller takes a snapshot of the floor before it asks, and
+//   the reset happens only if the floor is still exactly that, in memory and (inside the Web Lock) in storage.
+//   Otherwise something was confirmed while the answer was on its way, and nothing is lowered.
 //
 // Floors are kept in memory for the page's lifetime, so a failing storage or a sign-out cannot lose them, and in
 // localStorage across reloads and tabs. Only writers holding a cross-tab Web Lock store them (read, then write the
@@ -101,16 +103,35 @@ export function floorOf(owner: string): number {
 }
 
 /**
- * The canister confirmed `revision`, in an exchange that started when the floor was in `epoch`. Ignored when a reset
- * has happened since (the answer is from before it). Returns whether it counted.
+ * Whether a conversation at `revision`, judged against a floor of `epoch`, may be shown now: the floor as it is at
+ * this moment is in that epoch and not above it. The last check before anything is shown — an answer can be
+ * overtaken while it is on its way, or while a reset waits for its lock.
  */
-export function raiseFloor(owner: string, revision: number, epoch: number): boolean {
-  const base = current(owner);
-  if (base.epoch !== epoch) return false;
-  const floor = { epoch, revision: Math.max(base.revision, revision) };
+export function isCurrent(owner: string, revision: number, epoch: number): boolean {
+  const now = readFloor(owner);
+  return now.epoch === epoch && revision >= now.revision;
+}
+
+function raise(owner: string, base: Floor, revision: number) {
+  const floor = { epoch: base.epoch, revision: Math.max(base.revision, revision) };
   memory.set(owner, floor);
   // write() only stores it over an older value, so a reset another tab stored meanwhile wins.
   persist(owner, floor);
+}
+
+/** An update call answered with `revision` (the canister's state when it answered): the floor of now rises to it. */
+export function raiseFloorByUpdate(owner: string, revision: number) {
+  raise(owner, current(owner), revision);
+}
+
+/**
+ * A query, started when the floor was in `epoch`, answered with `revision`. Ignored when a reset has happened since
+ * (the answer may be from before it). Returns whether it counted.
+ */
+export function raiseFloorByQuery(owner: string, revision: number, epoch: number): boolean {
+  const base = current(owner);
+  if (base.epoch !== epoch) return false;
+  raise(owner, base, revision);
   return true;
 }
 
@@ -150,11 +171,35 @@ export async function resetFloor(owner: string, revision: number, expected: Floo
   }
 }
 
+/**
+ * A clear answered with `cleared`; `before` is the floor taken before the call. Below the floor, it is a reset if
+ * nothing moved meanwhile. If something did, a revision at or above the floor as it is now still raises it (the
+ * clear's own answer), and one below it is left: something newer was confirmed. 'behind': the canister holds
+ * something newer than this clear.
+ */
+export async function settleClear(
+  owner: string,
+  cleared: number,
+  before: Floor,
+): Promise<'raised' | 'reset' | 'behind'> {
+  if (cleared >= floorOf(owner)) {
+    raiseFloorByUpdate(owner, cleared);
+    return 'raised';
+  }
+  if (await resetFloor(owner, cleared, before)) return 'reset';
+  if (cleared >= floorOf(owner)) {
+    raiseFloorByUpdate(owner, cleared);
+    return 'raised';
+  }
+  return 'behind';
+}
+
 /** Takes over the floor an earlier version of the app stored for this principal (it knew one canister only). */
 export function adoptLegacyFloor(owner: string, principal: string) {
   try {
     const revision = Number(localStorage.getItem(LEGACY_PREFIX + principal));
-    if (Number.isSafeInteger(revision) && revision > 0) raiseFloor(owner, revision, 0);
+    // A value from before epochs: only for a floor that was never reset.
+    if (Number.isSafeInteger(revision) && revision > 0) raiseFloorByQuery(owner, revision, 0);
   } catch {
     // Nothing to adopt.
   }

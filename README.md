@@ -75,6 +75,10 @@ Every limit is enforced by the canister (`src/eliza_backend/src/limits.rs`).
   principals used this browser; they are kept on purpose, so that a conversation older than one this browser has
   seen is never shown, and are not removed by signing out. Also a random marker that changes on every sign-out
   (`coo:signed-out`). Internet Identity's client keeps a fresh, unused session key in IndexedDB.
+- **Not tested: a real Internet Identity sign-in racing a sign-out in another tab.** Both tabs share the auth
+  client's IndexedDB; whether a sign-out whose deletion of the stored key lands after a new sign-in in another tab
+  leaves that new session's key or delegation inconsistent on the next reload has only been reasoned about (the
+  mock backend has no such storage).
 - **The JavaScript SDK is deprecated.** The frontend uses `@dfinity/agent` and `@dfinity/auth-client` 2.4.1 (pinned);
   their successor is `@icp-sdk`. The send/re-send logic depends on the exact behaviour of 2.4.1, so the migration is
   a project of its own and has not been done.
@@ -113,7 +117,7 @@ either.
 | `make test` | canister unit tests, frontend type check and unit tests |
 | `make test-canister` | the above for the canister plus PocketIC integration tests, including the upgrade from the version deployed on mainnet (built from its commit) and an upgrade at the full storage budget |
 | `make e2e` | browser tests against the mock (Chromium and WebKit) and the accessibility check; needs `npm run dev` running |
-| `make e2e-local` | the real client, served by the local asset canister under the security headers it sends in production: sign-in (with a locally made identity), queries, update calls and the certified read, failing on any Content-Security-Policy violation or console error; and the headers themselves |
+| `make e2e-local` | the real client, served by the local asset canister under the security headers it sends in production: sign-in (with a locally made identity), queries, update calls and the certified read, failing on any Content-Security-Policy violation or console error; and the headers themselves. `scripts/e2e-local.sh` puts the normal bundle back afterwards, also when it is interrupted |
 | `make check` | formatting, clippy, and that the Candid file and the generated bindings match the code |
 
 First time: `cd src/eliza_frontend && npx playwright install chromium webkit`.
@@ -123,12 +127,14 @@ First time: `cd src/eliza_frontend && npx playwright install chromium webkit`.
 ### First installation
 
 ```bash
-make install-ic      # refuses if the canisters already have code; asks; builds; runs `dfx deploy --network ic`
+make install-ic      # refuses if the canisters already have code; asks; builds; `dfx deploy --network ic --mode install`
 dfx canister update-settings eliza_backend --wasm-memory-limit 512MiB --network ic
 ```
 
 `make install-ic` first asks mainnet (read only) whether the canisters in `canister_ids.json` already have code, and
-stops if they do: a first installation would replace them without a snapshot. A canister that runs is upgraded with
+stops if they do: a first installation would replace them without a snapshot. The deploy itself is in install mode,
+which the Internet Computer refuses for a canister that has code (`canister is not empty`), so code installed after
+that check is not replaced either. A canister that runs is upgraded with
 `make upgrade-ic`. The ids in this repository's `canister_ids.json` are this project's own; a fork removes them before
 its first installation (`docs/BUILD_YOUR_OWN_AGENT.md`).
 
@@ -170,8 +176,10 @@ What the script does, and what to check:
 6. Starts the canister and shows `health` and `get_metrics`.
 
 If any step fails, the script says which one, whether the canister is stopped or running as far as it knows, and
-the command that loads the snapshot. A failure up to step 5 leaves the canister stopped; a failure of the checks
-after the start in step 6 leaves it running.
+the command that loads the snapshot (or starts it, when nothing was installed). A failure in step 1 (the build,
+reading the running version) leaves the canister running and unchanged. From the stop in step 2 up to step 5, a
+failure leaves it stopped — before the install also when the snapshot's id or the log's line numbers cannot be read.
+A failure of the checks after the start in step 6 leaves it running.
 
 Before the **first upgrade from 0.6.0**, look at the size of what it holds: `health` (conversations) and
 `dfx canister status eliza_backend --network ic` (memory). 0.7.0 reads the whole saved state before cutting it to
@@ -213,8 +221,8 @@ on a canister whose conversations are ordinary chat messages.
 ```bash
 make status NETWORK=ic                                  # health, config, metrics
 make logs NETWORK=ic
-make set-provider PROVIDER=Fallback                     # local; add NETWORK=ic for mainnet
-make set-character FILE=character.did NETWORK=ic        # a Candid record in a file
+make set-provider PROVIDER=Fallback                     # local; add NETWORK=ic for mainnet (it asks first)
+make set-character FILE=character.did NETWORK=ic        # a Candid record in a file (asks first on mainnet)
 ```
 
 `get_metrics` reports `stored_bytes` (against the 32 MiB budget), `entries`, `revision_floor` (it rises when
@@ -283,6 +291,7 @@ new character applies to existing conversations from their next message. Both se
 ├── scripts/upgrade.sh                 # the upgrade runbook
 ├── scripts/require-no-code.sh         # install-ic: refuses canisters that already have code
 ├── scripts/check-bundle.sh            # no development-only code in a production bundle
+├── scripts/e2e-local.sh               # make e2e-local: test bundle on the local replica, then the normal one back
 ├── src/
 │   ├── eliza_backend/                 # the canister
 │   │   ├── eliza_backend.did          # Candid interface (generated: make candid)
@@ -320,14 +329,16 @@ new character applies to existing conversations from their next message. Both se
   no HTML is interpreted, images are not loaded (an image becomes a link), and links are `http(s)` only, never with a
   user name or password in them. Every link shows where it really goes: its text is followed, inside the link, by
   the destination's host as the browser will use it (with the port when it is not the default, an international
-  domain name in its `xn--` form, and `http://` in front when the link is not https) — unless the text already names
-  exactly that, as a name of its own and without invisible characters. So a link cannot show one site while pointing
-  to another without the other one being shown too. The asset canister sends a Content-Security-Policy without
-  inline script or style (`public/.ic-assets.json5`).
+  domain name in its `xn--` form, and `http://` in front when the link is not https). The one exception is a link
+  whose text is exactly its own URL (a bare URL, or a label identical to it) with the host typed as the browser will
+  use it: that text already is the destination. No label is read for what it seems to say, so a link cannot show one
+  site while pointing to another without the other one being shown too. The asset canister sends a
+  Content-Security-Policy without inline script or style (`public/.ic-assets.json5`).
 - **Sessions.** The Internet Identity delegation is checked before every call. Ten minutes without activity in any
   tab signs every tab out, as does signing out in one of them — also a tab that is still restoring the session when
   that happens, and a session found idle when a tab opens. A tab in the middle of signing in is left to finish: that
-  is a new, explicit sign-in. All of this goes through the browser's localStorage; where it cannot be used, each tab
+  is a new, explicit sign-in, and a session that began after a sign-out is not ended when the news of that sign-out
+  arrives late. All of this goes through the browser's localStorage; where it cannot be used, each tab
   still ends its own session when it is idle or its delegation expires.
 - **Stored data.** Conversations are stored in the canister unencrypted; node providers of the subnet and the
   canister's controllers can read them.

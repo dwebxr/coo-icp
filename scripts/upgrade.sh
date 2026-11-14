@@ -152,7 +152,13 @@ step="reading the log before the install"
 say "Reading the canister log before the install"
 log_before="$(dfx canister logs "$CANISTER" --network "$NETWORK")"
 index_before="$(highest_index "$log_before")"
-index_before="${index_before:--1}"
+if [ -z "$index_before" ]; then
+  # An empty log is fine (this upgrade's lines are then all there is). Lines without the "[N. time]: " numbering
+  # this script reads are not: it could not tell this upgrade's lines from earlier ones.
+  grep -q '[^[:space:]]' <<<"$log_before" &&
+    fail "the canister log has lines, but not numbered '[N. time]: …' as this script expects; nothing was installed."
+  index_before=-1
+fi
 echo "Newest log line before the install: ${index_before/#-1/none}"
 
 step="installing"
@@ -172,6 +178,8 @@ echo "Built Wasm:       sha256 $built_hash"
 step="checking the upgrade hooks"
 say "Checking the log lines of this upgrade's hooks (newer than line $index_before)"
 log_after="$(dfx canister logs "$CANISTER" --network "$NETWORK")"
+[ -n "$(highest_index "$log_after")" ] || ! grep -q '[^[:space:]]' <<<"$log_after" ||
+  fail "the canister log has lines, but not numbered '[N. time]: …' as this script expects."
 this_upgrade="$(logs_after "$index_before" "$log_after")"
 printf '%s\n' "$this_upgrade" | grep -E 'pre_upgrade: |Restoring state|Brought the state|State restored' || true
 saved="$(grep -oE 'pre_upgrade: [0-9]+ bytes' <<<"$this_upgrade" | grep -oE '[0-9]+' || true)"
