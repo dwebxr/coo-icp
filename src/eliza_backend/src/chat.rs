@@ -2,8 +2,10 @@
 //!
 //! A message is sent as the next exchange after the revision the client last saw, under a request id. A (request
 //! id, revision) pair is saved at most once: repeating it returns the saved reply, and once the conversation has
-//! moved on the request is a `Conflict` for good. The steps are split in two synchronous halves around the model
-//! call (`begin`, `finish`) that only touch the state passed in, so every outcome is covered by unit tests.
+//! moved past that revision the request is a `Conflict` for good. (A revision the conversation has not reached yet
+//! is a `Conflict` only for now; the canister never hands one out.) The steps are split in two synchronous halves
+//! around the model call (`begin`, `finish`) that only touch the state passed in, so every outcome is covered by
+//! unit tests.
 
 use crate::api::{ChatError, Conversation, LlmProvider, Message, MessageStatus, Sent};
 use crate::flight::Verdict;
@@ -12,6 +14,7 @@ use crate::limits::{
 };
 use crate::llm::{self, PromptMessage};
 use crate::state::{self, State};
+use crate::store::Evict;
 use candid::Principal;
 
 pub enum Begun {
@@ -31,8 +34,11 @@ pub struct Run {
 
 /// Everything before the model is asked. The order of the checks is part of the protocol:
 /// a repeated request is recognised before anything can refuse it; what is wrong with the request itself comes
-/// before what is only wrong right now; and a request for an outdated revision is a `Conflict` even while the
-/// canister is at a limit, so no room is made for a request that can never run.
+/// before what is only wrong right now; and a request whose base revision is not the conversation's is a
+/// `Conflict` even while the canister is at a limit, so no room is made for a request that cannot run now. For a
+/// revision the conversation has moved past, which includes every revision the canister has handed out but the
+/// current one, that is for good. A revision the conversation has not reached yet is refused the same way, but
+/// the same request would run once the conversation got there.
 pub fn begin(
     state: &mut State,
     caller: Principal,
@@ -77,9 +83,10 @@ pub fn begin(
     }
     // Room for this exchange and for those of the chats already in flight, now, so that saving a reply never has
     // to make room (or fail for lack of it).
+    // A message may cost the least recently used conversations their place (a clear may not; see `clear`).
     let new_entry = !store.contains(&caller);
     let protected = |who: &Principal| *who == caller || flights.holds(who);
-    if !store.make_room((live + 1) * MAX_EXCHANGE_BYTES, new_entry, protected) {
+    if !store.make_room((live + 1) * MAX_EXCHANGE_BYTES, new_entry, Evict::Any, protected) {
         return Err(ChatError::Busy);
     }
 
@@ -132,6 +139,12 @@ impl Drop for FlightGuard {
 pub async fn send_message(request_id: String, base_revision: u64, content: String) -> Result<Sent, ChatError> {
     let caller = ic_cdk::api::msg_caller();
     let begun = state::mutate(|s| begin(s, caller, &request_id, base_revision, &content, ic_cdk::api::time()))?;
+    // What the PocketIC tests measure making room by (at most one eviction pass over the store happens in `begin`).
+    #[cfg(feature = "test-hooks")]
+    ic_cdk::println!(
+        "test: send_message took {} instructions up to the model call",
+        ic_cdk::api::instruction_counter()
+    );
     let run = match begun {
         Begun::Replay(sent) => return Ok(sent),
         Begun::Run(run) => run,
@@ -173,12 +186,14 @@ pub fn conversation(state: &State, caller: &Principal) -> Conversation {
 }
 
 /// Empties the caller's conversation, moves its revision on, and cancels saving a reply that is still being
-/// generated. Returns the new revision. Fails only when the caller has no entry and none can be freed for it.
+/// generated. Returns the new revision. A caller without an entry needs one, and gets it only by removing entries
+/// without turns: a clear calls no model and has no other limit, so it must never cost anyone their conversation.
+/// It fails when that does not free a place.
 pub fn clear(state: &mut State, caller: Principal, now: u64) -> Result<u64, String> {
     let State { store, flights, .. } = state;
     if !store.contains(&caller) {
         let reserved = ENTRY_OVERHEAD_BYTES + flights.live(now) * MAX_EXCHANGE_BYTES;
-        if !store.make_room(reserved, true, |who| *who == caller || flights.holds(who)) {
+        if !store.make_room(reserved, true, Evict::EmptyOnly, |who| *who == caller || flights.holds(who)) {
             return Err("Coo is at capacity. Try again later.".to_string());
         }
     }
@@ -344,6 +359,24 @@ mod tests {
         assert_eq!(chat(&mut state, 1, "r2", 2, "next", 7).map(|s| s.revision), Ok(3));
     }
 
+    /// What `Conflict` guarantees, and what it does not: a revision the conversation has moved past never runs
+    /// again, but one it has not reached yet (which the canister never hands out) is only refused for now.
+    #[test]
+    fn a_revision_the_conversation_has_not_reached_is_refused_only_for_now() {
+        let mut state = fallback();
+        assert_eq!(err(begin(&mut state, who(1), "ahead", 1, "q", 0)), ChatError::Conflict);
+        assert!(!state.store.contains(&who(1)), "nothing is left behind");
+        // Once the conversation reaches revision 1, the same request runs.
+        chat(&mut state, 1, "other", 0, "first", 1).unwrap();
+        assert_eq!(chat(&mut state, 1, "ahead", 1, "q", 2).map(|s| s.revision), Ok(2));
+        // The same with a clear: a request naming the revision a clear is about to reach runs after it...
+        assert_eq!(err(begin(&mut state, who(2), "guess", 1, "q", 3)), ChatError::Conflict);
+        assert_eq!(clear(&mut state, who(2), 3), Ok(1));
+        assert_eq!(chat(&mut state, 2, "guess", 1, "q", 4).map(|s| s.revision), Ok(2));
+        // ...while one for the revision it had before the clear (0) never does.
+        assert_eq!(err(begin(&mut state, who(2), "before", 0, "q", 5)), ChatError::Conflict);
+    }
+
     #[test]
     fn a_reply_that_comes_too_late_is_not_saved() {
         let mut state = fallback();
@@ -448,5 +481,42 @@ mod tests {
         // Once a chat has ended, its entry can make way.
         end(&mut state, 2, &b, "b", "hi", "x", 3).unwrap();
         assert!(chat(&mut state, 3, "c", 0, "hi", 4).is_ok());
+    }
+
+    #[test]
+    fn newcomers_clearing_take_the_place_of_empty_entries_never_of_conversations() {
+        let mut state = small(6);
+        // Old conversations, and newer entries without turns: two cleared, one left by a chat that failed.
+        for n in 1..=3u8 {
+            chat(&mut state, n, "r", 0, "hi", n as u64).unwrap();
+        }
+        assert_eq!(clear(&mut state, who(4), 10), Ok(1));
+        assert_eq!(clear(&mut state, who(5), 11), Ok(1));
+        let failed = start(&mut state, 6, "r", 0, "hi", 12).unwrap();
+        let _ =
+            finish(&mut state, who(6), (failed.token, failed.revision), "r".into(), "hi".into(), Err("x".into()), 12);
+        state.flights.end(&who(6), failed.token);
+        assert_eq!((state.store.entries(), state.store.conversations()), (6, 3));
+
+        // However many newcomers clear, each takes the place of an empty entry, and the conversations stay.
+        for n in 20..60u8 {
+            assert!(clear(&mut state, who(n), 20 + n as u64).is_ok(), "newcomer {n}");
+            assert!((1..=3).all(|c| state.store.turns(&who(c)).len() == 2), "after newcomer {n}");
+            assert!(state.store.entries() <= 6);
+        }
+    }
+
+    #[test]
+    fn with_only_conversations_left_a_newcomer_cannot_clear_but_can_send() {
+        let mut state = small(3);
+        for n in 1..=3u8 {
+            chat(&mut state, n, "r", 0, "hi", n as u64).unwrap();
+        }
+        assert_eq!(clear(&mut state, who(4), 10), Err("Coo is at capacity. Try again later.".to_string()));
+        assert_eq!((state.store.entries(), state.store.conversations(), state.store.revision_floor()), (3, 3, 0));
+        // A message, unlike a clear, may take the place of the least recently used conversation.
+        assert_eq!(chat(&mut state, 4, "r", 0, "hi", 11).map(|s| s.revision), Ok(1));
+        assert!(!state.store.contains(&who(1)));
+        assert!(state.store.contains(&who(2)) && state.store.contains(&who(3)));
     }
 }

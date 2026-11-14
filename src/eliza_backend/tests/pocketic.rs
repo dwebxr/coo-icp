@@ -7,13 +7,14 @@
 //! The on-chain model is replaced by `mock_llm`, installed at the LLM canister's real id, so the canister's own
 //! `v1_chat` call runs unchanged and the tests can hold, release and inspect it.
 //!
-//! An update call that `canister_inspect_message` refuses never reaches the method: the tests tell "rejected at
-//! ingress" (`ingress_rejected`) from "the method answered with an error" (`Ok(Err(..))`).
+//! An update call that `canister_inspect_message` refuses never reaches the method: the tests tell "refused at
+//! ingress by inspect_message" (`refused_by_inspect`, which checks the rejection is inspect_message's own) from "the
+//! method answered with an error" (`Ok(Err(..))`).
 
 use candid::{decode_one, encode_args, encode_one, CandidType, Nat, Principal};
 use eliza_backend::{Character, ChatError, Config, Conversation, LlmProvider, MessageStatus, Metrics, Sent};
 use pocket_ic::common::rest::{RawEffectivePrincipal, RawMessageId};
-use pocket_ic::PocketIc;
+use pocket_ic::{ErrorCode, PocketIc};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use std::time::Duration;
@@ -134,21 +135,93 @@ fn upgrade(pic: &PocketIc, id: Principal, wasm: Vec<u8>) {
     assert_logged_sizes_match(pic, id);
 }
 
-/// The README's post-upgrade check: the last saved and restored state sizes in the canister log are equal.
-fn assert_logged_sizes_match(pic: &PocketIc, id: Principal) {
-    let logs: Vec<String> = pic
-        .fetch_canister_logs(id, admin())
+const PRE_UPGRADE_LINE: &str = "pre_upgrade: ";
+const POST_UPGRADE_LINE: &str = "State restored from stable memory successfully (";
+
+fn logs(pic: &PocketIc, id: Principal) -> Vec<String> {
+    pic.fetch_canister_logs(id, admin())
         .unwrap()
         .into_iter()
         .map(|r| String::from_utf8_lossy(&r.content).into_owned())
-        .collect();
-    let last_number = |prefix: &str| -> u64 {
-        let line =
-            logs.iter().rev().find(|l| l.contains(prefix)).unwrap_or_else(|| panic!("no {prefix:?} in {logs:?}"));
-        let rest = &line[line.find(prefix).unwrap() + prefix.len()..];
-        rest.chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse().unwrap()
+        .collect()
+}
+
+/// The last line of the canister log that contains `marker`.
+fn last_line(pic: &PocketIc, id: Principal, marker: &str) -> String {
+    let logs = logs(pic, id);
+    logs.iter().rev().find(|l| l.contains(marker)).cloned().unwrap_or_else(|| panic!("no {marker:?} in {logs:?}"))
+}
+
+/// The number right after the first `label` in `line`.
+fn number_after(line: &str, label: &str) -> u64 {
+    let at = line.find(label).unwrap_or_else(|| panic!("no {label:?} in {line:?}")) + label.len();
+    line[at..].chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse().unwrap()
+}
+
+/// The README's post-upgrade check: the last saved and restored state sizes in the canister log are equal.
+fn assert_logged_sizes_match(pic: &PocketIc, id: Principal) {
+    assert_eq!(
+        number_after(&last_line(pic, id, PRE_UPGRADE_LINE), PRE_UPGRADE_LINE),
+        number_after(&last_line(pic, id, POST_UPGRADE_LINE), POST_UPGRADE_LINE)
+    );
+}
+
+/// What a hook logged it used: the Wasm memory size at its end (memory only grows, so the hook's peak is at most
+/// this) and the instructions it had executed.
+#[derive(Debug, Clone, Copy)]
+struct HookCost {
+    memory: u64,
+    instructions: u64,
+}
+
+fn hook_cost(line: &str) -> HookCost {
+    HookCost { memory: number_after(line, "wasm memory "), instructions: number_after(line, "instructions ") }
+}
+
+/// What the last upgrade's pre_upgrade (of this version) and post_upgrade logged they used.
+fn upgrade_cost(pic: &PocketIc, id: Principal) -> (HookCost, HookCost) {
+    (hook_cost(&last_line(pic, id, PRE_UPGRADE_LINE)), hook_cost(&last_line(pic, id, POST_UPGRADE_LINE)))
+}
+
+/// The Wasm memory limit the README tells operators to set. It is enforced for update calls and post_upgrade, but
+/// not for pre_upgrade (interface spec, canister settings: "The WASM heap memory limit is ignored for query methods,
+/// response callback handlers, global timers, heartbeats, and canister pre_upgrade"), so pre_upgrade's use is read
+/// from its log line instead.
+const RECOMMENDED_WASM_MEMORY_LIMIT: u64 = 512 * 1024 * 1024;
+/// "Per canister install or upgrade | 300 billion" instructions, and "Per update call, heartbeat, or timer | 40
+/// billion" (https://docs.internetcomputer.org/building-apps/canister-management/resource-limits, 2026-11). Whether
+/// the two hooks share the upgrade's budget is not documented, so their sum is held to the ceiling.
+const UPGRADE_INSTRUCTION_LIMIT: u64 = 300_000_000_000;
+const UPDATE_INSTRUCTION_LIMIT: u64 = 40_000_000_000;
+
+/// An upgrade stays well within the limits: each hook under a quarter of the recommended Wasm memory limit, and
+/// both together under a tenth of the instruction limit.
+fn assert_upgrade_well_within_limits(shape: &str, pre: Option<HookCost>, post: HookCost) {
+    eprintln!("{shape}: pre_upgrade {pre:?}, post_upgrade {post:?}");
+    for (hook, cost) in [("pre_upgrade", pre), ("post_upgrade", Some(post))] {
+        if let Some(HookCost { memory, .. }) = cost {
+            assert!(
+                memory < RECOMMENDED_WASM_MEMORY_LIMIT / 4,
+                "{shape}: {hook} grew the Wasm memory to {memory} bytes"
+            );
+        }
+    }
+    let instructions = pre.map_or(0, |c| c.instructions) + post.instructions;
+    assert!(instructions < UPGRADE_INSTRUCTION_LIMIT / 10, "{shape}: the upgrade took {instructions} instructions");
+}
+
+/// The instructions the last `send_message` took up to the model call (logged by the test-hooks builds), which
+/// includes making room.
+fn send_instructions(pic: &PocketIc, id: Principal) -> u64 {
+    number_after(&last_line(pic, id, "test: send_message took "), "test: send_message took ")
+}
+
+fn set_recommended_memory_limit(pic: &PocketIc, id: Principal) {
+    let settings = ic_management_canister_types::CanisterSettings {
+        wasm_memory_limit: Some(Nat::from(RECOMMENDED_WASM_MEMORY_LIMIT)),
+        ..Default::default()
     };
-    assert_eq!(last_number("pre_upgrade: "), last_number("State restored from stable memory successfully ("));
+    pic.update_canister_settings(id, Some(admin()), settings).unwrap();
 }
 
 fn update<T: CandidType + DeserializeOwned>(
@@ -215,14 +288,32 @@ fn sent(reply: &str, revision: u64) -> SendResult {
     Ok(Sent { reply: reply.to_string(), revision })
 }
 
-/// True if the call was refused before it reached the method (by `canister_inspect_message`).
-fn ingress_rejected(pic: &PocketIc, id: Principal, from: Principal, method: &str, arg: Vec<u8>) -> bool {
+/// What `inspect_message` traps with when it refuses a call.
+const INSPECT_REFUSAL: &str = "not accepted: sign in, call queries as queries, and keep arguments small";
+
+/// True if `canister_inspect_message` refused the call (the rejection is its trap); false if the call was accepted
+/// and reached the method. Any other rejection at submission fails the test.
+fn refused_by_inspect(pic: &PocketIc, id: Principal, from: Principal, method: &str, arg: Vec<u8>) -> bool {
     match pic.submit_call(id, from, method, arg) {
-        Err(_) => true,
+        Err(reject) => {
+            assert!(
+                reject.error_code == ErrorCode::CanisterCalledTrap && reject.reject_message.contains(INSPECT_REFUSAL),
+                "{method}: rejected at submission, but not by inspect_message: {reject}"
+            );
+            true
+        }
         Ok(message) => {
             let _ = pic.await_call(message);
             false
         }
+    }
+}
+
+/// A clear that traps (no room for the caller), with the trap message.
+fn clear_refused(pic: &PocketIc, id: Principal, from: Principal) -> String {
+    match pic.update_call(id, from, "clear_conversation", encode_args(()).unwrap()) {
+        Err(reject) => reject.reject_message,
+        Ok(bytes) => panic!("the clear was accepted: revision {:?}", decode_one::<u64>(&bytes)),
     }
 }
 
@@ -274,8 +365,9 @@ fn upgrade_from_the_deployed_version_keeps_every_conversation() {
     set_provider(&pic, id, LlmProvider::Fallback);
     let first = send(&pic, id, alice(), "a-1", 0, "hello").unwrap();
     let second = send(&pic, id, alice(), "a-2", 1, "tell me about icp").unwrap();
-    // Longer than 0.7.0 accepts; 0.6.0 had no limit.
-    let long_text = "long ".repeat(1_000);
+    // Longer than 0.7.0 accepts, and than the 8 KiB its ingress filter first allowed; 0.6.0 had no limit.
+    let long_text = "long ".repeat(1_800);
+    assert_eq!(long_text.len(), 9_000);
     let long = send(&pic, id, alice(), "a-long", 2, &long_text).unwrap();
     let legacy: Result<String, String> = update(&pic, id, bob(), "chat", encode_one("who are you").unwrap());
     legacy.unwrap();
@@ -329,6 +421,59 @@ fn upgrade_from_the_deployed_version_keeps_every_conversation() {
     assert_eq!(config.llm_provider, LlmProvider::Fallback);
 }
 
+/// 0.6.0 had no limits: its state may be over this version's, as a whole and per conversation, and bigger than this
+/// version ever writes. The upgrade reads it, cuts it to the limits, and every caller can go on.
+#[test]
+#[ignore]
+fn an_oversized_state_from_the_deployed_version_is_cut_to_the_limits() {
+    // A message as long as fits one ingress message (2 MiB in all), with a reply as long that fits one response.
+    const BIG: usize = 1_900_000;
+    // Each conversation holds the message and 0.6.0's fallback reply, which echoes it: 18 make a saved state of
+    // more than the 64 MiB this version writes at most.
+    const CALLERS: u32 = 18;
+    let (pic, id) = setup(old_wasm());
+    set_recommended_memory_limit(&pic, id);
+    set_provider(&pic, id, LlmProvider::Fallback);
+    let hello = send(&pic, id, alice(), "a-1", 0, "hello").unwrap();
+    let alice_before = chat_messages(&pic, id, alice());
+    let big = "x".repeat(BIG);
+    for n in 0..CALLERS {
+        assert_eq!(send(&pic, id, user(n), "big", 0, &big).map(|s| (s.revision, s.reply.len() > BIG)), Ok((1, true)));
+    }
+
+    upgrade(&pic, id, read(NEW_WASM));
+
+    let saved = number_after(&last_line(&pic, id, PRE_UPGRADE_LINE), PRE_UPGRADE_LINE);
+    assert!(saved > 64 * 1024 * 1024 && saved > CALLERS as u64 * 2 * BIG as u64, "{saved}");
+    let cut = last_line(&pic, id, "Brought the state of schema version 2 within this version's limits: ");
+    assert_eq!(number_after(&cut, "limits: "), 2 * CALLERS as u64, "{cut}");
+    assert_eq!(number_after(&cut, "turns and "), 0, "{cut}");
+    // Reading needs the saved state and its decoding at once, about twice the payload: at the most 0.6.0 could have
+    // saved (100 000 000 bytes) still under half the recommended limit (which post_upgrade is held to; it was set).
+    let post = hook_cost(&last_line(&pic, id, POST_UPGRADE_LINE));
+    eprintln!("0.6.0 state of {saved} bytes with {CALLERS} oversized conversations: post_upgrade {post:?}");
+    assert!(post.memory < 2 * saved + 16 * 1024 * 1024, "{post:?}");
+    assert!(post.instructions < UPGRADE_INSTRUCTION_LIMIT / 10, "{post:?}");
+
+    // The small conversation is intact and still replays.
+    assert_eq!(chat_messages(&pic, id, alice()), alice_before);
+    assert_eq!(send(&pic, id, alice(), "a-1", 0, "hello"), Ok(hello.clone()));
+    // The oversized ones were cut whole, their revisions kept: the cut request is gone, and can never run again.
+    let m = metrics(&pic, id);
+    assert_eq!((m.entries, m.conversations), (CALLERS as u64 + 1, 1));
+    assert!(m.stored_bytes <= 32 * 1024 * 1024, "{m:?}");
+    for n in 0..CALLERS {
+        assert_eq!(conversation(&pic, id, user(n)), Conversation { messages: vec![], revision: 1 });
+        assert_eq!(status(&pic, id, user(n), "big"), MessageStatus::Unknown);
+        assert_eq!(send(&pic, id, user(n), "again", 0, "x"), Err(ChatError::Conflict));
+    }
+    // Every caller can chat on.
+    for n in 0..CALLERS {
+        assert_eq!(send(&pic, id, user(n), "next", 1, "hello again").map(|s| s.revision), Ok(2));
+    }
+    assert_eq!(send(&pic, id, alice(), "a-2", 1, "and me").map(|s| s.revision), Ok(2));
+}
+
 #[test]
 #[ignore]
 fn a_customised_character_survives_the_upgrade() {
@@ -350,19 +495,16 @@ fn an_upgrade_without_saved_state_is_refused() {
     assert!(result.is_err(), "post_upgrade must trap instead of starting empty");
 }
 
+const BUDGET: u64 = 32 * 1024 * 1024;
+
 /// A canister filled to its storage budget still upgrades, under the Wasm memory limit the README tells
 /// operators to set. (If this fails after raising a limit in limits.rs, the README's number must change too.)
+/// The three shapes below cover few large conversations, many entries, and many turns.
 #[test]
 #[ignore]
 fn a_canister_at_its_storage_budget_upgrades_within_the_recommended_memory_limit() {
-    const RECOMMENDED_WASM_MEMORY_LIMIT: u64 = 512 * 1024 * 1024;
-    const BUDGET: u64 = 32 * 1024 * 1024;
     let (pic, id) = setup(read(HOOKS_WASM));
-    let settings = ic_management_canister_types::CanisterSettings {
-        wasm_memory_limit: Some(Nat::from(RECOMMENDED_WASM_MEMORY_LIMIT)),
-        ..Default::default()
-    };
-    pic.update_canister_settings(id, Some(admin()), settings).unwrap();
+    set_recommended_memory_limit(&pic, id);
 
     // 1 663 conversations of one 2 × 10 000-byte exchange: the 32 MiB budget, to within one exchange.
     let filled: u64 = update(&pic, id, admin(), "test_fill", encode_args((1_663u32, 1u32, 10_000u32)).unwrap());
@@ -374,12 +516,8 @@ fn a_canister_at_its_storage_budget_upgrades_within_the_recommended_memory_limit
     let after = metrics(&pic, id);
     assert_eq!((after.entries, after.stored_bytes), (1_663, filled));
     assert_eq!(after.conversations, before.conversations);
-    eprintln!(
-        "full budget: {} bytes counted; wasm memory {} MiB before the upgrade, {} MiB after",
-        filled,
-        before.wasm_memory_bytes >> 20,
-        after.wasm_memory_bytes >> 20
-    );
+    let (pre, post) = upgrade_cost(&pic, id);
+    assert_upgrade_well_within_limits("1 663 conversations of one 20 000-byte exchange", Some(pre), post);
     // Saving and restoring each need the state twice (the conversations and their encoding): about 70 MiB here.
     assert!(after.wasm_memory_bytes < RECOMMENDED_WASM_MEMORY_LIMIT / 4, "a quarter of the limit is not reached");
     // And it still chats: making room for the next exchange evicts down to the target.
@@ -387,6 +525,56 @@ fn a_canister_at_its_storage_budget_upgrades_within_the_recommended_memory_limit
     assert!(send(&pic, id, alice(), "r-1", 0, "hello").is_ok());
     let evicted = metrics(&pic, id);
     assert!(evicted.stored_bytes <= BUDGET * 90 / 100 && evicted.revision_floor == 2, "{evicted:?}");
+    eprintln!("  the send that made room took {} instructions", send_instructions(&pic, id));
+}
+
+/// The entry cap: 100 000 entries of one tiny exchange each. The upgrade handles them all, and the first newcomer
+/// after it makes room by sorting all 100 000 inside its update call — the most `make_room` ever has to do.
+#[test]
+#[ignore]
+fn many_small_entries_at_the_entry_cap_upgrade_and_make_way() {
+    const MAX_ENTRIES: u64 = 100_000;
+    let (pic, id) = setup(read(HOOKS_WASM));
+    set_recommended_memory_limit(&pic, id);
+    let filled: u64 = update(&pic, id, admin(), "test_fill", encode_args((MAX_ENTRIES as u32, 1u32, 1u32)).unwrap());
+    assert_eq!(metrics(&pic, id).entries, MAX_ENTRIES);
+
+    upgrade(&pic, id, read(HOOKS_WASM));
+
+    let after = metrics(&pic, id);
+    assert_eq!((after.entries, after.stored_bytes), (MAX_ENTRIES, filled));
+    let (pre, post) = upgrade_cost(&pic, id);
+    assert_upgrade_well_within_limits("100 000 entries of one tiny exchange", Some(pre), post);
+
+    set_provider(&pic, id, LlmProvider::Fallback);
+    assert_eq!(send(&pic, id, alice(), "r-1", 0, "hello").map(|s| s.revision), Ok(1));
+    let made_way = metrics(&pic, id);
+    // Down to 90 % of the cap, plus the newcomer.
+    assert_eq!((made_way.entries, made_way.revision_floor), (MAX_ENTRIES * 9 / 10 + 1, 2));
+    let took = send_instructions(&pic, id);
+    eprintln!("  the send that sorted {MAX_ENTRIES} entries took {took} instructions");
+    assert!(took < UPDATE_INSTRUCTION_LIMIT / 20, "{took}");
+}
+
+/// Conversations at their turn limit, with one-byte texts: the most turns the budget can hold.
+#[test]
+#[ignore]
+fn conversations_at_their_turn_limit_upgrade_within_the_limits() {
+    let (pic, id) = setup(read(HOOKS_WASM));
+    set_recommended_memory_limit(&pic, id);
+    // 25 exchanges (50 turns) of 1-byte texts count 1 911 bytes per conversation: 17 558 of them fill the budget.
+    let filled: u64 = update(&pic, id, admin(), "test_fill", encode_args((17_558u32, 25u32, 1u32)).unwrap());
+    assert!(filled <= BUDGET && filled + 20_224 > BUDGET, "{filled}");
+
+    upgrade(&pic, id, read(HOOKS_WASM));
+
+    assert_eq!(metrics(&pic, id).stored_bytes, filled);
+    let (pre, post) = upgrade_cost(&pic, id);
+    assert_upgrade_well_within_limits("17 558 conversations of 50 one-byte turns", Some(pre), post);
+    set_provider(&pic, id, LlmProvider::Fallback);
+    assert!(send(&pic, id, alice(), "r-1", 0, "hello").is_ok());
+    assert!(metrics(&pic, id).stored_bytes <= BUDGET * 90 / 100);
+    eprintln!("  the send that made room took {} instructions", send_instructions(&pic, id));
 }
 
 // ========== The chat protocol ==========
@@ -641,8 +829,9 @@ fn the_model_gets_the_character_and_the_recent_conversation_within_its_limits() 
     assert_eq!(first.messages.len(), 2);
     let (role, system) = &first.messages[0];
     assert_eq!(role, "system");
-    // The whole character is in the system message, bio and style included.
-    assert!(system.starts_with("You are Coo") && system.contains("About you:") && system.contains("- Friendly"));
+    // The whole character is in the system message, name, bio and style included.
+    assert!(system.starts_with("You are Coo") && system.contains("About you:\n- Your name is Coo\n"));
+    assert!(system.contains("Your style:") && system.contains("- Friendly"));
     assert_eq!(first.messages[1], ("user".to_string(), "hello".to_string()));
 
     // Twelve exchanges later the system message is still first, and the request has at most 10 messages.
@@ -673,7 +862,8 @@ fn the_model_gets_the_character_and_the_recent_conversation_within_its_limits() 
     set.unwrap();
     llm_mode(&pic, Mode::Reply("Hi there!".into()));
     send(&pic, id, alice(), "r-13", 13, "who are you?").unwrap();
-    assert_eq!(llm_seen(&pic).pop().unwrap().messages[0], ("system".to_string(), "You are Zoe.".to_string()));
+    let zoe_system = "You are Zoe.\n\nAbout you:\n- Your name is Zoe".to_string();
+    assert_eq!(llm_seen(&pic).pop().unwrap().messages[0], ("system".to_string(), zoe_system));
 }
 
 // ========== Who may call what ==========
@@ -686,25 +876,34 @@ fn ingress_is_filtered_before_the_canister_pays_for_it() {
     let send_args = |text: &str| encode_args(("r-1", 0u64, text)).unwrap();
 
     // Anonymous update calls.
-    assert!(ingress_rejected(&pic, id, anonymous, "send_message", send_args("hi")));
-    assert!(ingress_rejected(&pic, id, anonymous, "clear_conversation", encode_args(()).unwrap()));
+    assert!(refused_by_inspect(&pic, id, anonymous, "send_message", send_args("hi")));
+    assert!(refused_by_inspect(&pic, id, anonymous, "clear_conversation", encode_args(()).unwrap()));
     // Arguments far beyond what the method accepts.
-    assert!(ingress_rejected(&pic, id, alice(), "send_message", send_args(&"x".repeat(9_000))));
-    assert!(ingress_rejected(&pic, id, alice(), "clear_conversation", vec![0u8; 1_000]));
+    assert!(refused_by_inspect(&pic, id, alice(), "send_message", send_args(&"x".repeat(17_000))));
+    assert!(refused_by_inspect(&pic, id, alice(), "clear_conversation", vec![0u8; 1_000]));
     // Administration by someone who is not a controller.
     let zoe = Character { name: "Zoe".into(), system_prompt: "You are Zoe.".into(), bio: vec![], style: vec![] };
-    assert!(ingress_rejected(&pic, id, alice(), "update_character", encode_one(&zoe).unwrap()));
-    assert!(ingress_rejected(&pic, id, alice(), "set_llm_provider", encode_one(LlmProvider::Fallback).unwrap()));
-    // Queries sent as update calls, and methods that do not exist (any more).
-    for method in ["health", "get_metrics", "get_character", "chat", "set_admin", "store_encrypted_api_key"] {
-        assert!(ingress_rejected(&pic, id, alice(), method, encode_args(()).unwrap()), "{method}");
+    assert!(refused_by_inspect(&pic, id, alice(), "update_character", encode_one(&zoe).unwrap()));
+    assert!(refused_by_inspect(&pic, id, alice(), "set_llm_provider", encode_one(LlmProvider::Fallback).unwrap()));
+    // Queries sent as update calls.
+    for method in ["health", "get_metrics", "get_character"] {
+        assert!(refused_by_inspect(&pic, id, alice(), method, encode_args(()).unwrap()), "{method}");
     }
+    // Methods that do not exist (any more) are refused by inspect_message too: it runs before the replica looks
+    // the method up. (That they do not exist is checked from another canister, in the next test.)
+    for method in ["chat", "set_admin", "store_encrypted_api_key"] {
+        assert!(refused_by_inspect(&pic, id, alice(), method, encode_args(()).unwrap()), "{method}");
+    }
+    // A message longer than the method accepts reaches it, as long as the argument is within 16 KiB: a request saved
+    // by 0.6.0 may be that long and replays only this way. The method itself refuses it as new.
+    let long = submit(&pic, id, alice(), "r-0", 0, &"x".repeat(10_000));
+    assert!(matches!(outcome(&pic, long), Err(ChatError::Invalid(_))));
     assert_eq!(metrics(&pic, id).entries, 0);
     assert_eq!(llm_seen(&pic).len(), 0);
 
     // What the frontend does is accepted: chatting, clearing, and reading its conversation as an update call
     // (answered by the subnet, not by a single replica).
-    assert!(!ingress_rejected(&pic, id, alice(), "send_message", send_args("hi")));
+    assert!(!refused_by_inspect(&pic, id, alice(), "send_message", send_args("hi")));
     let certified: Conversation = update(&pic, id, alice(), "get_conversation", encode_args(()).unwrap());
     assert_eq!((certified.messages.len(), certified.revision), (2, 1));
     let certified: MessageStatus = update(&pic, id, alice(), "get_message_status", encode_one("r-1").unwrap());
@@ -732,12 +931,15 @@ fn every_method_checks_its_caller_and_input_itself() {
     let reply = via_canister(&pic, id, "send_message", encode_args(("r-1", 0u64, "x".repeat(9_000))).unwrap()).unwrap();
     assert!(matches!(decode_one::<SendResult>(&reply).unwrap(), Err(ChatError::Invalid(_))));
     assert_eq!(metrics(&pic, id).entries, 0);
-    // Removed methods are gone for every kind of caller.
+    // Removed methods are gone: called from a canister (no inspect_message on the way), the replica finds no method.
     for method in
         ["chat", "get_conversation_history", "set_admin", "store_encrypted_api_key", "transform_openai_response"]
     {
-        assert!(via_canister(&pic, id, method, encode_args(()).unwrap()).is_err(), "{method} must not exist");
+        let missing = via_canister(&pic, id, method, encode_args(()).unwrap()).unwrap_err();
+        assert!(missing.contains(&format!("has no update method '{method}'")), "{method}: {missing}");
     }
+    // An existing method answers the same kind of call, so the check above tells a missing method from any failure.
+    assert!(via_canister(&pic, id, "get_conversation", encode_args(()).unwrap()).is_ok());
 
     // A controller is held to the character's limits too.
     for (what, bad) in [
@@ -759,7 +961,7 @@ fn every_method_checks_its_caller_and_input_itself() {
 fn the_deployed_build_has_no_test_hooks() {
     let contains = |wasm: &[u8], needle: &[u8]| wasm.windows(needle.len()).any(|w| w == needle);
     let (deployed, hooks) = (read(NEW_WASM), read(HOOKS_WASM));
-    for needle in [&b"test_fill"[..], &b"trap in the reply callback"[..]] {
+    for needle in [&b"test_fill"[..], &b"trap in the reply callback"[..], &b"test: send_message took "[..]] {
         assert!(contains(&hooks, needle), "the check itself must be able to find the hook");
         assert!(!contains(&deployed, needle));
     }
@@ -782,7 +984,8 @@ fn chats_at_once_and_model_calls_per_minute_are_limited() {
     llm_pending(&pic, 2);
     assert_eq!(metrics(&pic, id).chats_in_flight, 2);
     assert_eq!(send(&pic, id, carol(), "c-1", 0, "hello"), Err(ChatError::Busy));
-    // What does not depend on the limit keeps its own answer: a repeated request, and an outdated revision.
+    // What does not depend on the limit keeps its own answer: a repeated request, and a revision that is not the
+    // conversation's (carol is at 0; 7 was never handed out, so this Conflict holds only for now).
     assert_eq!(send(&pic, id, alice(), "a-1", 0, "hello"), Err(ChatError::InProgress));
     assert_eq!(send(&pic, id, carol(), "c-1", 7, "hello"), Err(ChatError::Conflict));
     assert_eq!(metrics(&pic, id).entries, 2, "a refused request leaves no entry");
@@ -835,12 +1038,13 @@ fn when_storage_is_full_the_least_recently_used_conversations_make_way() {
     assert_eq!(send(&pic, id, user(1), "second", 1, "again"), Err(ChatError::Conflict));
     pic.advance_time(Duration::from_secs(1));
     assert_eq!(send(&pic, id, user(1), "third", 2, "back again").map(|s| s.revision), Ok(3));
-    // Clearing without a conversation needs an entry too, and gets one the same way.
+    // Clearing without a conversation needs an entry too, but never takes a conversation's place: with only
+    // conversations stored, it is refused and nothing changes.
     pic.advance_time(Duration::from_secs(1));
-    let floor = metrics(&pic, id).revision_floor;
-    assert_eq!(clear(&pic, id, user(9)), metrics(&pic, id).revision_floor + 1);
-    assert!(metrics(&pic, id).revision_floor >= floor);
-    assert_eq!(metrics(&pic, id).entries, 8);
+    let before = metrics(&pic, id);
+    assert!(clear_refused(&pic, id, user(9)).contains("Coo is at capacity"));
+    let after = metrics(&pic, id);
+    assert_eq!((after.entries, after.conversations, after.revision_floor), (8, 8, before.revision_floor));
 
     // The byte budget (2 MiB in this build) works the same way: filled past it behind the canister's back,
     // the next chat first frees room down to 90 %.
@@ -855,4 +1059,56 @@ fn when_storage_is_full_the_least_recently_used_conversations_make_way() {
     upgrade(&pic, id, read(SMALL_WASM));
     assert_eq!(metrics(&pic, id).revision_floor, freed.revision_floor);
     assert_eq!(chat_messages(&pic, id, user(1)).len(), 4);
+}
+
+/// Clearing calls no model and has no rate limit: a newcomer clearing, however often and under however many
+/// principals, takes only the place of entries without turns, never of a conversation.
+#[test]
+#[ignore]
+fn newcomers_clearing_cannot_delete_conversations() {
+    let (pic, id) = setup(read(SMALL_WASM));
+    set_provider(&pic, id, LlmProvider::Fallback);
+    // Six old conversations and two newer cleared entries: the eight entries this build allows.
+    for n in 0..6u32 {
+        pic.advance_time(Duration::from_secs(1));
+        send(&pic, id, user(n), "first", 0, "hello").unwrap();
+    }
+    for n in 6..8u32 {
+        pic.advance_time(Duration::from_secs(1));
+        assert_eq!(clear(&pic, id, user(n)), 1);
+    }
+    let conversations = |pic: &PocketIc| (0..6u32).map(|n| chat_messages(pic, id, user(n))).collect::<Vec<_>>();
+    let before = conversations(&pic);
+    assert!(before.iter().all(|c| c.len() == 2));
+
+    // Twenty newcomers clear: each one takes the place of the least recently updated empty entry.
+    for n in 100..120u32 {
+        pic.advance_time(Duration::from_secs(1));
+        let revision = clear(&pic, id, user(n));
+        assert_eq!(conversation(&pic, id, user(n)).revision, revision);
+        let m = metrics(&pic, id);
+        assert_eq!((m.entries, m.conversations), (8, 6), "after newcomer {n}");
+    }
+    assert_eq!(conversations(&pic), before);
+
+    // The two entries without turns left (the last two newcomers') become conversations...
+    for n in 118..120u32 {
+        pic.advance_time(Duration::from_secs(1));
+        let revision = conversation(&pic, id, user(n)).revision;
+        send(&pic, id, user(n), "first", revision, "hello").unwrap();
+    }
+    let full = metrics(&pic, id);
+    assert_eq!((full.entries, full.conversations), (8, 8));
+    // ...and then a newcomer's clear is refused, removing nothing.
+    pic.advance_time(Duration::from_secs(1));
+    assert!(clear_refused(&pic, id, user(200)).contains("Coo is at capacity"));
+    let refused = metrics(&pic, id);
+    assert_eq!((refused.entries, refused.conversations, refused.revision_floor), (8, 8, full.revision_floor));
+    assert_eq!(conversations(&pic), before);
+
+    // A newcomer's message, unlike its clear, takes the place of the least recently used conversation (user 0's).
+    let floor = refused.revision_floor;
+    assert_eq!(send(&pic, id, user(200), "first", floor, "hello").map(|s| s.revision), Ok(floor + 1));
+    assert!(chat_messages(&pic, id, user(0)).is_empty());
+    assert!((1..6u32).all(|n| chat_messages(&pic, id, user(n)).len() == 2));
 }

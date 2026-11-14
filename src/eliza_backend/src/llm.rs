@@ -1,7 +1,7 @@
 //! Turning a conversation into a model request, and asking the model.
 
 use crate::api::{Character, LlmProvider};
-use crate::limits::{prefix, MAX_REPLY_BYTES, MODEL_CALL_TIMEOUT_SECS};
+use crate::limits::{prefix, MAX_REPLY_BYTES, MAX_SYSTEM_MESSAGE_BYTES, MODEL_CALL_TIMEOUT_SECS};
 use crate::store::{Role, Turn};
 use candid::Principal;
 use ic_cdk::call::Call;
@@ -14,9 +14,6 @@ pub const LLM_MODEL: &str = "llama3.1:8b";
 // because how it counts the 10 KiB is not documented.
 const MAX_PROMPT_MESSAGES: usize = 10;
 const PROMPT_BUDGET_BYTES: usize = 9_000;
-/// The system message is cut to this (a character set through `update_character` is far below it; one restored
-/// from older state may not be).
-const MAX_SYSTEM_BYTES: usize = 3_000;
 /// Earlier turns are context, not the question: each is cut to this, so one long reply cannot push out the rest.
 const MAX_CONTEXT_TURN_BYTES: usize = 1_200;
 const CUT_MARK: &str = " […]";
@@ -34,21 +31,39 @@ pub struct PromptMessage {
     pub content: String,
 }
 
-/// Everything the character says about itself, as one system message.
+/// The system message of every model request: the system prompt, then the name and bio, then the style.
+/// `update_character` refuses a character whose system message is longer than MAX_SYSTEM_MESSAGE_BYTES, so it is
+/// sent whole. Only a character restored from the state of an older version can be longer; it is cut to the limit.
 pub fn system_text(character: &Character) -> String {
+    let mut text = whole_system_text(character);
+    text.truncate(prefix(&text, MAX_SYSTEM_MESSAGE_BYTES).len());
+    text
+}
+
+/// The system message before any cut; what `update_character` measures.
+pub fn whole_system_text(character: &Character) -> String {
+    let lines = |lines: &'_ [String]| -> Vec<String> {
+        lines.iter().map(|l| l.trim()).filter(|l| !l.is_empty()).map(str::to_string).collect()
+    };
+    let name = character.name.trim();
+    let mut about = Vec::with_capacity(character.bio.len() + 1);
+    if !name.is_empty() {
+        about.push(format!("Your name is {name}"));
+    }
+    about.extend(lines(&character.bio));
+
     let mut text = character.system_prompt.trim().to_string();
-    for (title, lines) in [("About you:", &character.bio), ("Your style:", &character.style)] {
-        let lines: Vec<&str> = lines.iter().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
+    for (title, lines) in [("About you:", about), ("Your style:", lines(&character.style))] {
         if !lines.is_empty() {
             text.push_str("\n\n");
             text.push_str(title);
             for line in lines {
                 text.push_str("\n- ");
-                text.push_str(line);
+                text.push_str(&line);
             }
         }
     }
-    prefix(&text, MAX_SYSTEM_BYTES).to_string()
+    text
 }
 
 /// The request for `user_message` as the next turn after `turns`: the system message first, always; then as many
@@ -268,12 +283,23 @@ mod tests {
     fn the_system_message_carries_the_whole_character() {
         assert_eq!(
             system_text(&character()),
-            "You are Coo.\n\nAbout you:\n- Runs in a canister\n\nYour style:\n- Friendly"
+            "You are Coo.\n\nAbout you:\n- Your name is Coo\n- Runs in a canister\n\nYour style:\n- Friendly"
         );
         let bare = Character { bio: vec![], style: vec![], ..character() };
-        assert_eq!(system_text(&bare), "You are Coo.");
+        assert_eq!(system_text(&bare), "You are Coo.\n\nAbout you:\n- Your name is Coo");
+        // Only a character from older state can be this long (update_character refuses it); it is cut.
         let huge = Character { system_prompt: "p".repeat(10_000), ..character() };
-        assert_eq!(system_text(&huge).len(), MAX_SYSTEM_BYTES);
+        assert_eq!(system_text(&huge).len(), MAX_SYSTEM_MESSAGE_BYTES);
+        assert_eq!(whole_system_text(&huge).len(), 10_000 + system_text(&character()).len() - "You are Coo.".len());
+    }
+
+    #[test]
+    fn the_name_reaches_the_model() {
+        let zoe = Character { name: "Zoe".into(), ..character() };
+        let (coo, zoe) = (build_prompt(&character(), &[], "hi"), build_prompt(&zoe, &[], "hi"));
+        assert_ne!(coo[0], zoe[0], "changing only the name changes the request");
+        assert!(zoe[0].content.contains("\n- Your name is Zoe\n"));
+        assert_eq!(coo[1..], zoe[1..]);
     }
 
     #[test]

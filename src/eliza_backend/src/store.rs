@@ -2,7 +2,8 @@
 //! Nothing here touches the IC API, so all of it runs in unit tests.
 
 use crate::limits::{
-    ENTRY_OVERHEAD_BYTES, EVICTION_TARGET_PERCENT, MAX_ENTRIES, MAX_STORE_BYTES, MAX_TURNS, TURN_OVERHEAD_BYTES,
+    ENTRY_OVERHEAD_BYTES, EVICTION_TARGET_PERCENT, MAX_CONVERSATION_BYTES, MAX_ENTRIES, MAX_STORE_BYTES, MAX_TURNS,
+    TURN_OVERHEAD_BYTES,
 };
 use candid::Principal;
 use std::collections::HashMap;
@@ -50,6 +51,24 @@ impl Entry {
     pub fn bytes(&self) -> usize {
         ENTRY_OVERHEAD_BYTES + self.turns.iter().map(Turn::bytes).sum::<usize>()
     }
+}
+
+/// Which entries `make_room` may remove.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Evict {
+    /// Only entries without turns (cleared conversations, entries pinned for a chat that failed). Making room for a
+    /// clear must not cost anyone a conversation: clearing calls no model and is limited by nothing else, so a
+    /// newcomer could otherwise delete conversations just by clearing under many principals.
+    EmptyOnly,
+    /// Any entry, those without turns first.
+    Any,
+}
+
+/// What `fit_to_limits` removed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Dropped {
+    pub turns: usize,
+    pub entries: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -163,7 +182,7 @@ impl Store {
     }
 
     /// Replaces the conversation by an empty one with the next revision (also when there was none, so that a
-    /// request sent before the clear cannot run after it) and returns that revision.
+    /// request for the revision the caller had before the clear cannot run after it) and returns that revision.
     pub fn clear(&mut self, who: Principal, now: u64) -> u64 {
         let revision = self.revision_of(&who) + 1;
         let fresh = Entry { turns: Vec::new(), revision, created_at: now, updated_at: now };
@@ -174,16 +193,26 @@ impl Store {
         revision
     }
 
-    /// Makes room for `extra_bytes` more and, with `new_entry`, for one more entry, by removing the least recently
-    /// updated entries that `protected` does not name. Returns false if that is not enough.
-    /// One pass over all entries, and only when a limit is reached; it then frees down to the eviction target, so
-    /// the next pass is a tenth of the budget away.
-    pub fn make_room(&mut self, extra_bytes: usize, new_entry: bool, protected: impl Fn(&Principal) -> bool) -> bool {
+    /// Makes room for `extra_bytes` more and, with `new_entry`, for one more entry, by removing entries that
+    /// `protected` does not name and `evict` allows, in eviction order (see `eviction_order`). It frees down to the
+    /// eviction target, so that it is needed again only a tenth of the budget later. If removing every entry it may
+    /// remove would still not be enough, it removes nothing and returns false: a request that cannot get in does
+    /// not cost anyone their conversation.
+    ///
+    /// Free while both limits hold. When one is reached it lists and sorts every entry it may remove — O(n log n) in
+    /// the number of entries, inside the update call that hit the limit. The PocketIC test
+    /// `many_small_entries_at_the_entry_cap_upgrade_and_make_way` measures it at MAX_ENTRIES.
+    pub fn make_room(
+        &mut self,
+        extra_bytes: usize,
+        new_entry: bool,
+        evict: Evict,
+        protected: impl Fn(&Principal) -> bool,
+    ) -> bool {
         let StoreLimits { max_bytes, max_entries } = self.limits;
-        let fits = |store: &Store| {
-            store.bytes + extra_bytes <= max_bytes && !(new_entry && store.entries.len() >= max_entries)
-        };
-        if fits(self) {
+        let fits =
+            |bytes: usize, entries: usize| bytes + extra_bytes <= max_bytes && !(new_entry && entries >= max_entries);
+        if fits(self.bytes, self.entries.len()) {
             return true;
         }
         let bytes_target = if self.bytes + extra_bytes > max_bytes {
@@ -196,20 +225,38 @@ impl Store {
         } else {
             usize::MAX
         };
-        let mut candidates: Vec<(u64, Principal)> = self
-            .entries
-            .iter()
-            .filter(|(who, _)| !protected(who))
-            .map(|(who, entry)| (entry.updated_at, *who))
-            .collect();
-        candidates.sort_unstable();
-        for (_, who) in candidates {
-            if self.bytes <= bytes_target && self.entries.len() <= entries_target {
+        let order = self.eviction_order(evict, protected);
+        // Plan first: how many of them, in order, reach the target (or all of them), and whether that is enough.
+        let (mut bytes, mut entries, mut count) = (self.bytes, self.entries.len(), 0);
+        for &(_, size) in &order {
+            if bytes <= bytes_target && entries <= entries_target {
                 break;
             }
-            self.remove(&who);
+            bytes -= size;
+            entries -= 1;
+            count += 1;
         }
-        fits(self)
+        if !fits(bytes, entries) {
+            return false;
+        }
+        for (who, _) in &order[..count] {
+            self.remove(who);
+        }
+        true
+    }
+
+    /// The entries that may be removed, with their bytes, in the order they are removed: entries without turns
+    /// first, then conversations; within each, least recently updated first (then by principal, so that the order
+    /// does not depend on the hash map).
+    fn eviction_order(&self, evict: Evict, protected: impl Fn(&Principal) -> bool) -> Vec<(Principal, usize)> {
+        let mut candidates: Vec<(bool, u64, Principal, usize)> = self
+            .entries
+            .iter()
+            .filter(|(who, entry)| !protected(who) && (evict == Evict::Any || entry.turns.is_empty()))
+            .map(|(who, entry)| (!entry.turns.is_empty(), entry.updated_at, *who, entry.bytes()))
+            .collect();
+        candidates.sort_unstable_by_key(|&(has_turns, updated_at, who, _)| (has_turns, updated_at, who));
+        candidates.into_iter().map(|(_, _, who, size)| (who, size)).collect()
     }
 
     fn remove(&mut self, who: &Principal) {
@@ -217,6 +264,31 @@ impl Store {
             self.bytes -= entry.bytes();
             self.revision_floor = self.revision_floor.max(entry.revision + 1);
         }
+    }
+
+    /// Brings a store read from the state of 0.6.0, which had no limits, within this version's. Every conversation
+    /// loses its oldest turns until it has at most MAX_TURNS and counts at most MAX_CONVERSATION_BYTES (an exchange
+    /// too big on its own goes as well), and never starts with a reply. Then, while the store is over its byte or
+    /// entry limit, entries are removed in eviction order, which raises the floor as eviction does.
+    /// No revision changes: an exchange that was cut no longer replays, and its request is for a revision the
+    /// conversation has moved past, so it can never run again.
+    pub fn fit_to_limits(&mut self) -> Dropped {
+        let mut dropped = Dropped::default();
+        for entry in self.entries.values_mut() {
+            dropped.turns += cut(&mut entry.turns, MAX_CONVERSATION_BYTES);
+        }
+        self.bytes = self.entries.values().map(Entry::bytes).sum();
+        let StoreLimits { max_bytes, max_entries } = self.limits;
+        if self.bytes > max_bytes || self.entries.len() > max_entries {
+            for (who, _) in self.eviction_order(Evict::Any, |_| false) {
+                if self.bytes <= max_bytes && self.entries.len() <= max_entries {
+                    break;
+                }
+                self.remove(&who);
+                dropped.entries += 1;
+            }
+        }
+        dropped
     }
 
     #[cfg(test)]
@@ -227,9 +299,21 @@ impl Store {
 
 /// Keeps the newest `MAX_TURNS` turns, and never starts with a reply whose question is gone.
 pub fn trim(turns: &mut Vec<Turn>) {
-    let excess = turns.len().saturating_sub(MAX_TURNS);
-    let orphans = turns[excess..].iter().take_while(|t| t.role == Role::Assistant).count();
-    turns.drain(..excess + orphans);
+    cut(turns, usize::MAX);
+}
+
+/// Drops the oldest turns until at most `MAX_TURNS` are left and, with their entry, they count at most `max_bytes`;
+/// then any reply left first. Returns how many turns were dropped.
+fn cut(turns: &mut Vec<Turn>, max_bytes: usize) -> usize {
+    let mut bytes = ENTRY_OVERHEAD_BYTES + turns.iter().map(Turn::bytes).sum::<usize>();
+    let mut start = 0;
+    while start < turns.len() && (turns.len() - start > MAX_TURNS || bytes > max_bytes) {
+        bytes -= turns[start].bytes();
+        start += 1;
+    }
+    start += turns[start..].iter().take_while(|t| t.role == Role::Assistant).count();
+    turns.drain(..start);
+    start
 }
 
 #[cfg(test)]
@@ -326,7 +410,7 @@ mod tests {
         add(&mut store, 2, 0, 2);
         // A newcomer is checked against the floor (0), then room is made, which raises the floor...
         let revision = store.revision_of(&who(3));
-        assert!(store.make_room(0, true, |p| *p == who(3)));
+        assert!(store.make_room(0, true, Evict::Any, |p| *p == who(3)));
         assert_eq!(store.revision_floor(), 2);
         // ...but its own request still continues revision 0.
         store.pin(who(3), revision, 3);
@@ -345,11 +429,11 @@ mod tests {
             add(&mut store, 1, i, 10);
         }
         add(&mut store, 2, 0, 20);
-        assert_eq!(store.clear(who(3), 30), 1);
+        add(&mut store, 3, 0, 30);
         assert_eq!(store.revision_of(&who(1)), 5);
 
         // A fourth caller needs an entry: the least recently updated one goes (down to 90 % of 3 = 2 entries).
-        assert!(store.make_room(0, true, |p| *p == who(4)));
+        assert!(store.make_room(0, true, Evict::Any, |p| *p == who(4)));
         assert!(!store.contains(&who(1)));
         assert!(store.contains(&who(2)) && store.contains(&who(3)));
         // Whoever was removed, or never had an entry, is now past every removed revision,
@@ -362,7 +446,7 @@ mod tests {
         assert_eq!((store.revision_of(&who(2)), store.revision_of(&who(3))), (1, 1));
         // A clear, then removal, then an old base: still ahead.
         assert_eq!(store.clear(who(1), 40), 7);
-        assert!(store.make_room(0, true, |p| *p != who(1)));
+        assert!(store.make_room(0, true, Evict::Any, |p| *p != who(1)));
         assert!(!store.contains(&who(1)));
         assert_eq!(store.revision_of(&who(1)), 8);
     }
@@ -376,11 +460,11 @@ mod tests {
             add(&mut store, n, 0, n as u64);
         }
         assert_eq!(store.bytes(), 10 * one);
-        assert!(store.make_room(0, false, |_| false), "exactly full still fits");
+        assert!(store.make_room(0, false, Evict::Any, |_| false), "exactly full still fits");
         assert_eq!(store.entries(), 10);
 
         // One more exchange for caller 1 (the oldest entry, but protected as the caller) and caller 3 in flight.
-        assert!(store.make_room(exchange, false, |p| *p == who(1) || *p == who(3)));
+        assert!(store.make_room(exchange, false, Evict::Any, |p| *p == who(1) || *p == who(3)));
         // Freed down to 90 % of the budget minus what is about to be added: callers 2 and 4 went.
         assert!(store.contains(&who(1)) && store.contains(&who(3)));
         assert!(!store.contains(&who(2)) && !store.contains(&who(4)));
@@ -391,23 +475,111 @@ mod tests {
     }
 
     #[test]
-    fn making_room_ends_and_reports_failure_when_nothing_helps() {
-        // Only empty entries: each frees a little, and the loop ends when they run out.
+    fn making_room_reports_failure_without_removing_anything_when_nothing_would_help() {
+        // Removing every entry would not free enough: none is removed.
         let mut store = Store::with_limits(StoreLimits { max_bytes: 4 * ENTRY_OVERHEAD_BYTES, max_entries: 100 });
         for n in 1..=4u8 {
             store.clear(who(n), n as u64);
         }
-        assert!(!store.make_room(10 * ENTRY_OVERHEAD_BYTES, false, |_| false));
-        assert_eq!(store.entries(), 0);
+        assert!(!store.make_room(10 * ENTRY_OVERHEAD_BYTES, false, Evict::Any, |_| false));
+        assert_eq!((store.entries(), store.revision_floor()), (4, 0));
 
         // Everything protected: nothing is removed.
         let mut store = Store::with_limits(StoreLimits { max_bytes: usize::MAX, max_entries: 2 });
         add(&mut store, 1, 0, 0);
         add(&mut store, 2, 0, 0);
-        assert!(!store.make_room(0, true, |_| true));
+        assert!(!store.make_room(0, true, Evict::Any, |_| true));
         assert_eq!((store.entries(), store.revision_floor()), (2, 0));
         // An existing caller does not need a new entry.
-        assert!(store.make_room(0, false, |_| true));
+        assert!(store.make_room(0, false, Evict::Any, |_| true));
+    }
+
+    #[test]
+    fn a_caller_whose_own_conversation_is_over_the_budget_evicts_nobody() {
+        // As state from 0.6.0 could be before it was cut on loading: caller 1's conversation alone is over budget.
+        let mut store = Store::with_limits(StoreLimits { max_bytes: 10_000, max_entries: 100 });
+        store.append_exchange(who(1), "q".repeat(6_000), "a".repeat(6_000), "r".into(), 1);
+        for n in 2..=5u8 {
+            add(&mut store, n, 0, n as u64);
+        }
+        let before = store.entries();
+        assert!(!store.make_room(100, false, Evict::Any, |p| *p == who(1)));
+        assert_eq!((store.entries(), store.revision_floor()), (before, 0), "nobody was evicted for nothing");
+        assert_eq!(store.bytes(), store.recount());
+    }
+
+    #[test]
+    fn entries_without_turns_go_first_and_a_clear_never_removes_a_conversation() {
+        let mut store = Store::with_limits(StoreLimits { max_bytes: usize::MAX, max_entries: 6 });
+        // Old conversations, then newer entries without turns (cleared, or pinned for a chat that failed).
+        for n in 1..=3u8 {
+            add(&mut store, n, 0, n as u64);
+        }
+        store.clear(who(4), 10);
+        store.clear(who(5), 11);
+        store.pin(who(6), 0, 12);
+
+        // A newcomer that may only remove empty entries gets in, by removing the least recently updated empty one
+        // (90 % of 6 is 5 entries).
+        assert!(store.make_room(0, true, Evict::EmptyOnly, |p| *p == who(9)));
+        assert!(!store.contains(&who(4)));
+        assert!((1..=3).all(|n| store.contains(&who(n))) && store.contains(&who(5)) && store.contains(&who(6)));
+        // Even when everything may go, the empty entries go before any conversation, however recent.
+        store.clear(who(9), 20);
+        assert!(store.make_room(0, true, Evict::Any, |_| false));
+        assert!(!store.contains(&who(5)) && (1..=3).all(|n| store.contains(&who(n))));
+
+        // Only conversations left: a clear's room cannot be made, and nothing is removed trying...
+        let mut full = Store::with_limits(StoreLimits { max_bytes: usize::MAX, max_entries: 3 });
+        for n in 1..=3u8 {
+            add(&mut full, n, 0, n as u64);
+        }
+        assert!(!full.make_room(0, true, Evict::EmptyOnly, |_| false));
+        assert_eq!((full.entries(), full.revision_floor()), (3, 0));
+        // ...while a send may evict the least recently used conversation.
+        assert!(full.make_room(0, true, Evict::Any, |_| false));
+        assert!(!full.contains(&who(1)) && full.contains(&who(2)) && full.contains(&who(3)));
+        assert_eq!(full.bytes(), full.recount());
+    }
+
+    #[test]
+    fn state_from_before_the_limits_is_cut_to_them() {
+        let user_turn = |i: usize, text: &str| Turn {
+            role: Role::User,
+            content: text.into(),
+            request_id: Some(format!("r{i:02}")),
+        };
+        let reply = |text: &str| Turn { role: Role::Assistant, content: text.into(), request_id: None };
+        let entry = |turns: Vec<Turn>, revision: u64| Entry { turns, revision, created_at: 0, updated_at: revision };
+        let mut entries = HashMap::new();
+        // 20 exchanges of 2 × 30 000 bytes (0.6.0 had no message limit): only the newest that fit stay.
+        let big = "x".repeat(30_000);
+        entries.insert(who(1), entry((0..20).flat_map(|i| [user_turn(i, &big), reply(&big)]).collect(), 20));
+        // 30 short exchanges: only the newest MAX_TURNS turns stay.
+        entries.insert(who(2), entry((0..30).flat_map(|i| [user_turn(i, "q"), reply("a")]).collect(), 30));
+        // One exchange bigger than a whole conversation may be: it goes, the revision stays.
+        entries.insert(who(3), entry(vec![user_turn(0, "q"), reply(&"y".repeat(MAX_CONVERSATION_BYTES))], 1));
+        let mut store = Store::from_parts(entries, 0);
+
+        let dropped = store.fit_to_limits();
+        let exchange = 2 * TURN_OVERHEAD_BYTES + 2 * 30_000 + "r00".len();
+        let kept = (MAX_CONVERSATION_BYTES - ENTRY_OVERHEAD_BYTES) / exchange;
+        assert_eq!(store.turns(&who(1)).len(), 2 * kept);
+        assert_eq!(store.saved_exchange(&who(1), "r19").map(|(_, a)| a.len()), Some(30_000));
+        assert!(store.saved_exchange(&who(1), &format!("r{:02}", 20 - kept)).is_some());
+        assert_eq!(store.saved_exchange(&who(1), &format!("r{:02}", 19 - kept)), None);
+        assert_eq!(store.turns(&who(2)).len(), MAX_TURNS);
+        assert_eq!(store.turns(&who(2))[0].request_id.as_deref(), Some("r05"));
+        assert!(store.turns(&who(3)).is_empty());
+        assert_eq!((store.revision_of(&who(1)), store.revision_of(&who(2)), store.revision_of(&who(3))), (20, 30, 1));
+        assert_eq!(dropped, Dropped { turns: 40 - 2 * kept + 10 + 2, entries: 0 });
+        for (_, entry) in store.iter() {
+            assert!(entry.bytes() <= MAX_CONVERSATION_BYTES && entry.turns.len() <= MAX_TURNS);
+            assert_ne!(entry.turns.first().map(|t| t.role), Some(Role::Assistant));
+        }
+        assert_eq!(store.bytes(), store.recount());
+        // Nothing more to do the second time.
+        assert_eq!(store.fit_to_limits(), Dropped::default());
     }
 
     #[test]
@@ -426,7 +598,14 @@ mod tests {
                 }
                 1 => {
                     let new_entry = !store.contains(&caller);
-                    store.make_room(next(3_000) as usize, new_entry, |p| *p == caller);
+                    let evict = if next(2) == 0 { Evict::Any } else { Evict::EmptyOnly };
+                    let (entries, conversations) = (store.entries(), store.conversations());
+                    if !store.make_room(next(3_000) as usize, new_entry, evict, |p| *p == caller) {
+                        assert_eq!(store.entries(), entries, "a failed attempt removes nothing (step {step})");
+                    }
+                    if evict == Evict::EmptyOnly {
+                        assert_eq!(store.conversations(), conversations, "after step {step}");
+                    }
                 }
                 2 => store.pin(caller, store.revision_of(&caller), step),
                 _ => {

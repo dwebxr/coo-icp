@@ -36,8 +36,10 @@ pub enum ChatError {
     Busy,
     /// This request id is already being answered; poll `get_message_status`.
     InProgress,
-    /// The conversation changed since the client's revision. Nothing was run, and this request never will be;
-    /// reload and send again.
+    /// The base revision is not the conversation's: nothing was run; reload and send again. For a revision the
+    /// canister handed out (in a reply, a conversation or a clear) this is for good: the conversation has moved
+    /// past it, and a request for it never runs. A revision the conversation has not reached yet is refused now,
+    /// but not for ever: the same request would run if the conversation got there.
     Conflict,
     /// The conversation was cleared while the reply was generated.
     Cleared,
@@ -56,7 +58,8 @@ pub enum MessageStatus {
     Done(Sent),
 }
 
-/// Who Coo is. All of it goes into the system message of every model request.
+/// Who Coo is. All of it — name, system prompt, bio and style — makes the system message of every model request,
+/// which may be at most 3 000 bytes as a whole (`update_character` refuses a longer one).
 #[derive(CandidType, Deserialize, Serialize, Clone, Debug, PartialEq, Eq)]
 pub struct Character {
     pub name: String,

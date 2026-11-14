@@ -15,6 +15,10 @@ pub const MAX_SYSTEM_PROMPT_BYTES: usize = 2_000;
 pub const MAX_CHARACTER_LINES: usize = 8;
 pub const MAX_BIO_LINE_BYTES: usize = 200;
 pub const MAX_STYLE_LINE_BYTES: usize = 100;
+/// The system message of a model request: name, system prompt, bio and style together, as `llm::system_text`
+/// composes them. Each field may be at its own limit only as long as the whole fits; `update_character` refuses a
+/// character that does not, so none of it is cut from the prompt.
+pub const MAX_SYSTEM_MESSAGE_BYTES: usize = 3_000;
 
 /// What an entry and a turn are counted as on top of their text, generously above their encoded size.
 pub const ENTRY_OVERHEAD_BYTES: usize = 96;
@@ -53,16 +57,22 @@ pub const MAX_MODEL_CALLS_PER_MINUTE: usize = 5;
 /// Eviction frees down to this share of the limit that was hit, so it runs once per tenth of the budget.
 pub const EVICTION_TARGET_PERCENT: usize = 90;
 
-// Making room can always succeed: the entries that may not be removed (the caller's and those with a chat in
-// flight) plus what the chats in flight may add fit below the eviction target.
+// Making room for a chat can always succeed: the entries that may not be removed (the caller's and those with a chat
+// in flight) plus what the chats in flight may add fit below the eviction target. This holds for conversations of
+// at most MAX_CONVERSATION_BYTES, which this version writes and to which state from 0.6.0 is cut when it is loaded.
 const _: () = assert!(
     (MAX_CONCURRENT_CHATS + 1) * MAX_CONVERSATION_BYTES + (MAX_CONCURRENT_CHATS + 1) * MAX_EXCHANGE_BYTES
         < MAX_STORE_BYTES / 100 * EVICTION_TARGET_PERCENT
 );
 const _: () = assert!(MAX_CONCURRENT_CHATS + 1 < MAX_ENTRIES * EVICTION_TARGET_PERCENT / 100);
 
-/// The saved state (one candid blob in stable memory) is refused above this. The store budget keeps it far below.
-pub const MAX_STATE_BYTES: usize = 64 * 1024 * 1024;
+/// The saved state (one candid blob in stable memory) is refused above this when it is WRITTEN (in `pre_upgrade`).
+/// The store budget keeps it far below.
+pub const MAX_WRITTEN_STATE_BYTES: usize = 64 * 1024 * 1024;
+/// ...and above this when it is READ (in `post_upgrade`): the limit of 0.6.0, which wrote its state without a budget
+/// and read back up to this much itself. Anything it could upgrade from is read, then cut to this version's limits.
+pub const MAX_READ_STATE_BYTES: usize = 100_000_000;
+const _: () = assert!(MAX_WRITTEN_STATE_BYTES <= MAX_READ_STATE_BYTES);
 
 /// The model is given at most this long (the longest bounded-wait call the IC offers).
 pub const MODEL_CALL_TIMEOUT_SECS: u32 = 300;
@@ -73,10 +83,31 @@ const _: () = assert!(STALE_FLIGHT_NS >= MODEL_CALL_TIMEOUT_SECS as u64 * 1_000_
 
 pub const RATE_WINDOW_NS: u64 = 60 * 1_000_000_000;
 
-/// Largest candid argument accepted at ingress for each kind of method (see `inspect_message`).
-pub const MAX_SEND_ARG_BYTES: usize = 8 * 1024;
+/// Largest candid argument accepted at ingress for each kind of method (see `accepts_ingress`).
+/// `send_message`'s is about four times what a valid new message needs, because a request saved by 0.6.0 (which had
+/// no length limit) replays only through `send_message`, with its message as saved. A message saved before the
+/// upgrade that is longer than this (with its request id) cannot be replayed through `send_message` any more;
+/// `get_message_status` still reports it.
+pub const MAX_SEND_ARG_BYTES: usize = 16 * 1024;
 pub const MAX_ADMIN_ARG_BYTES: usize = 16 * 1024;
 pub const MAX_SMALL_ARG_BYTES: usize = 256;
+
+/// Whether `inspect_message` lets an ingress call through: first who may call the method at all, then how big its
+/// argument may be. `arg_bytes` is only asked once caller and method pass, so a call refused for either is not
+/// copied to find its size.
+pub fn accepts_ingress(method: &str, signed_in: bool, controller: bool, arg_bytes: impl FnOnce() -> usize) -> bool {
+    let max_bytes = match method {
+        "send_message" if signed_in => MAX_SEND_ARG_BYTES,
+        // Also the queries a client may want answered by the whole subnet rather than one replica.
+        "clear_conversation" | "get_conversation" | "get_message_status" if signed_in => MAX_SMALL_ARG_BYTES,
+        "update_character" | "set_llm_provider" if controller => MAX_ADMIN_ARG_BYTES,
+        #[cfg(feature = "test-hooks")]
+        "test_fill" if controller => return true,
+        // Everything else is a query (call it as one), a method that does not exist, or a caller who may not.
+        _ => return false,
+    };
+    arg_bytes() <= max_bytes
+}
 
 pub fn validate_request_id(request_id: &str) -> Result<(), ChatError> {
     let valid = !request_id.is_empty()
@@ -131,6 +162,13 @@ pub fn validate_character(character: &Character) -> Result<(), String> {
         for line in lines {
             check_text(&format!("a {what} line"), line, max_bytes, false)?;
         }
+    }
+    let system = crate::llm::whole_system_text(character).len();
+    if system > MAX_SYSTEM_MESSAGE_BYTES {
+        return Err(format!(
+            "name, system_prompt, bio and style together make a system message that is too long ({system} bytes; \
+             the limit is {MAX_SYSTEM_MESSAGE_BYTES})"
+        ));
     }
     Ok(())
 }
@@ -204,6 +242,66 @@ mod tests {
             let mut c = character();
             edit(&mut c);
             assert!(validate_character(&c).is_err(), "{what}");
+        }
+    }
+
+    #[test]
+    fn a_character_must_fit_the_system_message_as_a_whole() {
+        // Every field at its own limit: each is accepted alone, together they are refused.
+        let largest = Character {
+            name: "n".repeat(MAX_CHARACTER_NAME_BYTES),
+            system_prompt: "p".repeat(MAX_SYSTEM_PROMPT_BYTES),
+            bio: vec!["b".repeat(MAX_BIO_LINE_BYTES); MAX_CHARACTER_LINES],
+            style: vec!["s".repeat(MAX_STYLE_LINE_BYTES); MAX_CHARACTER_LINES],
+        };
+        let refused = validate_character(&largest).unwrap_err();
+        assert!(refused.contains("together make a system message that is too long"), "{refused}");
+
+        // A character whose system message is exactly the limit is accepted, and all of it reaches the model.
+        let mut fits = Character {
+            name: "Coo".into(),
+            system_prompt: "p".into(),
+            bio: vec!["b".repeat(MAX_BIO_LINE_BYTES); 4],
+            style: vec!["s".repeat(MAX_STYLE_LINE_BYTES - 1) + "!"; 4],
+        };
+        let rest = crate::llm::whole_system_text(&fits).len() - 1;
+        fits.system_prompt = "p".repeat(MAX_SYSTEM_MESSAGE_BYTES - rest);
+        assert!(fits.system_prompt.len() <= MAX_SYSTEM_PROMPT_BYTES);
+        assert_eq!(crate::llm::whole_system_text(&fits).len(), MAX_SYSTEM_MESSAGE_BYTES);
+        assert_eq!(validate_character(&fits), Ok(()));
+        let sent = crate::llm::system_text(&fits);
+        assert_eq!(sent, crate::llm::whole_system_text(&fits), "nothing is cut");
+        assert!(sent.ends_with(&fits.style[3]) && sent.contains("Your name is Coo"));
+        // One byte more is refused.
+        fits.system_prompt.push('p');
+        assert!(validate_character(&fits).is_err());
+    }
+
+    #[test]
+    fn ingress_is_decided_on_caller_and_method_before_the_argument_is_read() {
+        let unread = || -> usize { panic!("the argument was read for a call refused anyway") };
+        // (method, signed in, controller): refused whatever the argument.
+        for (method, signed_in, controller) in [
+            ("send_message", false, false),
+            ("clear_conversation", false, false),
+            ("get_conversation", false, false),
+            ("update_character", true, false),
+            ("set_llm_provider", true, false),
+            ("health", true, true),
+            ("get_metrics", true, true),
+            ("chat", true, true),
+            ("test_fill", true, false),
+        ] {
+            assert!(!accepts_ingress(method, signed_in, controller, unread), "{method}");
+        }
+        // Then the size, for the calls that may pass.
+        for (method, signed_in, controller, max) in [
+            ("send_message", true, false, MAX_SEND_ARG_BYTES),
+            ("get_message_status", true, false, MAX_SMALL_ARG_BYTES),
+            ("update_character", true, true, MAX_ADMIN_ARG_BYTES),
+        ] {
+            assert!(accepts_ingress(method, signed_in, controller, || max), "{method}");
+            assert!(!accepts_ingress(method, signed_in, controller, || max + 1), "{method}");
         }
     }
 

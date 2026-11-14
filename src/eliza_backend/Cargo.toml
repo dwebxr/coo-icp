@@ -23,8 +23,8 @@ ic-management-canister-types = "0.3"
 [features]
 default = []
 # Test only, never deployed (make test-canister builds these variants):
-# test-hooks: a controller-only method that fills the store, and send_message traps after the model replied when the
-# message is "trap after reply".
+# test-hooks: a controller-only method that fills the store; send_message logs the instructions it took up to the
+# model call, and traps after the model replied when the message is "trap after reply".
 test-hooks = []
 # small-limits: tiny storage, concurrency and rate limits, so tests can reach them.
 small-limits = []

@@ -49,8 +49,10 @@ fn pre_upgrade() {
     }
     ic_cdk::stable::stable_write(0, &(payload.len() as u64).to_le_bytes());
     ic_cdk::stable::stable_write(LENGTH_PREFIX_BYTES as u64, &payload);
-    // The same count as post_upgrade logs, so the two can be compared.
-    ic_cdk::println!("pre_upgrade: {} bytes serialized to stable memory", payload.len());
+    // The same count as post_upgrade logs, so the two can be compared. Then what saving cost: the Wasm memory
+    // (which only grows, so saving needed at most this much) and the instructions so far. The canister's Wasm
+    // memory limit does not apply to pre_upgrade, so this line is the only place to see how close it came.
+    ic_cdk::println!("pre_upgrade: {} bytes serialized to stable memory; {}", payload.len(), cost_so_far());
 }
 
 // A saved state that cannot be read traps instead of starting empty: the upgrade is rolled back and no
@@ -75,11 +77,26 @@ fn post_upgrade() {
     drop(payload);
 
     ic_cdk::println!("Restoring state (schema version {})", loaded.version);
+    if let Some(dropped) = loaded.dropped {
+        ic_cdk::println!(
+            "Brought the state of schema version {} within this version's limits: {} turns and {} entries dropped",
+            loaded.version,
+            dropped.turns,
+            dropped.entries
+        );
+    }
     let (entries, bytes, provider) = (loaded.state.store.entries(), loaded.state.store.bytes(), loaded.state.provider);
     state::replace(loaded.state);
     ic_cdk::println!(
-        "State restored from stable memory successfully ({len} bytes; {entries} entries, {bytes} bytes counted, provider {provider:?})"
+        "State restored from stable memory successfully ({len} bytes; {entries} entries, {bytes} bytes counted, provider {provider:?}; {})",
+        cost_so_far()
     );
+}
+
+/// "wasm memory <bytes> bytes, instructions <count>": the Wasm memory size and the instructions executed in the
+/// current message so far, for the upgrade hooks' log lines.
+fn cost_so_far() -> String {
+    format!("wasm memory {} bytes, instructions {}", wasm_memory_bytes(), ic_cdk::api::instruction_counter())
 }
 
 /// Runs on one replica before an ingress update call is accepted, and costs the canister nothing when it refuses.
@@ -88,25 +105,14 @@ fn post_upgrade() {
 /// decides. Every method checks its caller and its input again.
 #[inspect_message]
 fn inspect_message() {
-    use limits::{MAX_ADMIN_ARG_BYTES, MAX_SEND_ARG_BYTES, MAX_SMALL_ARG_BYTES};
-
     let caller = msg_caller();
-    let signed_in = caller != Principal::anonymous();
-    let arg_bytes = ic_cdk::api::msg_arg_data().len();
-    let accept = match ic_cdk::api::msg_method_name().as_str() {
-        "send_message" => signed_in && arg_bytes <= MAX_SEND_ARG_BYTES,
-        // Also the queries a client may want answered by the whole subnet rather than one replica.
-        "clear_conversation" | "get_conversation" | "get_message_status" => {
-            signed_in && arg_bytes <= MAX_SMALL_ARG_BYTES
-        }
-        "update_character" | "set_llm_provider" => {
-            ic_cdk::api::is_controller(&caller) && arg_bytes <= MAX_ADMIN_ARG_BYTES
-        }
-        #[cfg(feature = "test-hooks")]
-        "test_fill" => ic_cdk::api::is_controller(&caller),
-        // Everything else is a query; call it as one.
-        _ => false,
-    };
+    let accept = limits::accepts_ingress(
+        &ic_cdk::api::msg_method_name(),
+        caller != Principal::anonymous(),
+        ic_cdk::api::is_controller(&caller),
+        // ic-cdk only offers the argument as a copy; it is made for calls that caller and method let through.
+        || ic_cdk::api::msg_arg_data().len(),
+    );
     if accept {
         ic_cdk::api::accept_message();
     } else {
@@ -117,7 +123,8 @@ fn inspect_message() {
 // ========== Chat ==========
 
 /// Sends a message as the next exchange after `base_revision`. A (request id, base revision) pair is saved at most
-/// once: repeating it returns the saved reply, and a stale revision is a Conflict.
+/// once: repeating it returns the saved reply. A base revision other than the conversation's is a Conflict, for
+/// good once the conversation has moved past it (see `ChatError::Conflict`).
 #[update]
 async fn send_message(request_id: String, base_revision: u64, content: String) -> Result<Sent, ChatError> {
     chat::send_message(request_id, base_revision, content).await
@@ -135,8 +142,10 @@ fn get_message_status(request_id: String) -> MessageStatus {
 }
 
 /// Empties the caller's conversation and cancels saving a reply that is still being generated. The conversation
-/// gets the next revision (even if there was none yet), so no request sent before the clear can run afterwards.
-/// Returns the new revision.
+/// gets the next revision (even if there was none yet), so no request for a revision handed out before the clear
+/// can run afterwards. Returns the new revision. Traps when the canister keeps nothing for the caller yet (not even
+/// a cleared conversation) and has no room: a clear only takes the place of conversations with nothing in them,
+/// never of anyone's saved exchanges.
 #[update]
 fn clear_conversation() -> u64 {
     let caller = msg_caller();
@@ -230,8 +239,9 @@ fn wasm_memory_bytes() -> u64 {
 
 // ========== Test hooks (feature `test-hooks`; never part of a deployed build) ==========
 
-/// Fills the store with `callers` conversations of `exchanges` exchanges of `bytes`-byte texts, past any limit,
-/// so tests can upgrade a full canister. Returns the bytes counted afterwards.
+/// Fills the store with `callers` conversations of `exchanges` exchanges of `bytes`-byte texts (with no exchanges:
+/// entries without turns, as a clear leaves them), past any limit, so tests can upgrade a full canister. Returns the
+/// bytes counted afterwards.
 #[cfg(feature = "test-hooks")]
 #[update]
 fn test_fill(callers: u32, exchanges: u32, bytes: u32) -> u64 {
@@ -242,6 +252,9 @@ fn test_fill(callers: u32, exchanges: u32, bytes: u32) -> u64 {
             let mut id = [0xfeu8; 29];
             id[..4].copy_from_slice(&c.to_be_bytes());
             let caller = Principal::from_slice(&id);
+            if exchanges == 0 {
+                s.store.clear(caller, now);
+            }
             for e in 0..exchanges {
                 let text = "x".repeat(bytes as usize);
                 s.store.append_exchange(caller, text.clone(), text, format!("fill-{e}"), now);
