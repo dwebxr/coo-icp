@@ -1,6 +1,11 @@
 # Rust build artifacts
 /target/
 **/*.rs.bk
+# Editor/script backup copies of sources (28 of these were once committed by mistake)
+*.bak
+*.bak[0-9]*
+*.perlbak
+src/eliza_backend/src/lib.rs.*
 
 # Node.js dependencies
 node_modules/
@@ -38,9 +43,11 @@ src/eliza_frontend/dist/
 # Test coverage
 coverage/
 
-# Generated declarations (can be regenerated with dfx generate)
-# Uncomment if you prefer to regenerate on each build:
-# src/eliza_frontend/src/declarations/
+# `dfx generate` default output; the frontend keeps its bindings in src/eliza_frontend/src/declarations/
+/src/declarations/
+
+# Local agent/tool settings
+.claude/
 
 # Secrets (NEVER commit these)
 *.pem
