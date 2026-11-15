@@ -59,7 +59,15 @@ const button = page.getByRole('button', { name: /sign in with/i });
 
 check(problems.length === 0, `the page loads without errors or policy violations${problems.length ? `: ${problems[0]}` : ''}`);
 check((await button.evaluate((el) => getComputedStyle(el).borderRadius)) !== '0px', 'the stylesheet is applied');
-check(await page.locator('img').first().evaluate((el) => el.complete && el.naturalWidth > 0), 'images load');
+// Over a real network the image is still on its way when the sign-in screen appears: wait for it.
+check(
+  await page
+    .waitForFunction(() => document.images.length > 0 && [...document.images].every((i) => i.complete && i.naturalWidth > 0), null, {
+      timeout: 20000,
+    })
+    .then(() => true, () => false),
+  'images load',
+);
 
 // Tries to connect to `target` and tells "blocked by the policy" (the browser reports a violation for it) from "the
 // network failed" (no violation, the request just did not succeed): a failed fetch alone says neither.
