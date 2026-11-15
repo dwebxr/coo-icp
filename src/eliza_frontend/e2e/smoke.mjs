@@ -38,8 +38,8 @@ async function open(p, q) {
 const userBubbles = (p) => p.locator('.msg-user .bubble').count();
 const stats = (p) => p.evaluate(() => window.__mock);
 const replies = (p) => p.locator('.msg-assistant:not(.thinking)').count();
-// Confirms the clear dialog and waits until the clear call has gone out: the app first marks the conversation
-// unconfirmed (an awaited Web Lock), and a test that then moves the installed clock on must not get ahead of the call.
+// Confirms the clear dialog and waits until the clear call has reached the mock: a test that then moves the installed
+// clock on must not get ahead of the call (the click returns before the app has handled it).
 async function confirmClear(p) {
   const before = (await stats(p)).clears;
   await p.locator('dialog').getByRole('button', { name: 'Clear' }).click();
@@ -513,8 +513,16 @@ await test('Clear failure is shown inside the dialog', async (p) => {
   await p.getByRole('button', { name: 'Clear', exact: true }).click();
   await p.waitForSelector('dialog[open] .dialog-error');
   expect((await userBubbles(p)) > 0, 'messages kept');
-  // The canister refused it: certainly not run, so nothing is loaded again.
-  expect((await stats(p)).historyReads === reads, 'no reload after a definite refusal');
+  // The canister refused it: not run. The floor was raised before the call, so the conversation is read through
+  // consensus once, which puts the floor back at the canister's revision (in a new epoch).
+  expect((await stats(p)).historyReads === reads + 1, 'one read through consensus after the refusal');
+  const floor = await p.evaluate(() =>
+    localStorage.getItem(Object.keys(localStorage).find((name) => name.startsWith('coo:floor:'))),
+  );
+  expect(floor === '1:0', `the floor is back at the canister's revision (${floor})`);
+  await p.locator('dialog').getByRole('button', { name: 'Cancel' }).click();
+  await p.locator('textarea').fill('still here');
+  expect(!(await p.locator('.send-btn').isDisabled()), 'and sending works');
 });
 
 // Review round 2, I4: an error in transit says nothing about whether the clear ran; the conversation tells.
@@ -565,8 +573,9 @@ await test('A clear from an earlier session whose answer is lost still brings th
   expect(!(await p.locator('.send-btn').isDisabled()), 'sending is possible again');
 });
 
-// Review round 4, Important 1: the session ends while the unconfirmed clear is being confirmed.
-await test('An unconfirmed clear is confirmed through consensus in the next session too', async (p) => {
+// Review round 4, Important 1: the session ends while a clear whose answer was lost is being confirmed. (Since
+// round 5 the floor, raised before the clear was sent, is what keeps the old conversation off the screen.)
+await test('A clear whose answer was lost is confirmed through consensus in the next session too', async (p) => {
   // The clear runs, its answer is lost; queries return the conversation from before it; consensus takes 6 s.
   await open(p, '?mock=clearlost&stale=3&certified=6000');
   await p.getByRole('button', { name: 'Account' }).click();
@@ -586,7 +595,7 @@ await test('An unconfirmed clear is confirmed through consensus in the next sess
   await p.waitForSelector('.empty');
 });
 
-// Review round 4, Important 2: the read that should confirm the clear fails too; later, Retry.
+// Review round 4, Important 2: the read that should confirm the clear fails too; later, Retry (round 5: the floor).
 await test('A clear that could not be confirmed says so, and Retry reads through consensus', async (p) => {
   await open(p, '?mock=clearlost&stale=3&certifiedfail=1');
   await p.getByRole('button', { name: 'Account' }).click();
@@ -600,6 +609,40 @@ await test('A clear that could not be confirmed says so, and Retry reads through
   await p.waitForSelector('.thread[aria-busy="false"]', { timeout: 8000 });
   expect((await userBubbles(p)) === 0, 'the conversation from before the clear is not shown');
   await p.waitForSelector('.empty');
+});
+
+// Review round 5, Important 2: tab A's clear ran, its answer was lost and A was closed; tab B still shows the
+// conversation from before it. (The scenario plays tab A: on B's first send, the canister has been cleared, and the
+// floor A raised before sending is in storage.)
+await test("Another tab's lost clear does not block this tab: a send meets a Conflict, and the thread catches up", async (p) => {
+  await open(p, '?mock=otherclear&delay=200');
+  expect((await userBubbles(p)) > 0, 'this tab shows the conversation from before the clear');
+  await p.locator('textarea').fill('hello');
+  await p.keyboard.press('Enter');
+  await p.waitForSelector('.msg-failed');
+  // The conversation the canister holds now is shown: only this tab's message, which was not sent.
+  expect((await userBubbles(p)) === 1, 'the cleared conversation is shown');
+  expect((await p.locator('.msg-failed').innerText()).includes('changed'), 'not sent: the conversation changed');
+  // And the next attempt goes through, without a reload.
+  const before = await replies(p);
+  await p.getByRole('button', { name: 'Retry' }).click();
+  await p.waitForFunction((n) => document.querySelectorAll('.msg-assistant:not(.thinking)').length === n + 1, before);
+  expect((await p.locator('.msg-failed').count()) === 0, 'sent');
+});
+
+// Review round 4/5, Nit 1: the hook shows the empty thread only while the floor is where the clear left it. Here
+// another tab's reply is confirmed (and its floor stored) after the clear ran and before its answer arrives.
+await test('A clear overtaken by another tab before its answer arrives shows what the canister holds, not an empty thread', async (p) => {
+  await open(p, '?mock=clearovertaken');
+  const reads = (await stats(p)).historyReads;
+  await p.getByRole('button', { name: 'Account' }).click();
+  await p.getByRole('menuitem', { name: /clear/i }).click();
+  await p.getByRole('button', { name: 'Clear', exact: true }).click();
+  await p.waitForSelector('dialog[open]', { state: 'detached', timeout: 8000 });
+  await p.waitForSelector('.thread[aria-busy="false"]');
+  expect((await stats(p)).historyReads > reads, 'the conversation was loaded through consensus');
+  expect((await userBubbles(p)) === 1, `the other tab's message is shown (${await userBubbles(p)} messages)`);
+  expect((await p.locator('.msg-user .bubble').first().innerText()) === 'Sent from another tab', 'it is that message');
 });
 
 await test('A clear lost before it ran is reported as failed, after the conversation was checked', async (p) => {
@@ -840,13 +883,15 @@ await test('A late refusal replaces "no answer yet" in the dialog with the failu
 // Review round 2, I3: the first read after that late clear comes from a replica that is behind.
 await test('After a late clear from an earlier session, a stale read is not the end of it: nothing is sent until the thread matches', async (p) => {
   await p.clock.install();
-  // Queries return the conversation from before the clear three times; a read through consensus takes 4 s.
-  await p.goto(`${BASE}/?mock=chat&clear=40000&stale=3&certified=4000`);
+  // The clear lands 60 s after it is sent; queries return the conversation from before it three times; a read
+  // through consensus takes 4 s.
+  await p.goto(`${BASE}/?mock=chat&clear=60000&stale=3&certified=4000`);
   await p.clock.runFor(1500);
   await p.waitForSelector('.thread[aria-busy="false"]');
   await p.getByRole('button', { name: 'Account' }).click();
   await p.getByRole('menuitem', { name: /clear/i }).click();
   await confirmClear(p);
+  const lands = (await p.evaluate(() => Date.now())) + 60_000;
   await p.clock.runFor(31_000);
   await p.waitForSelector('.dialog-note');
   await p.locator('dialog').getByRole('button', { name: 'Close' }).click();
@@ -855,10 +900,11 @@ await test('After a late clear from an earlier session, a stale read is not the 
   await p.clock.runFor(500);
   await p.getByRole('button', { name: /sign in/i }).click();
   await p.clock.runFor(2000);
-  await p.waitForSelector('.thread[aria-busy="false"]');
-  // The clear answers at about 41.5 s (the installed clock also runs on while the test clicks, so a little later);
-  // the thread is then loaded again, which takes 4 s.
-  await p.clock.runFor(6_700);
+  // (The floor was raised before the clear was sent, and the clear has not run yet: this load reads through
+  // consensus and puts the floor back. It takes a few seconds.)
+  await p.waitForSelector('.thread[aria-busy="false"]', { timeout: 20000 });
+  // Just after the clear lands, the thread is being loaded again (4 s), and nothing can be sent.
+  await p.clock.runFor(Math.max(lands - (await p.evaluate(() => Date.now())), 0) + 300);
   await p.locator('textarea').fill('too early');
   expect(await p.locator('.send-btn').isDisabled(), 'nothing can be sent while the thread may be stale');
   await p.clock.runFor(8_000);

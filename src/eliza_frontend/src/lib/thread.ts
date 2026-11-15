@@ -62,3 +62,17 @@ export function reconcile(prev: ChatMessage[], raw: Message[], activeId?: string
   );
   return [...merged, ...unsaved];
 }
+
+/**
+ * What a clear whose answer was lost came to, judged by the conversation loaded through consensus afterwards (null:
+ * none could be loaded). Empty, at a revision after the one the clear was made from: the conversation is cleared now
+ * — by this clear or by something else — which is what was asked for. Not empty: it is not cleared. Nothing loaded:
+ * not known yet.
+ */
+export function judgeLostClear(
+  loaded: { messages: unknown[]; revision: number } | null,
+  startRevision: number,
+): 'cleared' | 'failed' | 'unconfirmed' {
+  if (!loaded) return 'unconfirmed';
+  return loaded.messages.length === 0 && loaded.revision > startRevision ? 'cleared' : 'failed';
+}

@@ -17,7 +17,6 @@ function storage() {
       if (store.failing) throw new Error('QuotaExceededError');
       data.set(key, value);
     },
-    removeItem: (key: string) => data.delete(key),
     data,
   };
   return store;
@@ -413,57 +412,55 @@ describe('what to show after a clear', () => {
   });
 });
 
-// Review round 4, Important 1 and 2: "this conversation's clear is unconfirmed" outlives the call that noticed it.
-describe('the unconfirmed mark', () => {
-  const MARK = 'coo:unconfirmed:canister:alice';
-
-  it('is set (and stored) before the clear is sent, and only its own removal takes it away', async () => {
-    expect(floors.unconfirmedMark(ALICE)).toBeNull();
-    const first = await floors.markUnconfirmed(ALICE);
-    expect(store.data.get(MARK)).toBe(first);
-    expect(floors.unconfirmedMark(ALICE)).toBe(first);
-    // A second clear marks it again; confirming the first one's mark does not remove the newer one.
-    const second = await floors.markUnconfirmed(ALICE);
-    await floors.confirmMark(ALICE, first);
-    expect(floors.unconfirmedMark(ALICE)).toBe(second);
-    await floors.confirmMark(ALICE, second);
-    expect(floors.unconfirmedMark(ALICE)).toBeNull();
-    expect(store.data.has(MARK)).toBe(false);
-    // Per owner: Bob's conversation is not Alice's.
-    await floors.markUnconfirmed('canister:bob');
-    expect(floors.unconfirmedMark(ALICE)).toBeNull();
+// Review round 5: a clear raises the floor before it is sent; the floor is all there is to remember about it.
+describe('the floor raised before a clear', () => {
+  it('goes one past the revision shown (or the floor, if that is higher), and is the snapshot for the answer', () => {
+    floors.raiseFloorByUpdate(ALICE, 10);
+    expect(floors.raiseBeforeClear(ALICE, 10)).toEqual({ epoch: 0, revision: 11 });
+    expect(store.data.get(KEY)).toBe('0:11');
+    expect(floors.raiseBeforeClear('canister:bob', 4)).toEqual({ epoch: 0, revision: 5 });
   });
 
-  it("is seen in another tab's mark through storage (and after a reload)", () => {
-    store.data.set(MARK, 'set-by-another-tab');
-    expect(floors.unconfirmedMark(ALICE)).toBe('set-by-another-tab');
-  });
-
-  it('stays in memory when it cannot be stored', async () => {
-    store.failing = true;
-    const mark = await floors.markUnconfirmed(ALICE);
-    expect(store.data.has(MARK)).toBe(false);
-    expect(floors.unconfirmedMark(ALICE)).toBe(mark);
-    await floors.confirmMark(ALICE, mark);
-    expect(floors.unconfirmedMark(ALICE)).toBeNull();
-  });
-
-  it('is set and removed under a lock, so a removal that waited cannot take away a newer mark', async () => {
-    const queue: (() => void)[] = [];
-    vi.stubGlobal('navigator', {
-      locks: {
-        request: (_name: string, run: () => void) =>
-          new Promise<void>((resolve) => queue.push(() => (run(), resolve()))),
-      },
-    });
+  it("keeps every answer from before the clear off the screen, whoever asks: a load's and a re-sync's checks", async () => {
+    floors.raiseFloorByUpdate(ALICE, 10);
+    const queryStarted = floors.readFloor(ALICE);
+    floors.raiseBeforeClear(ALICE, 10);
+    // A query that answers 10 (from before the clear): below the floor (the check a load makes first) …
+    expect(10 >= floors.floorOf(ALICE)).toBe(false);
+    // … not current (the check before anything is shown, in a load and in a re-sync) …
+    expect(floors.isCurrent(ALICE, 10, queryStarted.epoch)).toBe(false);
+    // … and it does not lower anything.
+    floors.raiseFloorByQuery(ALICE, 10, queryStarted.epoch);
+    expect(floors.readFloor(ALICE)).toEqual({ epoch: 0, revision: 11 });
+    // Another tab, or this one after a reload, finds the same floor in storage.
     vi.resetModules();
-    floors = await import('./floors');
-    store.data.set(MARK, 'old');
-    const removal = floors.confirmMark(ALICE, 'old'); // waits for the lock …
-    const marking = floors.markUnconfirmed(ALICE); // … and so does a new clear's mark, after it
-    for (const run of queue) run();
-    await removal;
-    const fresh = await marking;
-    expect(floors.unconfirmedMark(ALICE)).toBe(fresh);
+    const otherTab = await import('./floors');
+    expect(otherTab.floorOf(ALICE)).toBe(11);
+  });
+
+  it('the clear ran but its answer was lost: the read through consensus shows the cleared conversation', () => {
+    floors.raiseFloorByUpdate(ALICE, 10);
+    floors.raiseBeforeClear(ALICE, 10);
+    const start = floors.readFloor(ALICE);
+    // The canister is at 11, empty: at the floor, so shown as it is, nothing reset.
+    expect(11 >= floors.floorOf(ALICE)).toBe(true);
+    expect(floors.isCurrent(ALICE, 11, start.epoch)).toBe(true);
+  });
+
+  it('the clear did not run (lost before it arrived, or refused): the read through consensus resets the floor', async () => {
+    floors.raiseFloorByUpdate(ALICE, 10);
+    floors.raiseBeforeClear(ALICE, 10);
+    const start = floors.readFloor(ALICE);
+    // The canister is still at 10: one behind the floor, so the load resets it there and shows the conversation.
+    expect(await floors.resetFloor(ALICE, 10, start)).toBe(true);
+    expect(floors.readFloor(ALICE)).toEqual({ epoch: 1, revision: 10 });
+    expect(floors.isCurrent(ALICE, 10, 1)).toBe(true);
+  });
+
+  it('the clear ran and was answered: settled at its revision', async () => {
+    floors.raiseFloorByUpdate(ALICE, 10);
+    const before = floors.raiseBeforeClear(ALICE, 10);
+    expect(await floors.settleClear(ALICE, 11, before)).toEqual({ epoch: 0, revision: 11 });
+    expect(floors.afterClear(ALICE, { epoch: 0, revision: 11 })).toBe('show-cleared');
   });
 });

@@ -7,6 +7,10 @@
 //            latesave | conflict | stale | laggy (one history read from before the last clear) |
 //            clearerror (the canister refuses the clear) | clearhang (the clear call never returns) |
 //            clearlost (the clear runs, its answer is lost) | clearfail (the clear is lost before it runs) |
+//            otherclear (before the first send, another tab's clear has run and its answer was lost: the canister is
+//            cleared, and the floor that tab raised before sending is in storage) |
+//            clearovertaken (right after the clear runs, and before its answer arrives, another tab sends a message
+//            and stores the floor it was confirmed) |
 //            historyerror | expiring | badsession |
 //            racyclear (this device has seen revision 5, replicas still say 4, and while the certified read — which
 //            reads 5 — is on its way, another tab clears the conversation: revision 6) |
@@ -143,7 +147,8 @@ export function createMockBackend(scenario: string): Backend {
   const copy = (c: Conversation) => ({ messages: c.messages.map((m) => ({ ...m })), revision: c.revision });
 
   // racyclear, racyreset: the floor this device stored, and whether the other tab has acted yet.
-  const floorKey = `coo:floor:${floorOwner(network.backendCanisterId ?? 'local', PRINCIPAL)}`;
+  const floorKeyOf = (who: string) => `coo:floor:${floorOwner(network.backendCanisterId ?? 'local', who)}`;
+  const floorKey = floorKeyOf(PRINCIPAL);
   let otherTabCleared = false;
   if (scenario === 'racyclear') {
     conv().revision = 5;
@@ -296,6 +301,11 @@ export function createMockBackend(scenario: string): Backend {
       // Before the first send, another tab changes the conversation: visibly, or (stale) only its revision.
       if (attempt === 1 && scenario === 'conflict') otherTab(c);
       if (attempt === 1 && scenario === 'stale') c.revision += 1;
+      if (attempt === 1 && scenario === 'otherclear') {
+        localStorage.setItem(floorKeyOf(principal), `0:${c.revision + 1}`);
+        c.messages = [];
+        c.revision += 1;
+      }
       const refused = check(c, id, base, text);
       if (refused) return refused;
       switch (scenario) {
@@ -363,8 +373,13 @@ export function createMockBackend(scenario: string): Backend {
       c.revision += 1;
       c.messages = [];
       if (c.inFlight) c.inFlight.cleared = true;
+      const cleared = c.revision;
+      if (scenario === 'clearovertaken') {
+        otherTab(c);
+        localStorage.setItem(floorKeyOf(principal), `0:${c.revision}`);
+      }
       if (scenario === 'clearlost') throw new Error('Failed to fetch');
-      return c.revision;
+      return cleared;
     },
 
     sessionExpiresAt() {

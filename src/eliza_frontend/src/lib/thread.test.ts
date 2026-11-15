@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { Message } from '../backend';
-import { mergeHistory, reconcile, turnsKey, type ChatMessage } from './thread';
+import { judgeLostClear, mergeHistory, reconcile, turnsKey, type ChatMessage } from './thread';
 
 const saved = (role: string, content: string, requestId?: string): Message => ({ role, content, requestId });
 const shown = (id: string, role: 'user' | 'assistant', content: string, extra: Partial<ChatMessage> = {}): ChatMessage => ({
@@ -71,5 +71,16 @@ describe('turnsKey', () => {
     expect(turnsKey([saved('user', 'hi'), saved('assistant', 'yo!')])).not.toBe(a);
     // "ab" + "c" is not "a" + "bc".
     expect(turnsKey([saved('user', 'ab'), saved('user', 'c')])).not.toBe(turnsKey([saved('user', 'a'), saved('user', 'bc')]));
+  });
+});
+
+// Review round 5: a clear whose answer was lost, judged by the conversation loaded through consensus afterwards.
+describe('judgeLostClear', () => {
+  it('cleared when empty at a later revision, failed when not empty, not known when nothing was loaded', () => {
+    expect(judgeLostClear({ messages: [], revision: 11 }, 10)).toBe('cleared');
+    expect(judgeLostClear({ messages: [{}], revision: 10 }, 10)).toBe('failed');
+    // Empty but not later: the conversation was already empty, and this clear did not run.
+    expect(judgeLostClear({ messages: [], revision: 10 }, 10)).toBe('failed');
+    expect(judgeLostClear(null, 10)).toBe('unconfirmed');
   });
 });
