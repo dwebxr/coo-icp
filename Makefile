@@ -161,12 +161,14 @@ DEPLOYED_SMALL_WASM := target/older/deployed-small-$(DEPLOYED_COMMIT).wasm
 V060_WASM := target/older/v060-$(V060_COMMIT).wasm
 
 # $(call build-older,<commit>,<paths to take from it>,<output>,<cargo flags>)
+# The sources are extracted to, and built in, a directory named after the output (<output> without .wasm, plus -src),
+# so two outputs share nothing, also when they are made from the same commit and built in parallel (make -j).
 # The result is copied under a temporary name and renamed, so an interrupted copy is never taken for a build.
 define build-older
-	rm -rf target/older/src-$(1) && mkdir -p target/older/src-$(1)
-	git archive $(1) $(2) | tar -x -C target/older/src-$(1)
-	cd target/older/src-$(1) && $(WASM_BUILD) -p eliza_backend $(4)
-	cp target/older/src-$(1)/target/wasm32-unknown-unknown/release/eliza_backend.wasm $(3).tmp
+	rm -rf $(basename $(3))-src && mkdir -p $(basename $(3))-src
+	git archive $(1) $(2) | tar -x -C $(basename $(3))-src
+	cd $(basename $(3))-src && $(WASM_BUILD) -p eliza_backend $(4)
+	cp $(basename $(3))-src/target/wasm32-unknown-unknown/release/eliza_backend.wasm $(3).tmp
 	mv $(3).tmp $(3)
 endef
 
