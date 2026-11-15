@@ -79,13 +79,17 @@ Every limit is enforced by the canister (`src/eliza_backend/src/limits.rs`).
   principals used this browser; they are kept on purpose, so that a conversation older than one this browser has
   seen is never shown, and are not removed by signing out. Also a random marker that changes on every sign-out
   (`coo:signed-out`). Internet Identity's client keeps a fresh, unused session key in IndexedDB.
-- **A clear on its way can be forgotten by this device in one narrow case.** A clear raises the floor before it is
-  sent, so a conversation from before it is never shown again — unless another tab of the same user finishes loading
-  the conversation in the moment between the clear being sent and reaching the canister (its read through consensus
-  finds the old revision and puts the floor back) and the tab that sent the clear is closed before its answer
-  arrives, so that nothing on this device remembers the clear. A replica that lags by a few seconds can then show
-  the conversation as it was before the clear, until the next action corrects it (a message sent then meets a
-  `Conflict`, and the thread is loaded again).
+- **A clear whose answer never arrives can let the conversation from just before it show for a few seconds.** What
+  holds: a tab that receives the clear's answer shows the cleared conversation and never an older one, and any
+  answer below this device's floor is refused in every tab. But the floor a clear raises before it is sent is a
+  lower bound — one past the revision the sending tab knew — not the clear's own revision. If the tab that sent the
+  clear is closed before the answer arrives (or in the instant after sending, before the raised floor has been
+  stored), this device may not know that revision. For the few seconds a replica can lag, another tab or a reload
+  can then show the conversation as it was just before the clear: when another tab of the same user saved a message
+  between the clear being sent and running (that conversation sits exactly at the raised floor), or finished a load
+  in that moment (its read through consensus found the old revision and put the floor back). The next action
+  corrects it: a message sent then meets a `Conflict`, and the thread is loaded again. Closing this completely would
+  need the clear to carry a request id and a status, as `send_message` does — a change to the canister's interface.
 - **Not tested: a real Internet Identity sign-in racing a sign-out in another tab.** Both tabs share the auth
   client's IndexedDB; whether a sign-out whose deletion of the stored key lands after a new sign-in in another tab
   leaves that new session's key or delegation inconsistent on the next reload has only been reasoned about (the

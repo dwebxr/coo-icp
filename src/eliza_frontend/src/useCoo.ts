@@ -280,6 +280,11 @@ export function useCoo(backend: Backend) {
   /**
    * Quietly re-syncs the thread with what the canister saved, unless the thread changed meanwhile. Resolves with the
    * conversation when it was applied, else null.
+   *
+   * A query's answer below the floor is never applied, and never lowers it. Instead the canister is asked once more,
+   * through consensus (within the same time): a replica may be behind, or the floor may be ahead of the canister (a
+   * clear that never ran raised it). If that answer is below the floor too, the floor is reset by compare-and-set, as
+   * a load does; without this, a tab whose sends meet a Conflict could never catch up.
    */
   const refreshHistory = useCallback(
     async (activeId?: string, timeoutMs = READ_TIMEOUT_MS): Promise<Conversation | null> => {
@@ -287,16 +292,32 @@ export function useCoo(backend: Backend) {
       const myRev = rev.current;
       const who = principalRef.current;
       if (!who) return null;
+      const deadline = Date.now() + timeoutMs;
+      // Taken before asking, as in loadHistory.
       const start = readFloor(who);
+      const unchanged = () => myGen === gen.current && myRev === rev.current && historyRef.current === 'loaded';
       try {
-        const conversation = await within(backend.history(), timeoutMs);
-        if (myGen !== gen.current || myRev !== rev.current || historyRef.current !== 'loaded') return null;
-        // Behind what was confirmed (a clear sent meanwhile included: lib/floors), or from before a reset: not applied.
-        if (!isCurrent(who, conversation.revision, start.epoch)) return null;
-        update((prev) => reconcile(prev, conversation.messages, activeId));
-        revision.current = conversation.revision;
-        raiseFloorByQuery(who, conversation.revision, start.epoch);
-        return conversation;
+        let conversation = await within(backend.history(), timeoutMs);
+        if (!unchanged()) return null;
+        let epoch = start.epoch;
+        let certified = false;
+        if (conversation.revision < floorOf(who)) {
+          conversation = await within(backend.certifiedHistory(), Math.max(deadline - Date.now(), 0));
+          certified = true;
+          if (!unchanged()) return null;
+          if (conversation.revision < floorOf(who)) {
+            if (!(await resetFloor(who, conversation.revision, start)) || !unchanged()) return null;
+            epoch = start.epoch + 1;
+          }
+        }
+        // Behind what was confirmed, or from before a reset: not applied.
+        if (!isCurrent(who, conversation.revision, epoch)) return null;
+        const applied = conversation;
+        update((prev) => reconcile(prev, applied.messages, activeId));
+        revision.current = applied.revision;
+        if (certified) raiseFloorByUpdate(who, applied.revision);
+        else raiseFloorByQuery(who, applied.revision, epoch);
+        return applied;
       } catch (err) {
         console.error('History refresh error:', err);
         return null;
@@ -670,10 +691,16 @@ export function useCoo(backend: Backend) {
     const who = principalRef.current;
     const startRevision = revision.current;
     // Before the call is sent, the floor rises past the conversation's revision (lib/floors): whether the answer
-    // arrives or not, nothing from before the clear is shown again, here or anywhere else on this device. The snapshot
+    // arrives or not, answers at that revision or below are refused, here and in the other tabs. The snapshot
     // the answer is judged against is the raised floor.
     const before = who ? raiseBeforeClear(who, startRevision) : null;
-    const call = backend.clear();
+    // A backend that throws instead of rejecting goes through the same handling as a rejection: the floor is raised.
+    let call: Promise<number>;
+    try {
+      call = backend.clear();
+    } catch (err) {
+      call = Promise.reject(err);
+    }
     inflight.current += 1;
     setBusy(true);
     // Once the call has settled, the thread shows either the clear's own result — and only while the floor is still
@@ -723,7 +750,7 @@ export function useCoo(backend: Backend) {
         }
         // Lost in transit: it may have run. The conversation is loaded through consensus in the session that is
         // current now — also when the clear was made in an earlier one. If nothing can be read, the raised floor
-        // still keeps the conversation from before the clear off the screen until something can.
+        // still refuses answers at the revision the thread showed.
         if (statusRef.current !== 'ready') return 'unconfirmed';
         const loaded = await resync();
         return judgeLostClear(principalRef.current === who ? loaded : null, startRevision);

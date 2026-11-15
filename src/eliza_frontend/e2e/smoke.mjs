@@ -507,7 +507,7 @@ await test('Lost response: the automatic re-send returns the saved reply', async
 
 await test('Clear failure is shown inside the dialog', async (p) => {
   await open(p, '?mock=clearerror');
-  const reads = (await stats(p)).historyReads;
+  const reads = (await stats(p)).certifiedReads;
   await p.getByRole('button', { name: 'Account' }).click();
   await p.getByRole('menuitem', { name: /clear/i }).click();
   await p.getByRole('button', { name: 'Clear', exact: true }).click();
@@ -515,7 +515,7 @@ await test('Clear failure is shown inside the dialog', async (p) => {
   expect((await userBubbles(p)) > 0, 'messages kept');
   // The canister refused it: not run. The floor was raised before the call, so the conversation is read through
   // consensus once, which puts the floor back at the canister's revision (in a new epoch).
-  expect((await stats(p)).historyReads === reads + 1, 'one read through consensus after the refusal');
+  expect((await stats(p)).certifiedReads === reads + 1, 'one read through consensus after the refusal');
   const floor = await p.evaluate(() =>
     localStorage.getItem(Object.keys(localStorage).find((name) => name.startsWith('coo:floor:'))),
   );
@@ -631,28 +631,61 @@ await test("Another tab's lost clear does not block this tab: a send meets a Con
 });
 
 // Review round 4/5, Nit 1: the hook shows the empty thread only while the floor is where the clear left it. Here
-// another tab's reply is confirmed (and its floor stored) after the clear ran and before its answer arrives.
+// another tab's reply is confirmed (and its floor stored) after the clear ran and before its answer arrives, so
+// settleClear finds the floor moved and returns null. (The other order — the floor moves after settleClear has
+// returned a floor — has only microtasks in between and is covered by the unit test of afterClear alone.)
 await test('A clear overtaken by another tab before its answer arrives shows what the canister holds, not an empty thread', async (p) => {
   await open(p, '?mock=clearovertaken');
-  const reads = (await stats(p)).historyReads;
+  const reads = (await stats(p)).certifiedReads;
   await p.getByRole('button', { name: 'Account' }).click();
   await p.getByRole('menuitem', { name: /clear/i }).click();
   await p.getByRole('button', { name: 'Clear', exact: true }).click();
   await p.waitForSelector('dialog[open]', { state: 'detached', timeout: 8000 });
   await p.waitForSelector('.thread[aria-busy="false"]');
-  expect((await stats(p)).historyReads > reads, 'the conversation was loaded through consensus');
+  expect((await stats(p)).certifiedReads > reads, 'the conversation was loaded through consensus');
   expect((await userBubbles(p)) === 1, `the other tab's message is shown (${await userBubbles(p)} messages)`);
   expect((await p.locator('.msg-user .bubble').first().innerText()) === 'Sent from another tab', 'it is that message');
 });
 
-await test('A clear lost before it ran is reported as failed, after the conversation was checked', async (p) => {
-  await open(p, '?mock=clearfail');
-  const reads = (await stats(p)).historyReads;
+// Review round 6, Important 2: this tab shows revision 10, the canister is at 11 (another tab's message), and the
+// floor is at 12 (that tab's clear, which never ran, raised it). A send meets a Conflict; the re-sync's query is
+// below the floor, so it asks through consensus, which puts the floor back — no reload needed.
+await test('A tab behind a floor that is ahead of the canister catches up after a Conflict', async (p) => {
+  await open(p, '?mock=floorahead&delay=200');
+  const before = (await stats(p)).certifiedReads;
+  await p.locator('textarea').fill('hello');
+  await p.keyboard.press('Enter');
+  await p.waitForSelector('.msg-failed');
+  expect((await p.locator('text=Sent from another tab').count()) === 1, "the canister's conversation is shown");
+  expect((await stats(p)).certifiedReads === before + 1, 'one read through consensus');
+  const repliesBefore = await replies(p);
+  await p.getByRole('button', { name: 'Retry' }).click();
+  await p.waitForFunction((n) => document.querySelectorAll('.msg-assistant:not(.thinking)').length === n + 1, repliesBefore);
+  expect((await p.locator('.msg-failed').count()) === 0, 'the next attempt goes through');
+});
+
+// Review round 6, Nit 2: a backend whose clear throws (instead of rejecting) gets the same handling.
+await test('A clear call that throws is handled like one that fails: checked, reported, floor put back', async (p) => {
+  await open(p, '?mock=clearthrows');
   await p.getByRole('button', { name: 'Account' }).click();
   await p.getByRole('menuitem', { name: /clear/i }).click();
   await p.getByRole('button', { name: 'Clear', exact: true }).click();
   await p.waitForSelector('dialog[open] .dialog-error', { timeout: 8000 });
-  expect((await stats(p)).historyReads > reads, 'the conversation was loaded again');
+  expect((await userBubbles(p)) > 0, 'messages kept');
+  const floor = await p.evaluate(() =>
+    localStorage.getItem(Object.keys(localStorage).find((name) => name.startsWith('coo:floor:'))),
+  );
+  expect(floor === '1:0', `the floor is back at the canister's revision (${floor})`);
+});
+
+await test('A clear lost before it ran is reported as failed, after the conversation was checked', async (p) => {
+  await open(p, '?mock=clearfail');
+  const reads = (await stats(p)).certifiedReads;
+  await p.getByRole('button', { name: 'Account' }).click();
+  await p.getByRole('menuitem', { name: /clear/i }).click();
+  await p.getByRole('button', { name: 'Clear', exact: true }).click();
+  await p.waitForSelector('dialog[open] .dialog-error', { timeout: 8000 });
+  expect((await stats(p)).certifiedReads > reads, 'the conversation was loaded again, through consensus');
   expect((await userBubbles(p)) > 0, 'messages kept');
   await p.locator('dialog').getByRole('button', { name: 'Cancel' }).click();
   await p.locator('textarea').fill('still here');

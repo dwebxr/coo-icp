@@ -11,6 +11,9 @@
 //            cleared, and the floor that tab raised before sending is in storage) |
 //            clearovertaken (right after the clear runs, and before its answer arrives, another tab sends a message
 //            and stores the floor it was confirmed) |
+//            floorahead (the canister starts at revision 10; before the first send, another tab's exchange is saved
+//            (11), and a clear of that tab that never ran left the floor at 12) |
+//            clearthrows (the clear call throws instead of returning a promise; nothing is cleared) |
 //            historyerror | expiring | badsession |
 //            racyclear (this device has seen revision 5, replicas still say 4, and while the certified read — which
 //            reads 5 — is on its way, another tab clears the conversation: revision 6) |
@@ -154,6 +157,7 @@ export function createMockBackend(scenario: string): Backend {
     conv().revision = 5;
     localStorage.setItem(floorKey, '0:5');
   }
+  if (scenario === 'floorahead') conv().revision = 10;
   let otherTabReset = false;
   if (scenario === 'racyreset') {
     conv().revision = 4;
@@ -165,7 +169,9 @@ export function createMockBackend(scenario: string): Backend {
     sends: 0,
     answered: 0,
     ids: [] as string[],
-    historyReads: 0,
+    // Reads of the conversation: by query, and through consensus.
+    queryReads: 0,
+    certifiedReads: 0,
     clears: 0,
     get session() {
       return signedIn;
@@ -243,7 +249,7 @@ export function createMockBackend(scenario: string): Backend {
 
     async history() {
       const c = conv();
-      stats.historyReads += 1;
+      stats.queryReads += 1;
       await sleep(scenario === 'historyerror' ? 600 : 300);
       if (scenario === 'badsession') throw new SessionInvalid('mock orphan delegation');
       guard();
@@ -261,7 +267,7 @@ export function createMockBackend(scenario: string): Backend {
 
     async certifiedHistory() {
       const c = conv();
-      stats.historyReads += 1;
+      stats.certifiedReads += 1;
       // Through consensus: slower, and never the stale copy a lagging replica returns.
       if (scenario === 'racyclear' && !otherTabCleared) {
         // Read now, answered late: meanwhile another tab clears, and stores the floor it was confirmed.
@@ -301,6 +307,10 @@ export function createMockBackend(scenario: string): Backend {
       // Before the first send, another tab changes the conversation: visibly, or (stale) only its revision.
       if (attempt === 1 && scenario === 'conflict') otherTab(c);
       if (attempt === 1 && scenario === 'stale') c.revision += 1;
+      if (attempt === 1 && scenario === 'floorahead') {
+        otherTab(c);
+        localStorage.setItem(floorKeyOf(principal), `0:${c.revision + 1}`);
+      }
       if (attempt === 1 && scenario === 'otherclear') {
         localStorage.setItem(floorKeyOf(principal), `0:${c.revision + 1}`);
         c.messages = [];
@@ -357,33 +367,40 @@ export function createMockBackend(scenario: string): Backend {
       return c.inFlight?.id === id && !c.inFlight.cleared ? 'pending' : 'unknown';
     },
 
-    async clear() {
+    clear() {
       stats.clears += 1;
-      guard();
-      const c = conv();
-      await sleep(clearMs ?? 300);
-      // What the agent reports when the canister rejects a call: certainly not run.
-      if (scenario === 'clearerror') throw new Error('Call was rejected: mock clear refused');
-      if (scenario === 'clearhang') return new Promise<number>(() => {});
-      if (scenario === 'clearfail') throw new Error('Failed to fetch');
-      if (staleReads > 0) {
-        c.beforeClear = copy(c);
-        c.staleLeft = staleReads;
-      }
-      c.revision += 1;
-      c.messages = [];
-      if (c.inFlight) c.inFlight.cleared = true;
-      const cleared = c.revision;
-      if (scenario === 'clearovertaken') {
-        otherTab(c);
-        localStorage.setItem(floorKeyOf(principal), `0:${c.revision}`);
-      }
-      if (scenario === 'clearlost') throw new Error('Failed to fetch');
-      return cleared;
+      // As a backend that fails before it has a promise to return could.
+      if (scenario === 'clearthrows') throw new Error('Failed to fetch');
+      return clearConversation();
     },
 
     sessionExpiresAt() {
       return signedIn ? expiresAt : null;
     },
   };
+
+  /** What the canister does with a clear of the caller's conversation. */
+  async function clearConversation(): Promise<number> {
+    guard();
+    const c = conv();
+    await sleep(clearMs ?? 300);
+    // What the agent reports when the canister rejects a call: certainly not run.
+    if (scenario === 'clearerror') throw new Error('Call was rejected: mock clear refused');
+    if (scenario === 'clearhang') return new Promise<number>(() => {});
+    if (scenario === 'clearfail') throw new Error('Failed to fetch');
+    if (staleReads > 0) {
+      c.beforeClear = copy(c);
+      c.staleLeft = staleReads;
+    }
+    c.revision += 1;
+    c.messages = [];
+    if (c.inFlight) c.inFlight.cleared = true;
+    const cleared = c.revision;
+    if (scenario === 'clearovertaken') {
+      otherTab(c);
+      localStorage.setItem(floorKeyOf(principal), `0:${c.revision}`);
+    }
+    if (scenario === 'clearlost') throw new Error('Failed to fetch');
+    return cleared;
+  }
 }

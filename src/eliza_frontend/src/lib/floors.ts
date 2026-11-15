@@ -15,12 +15,12 @@
 //   the reset happens only if the floor is still exactly that, in memory and (inside the Web Lock) in storage.
 //   Otherwise something was confirmed while the answer was on its way, and nothing is lowered.
 //
-// A clear raises the floor before it is sent (raiseBeforeClear): to one past the conversation's revision, the lowest
-// revision the conversation can have once the clear has run. Whether its answer arrives or not, an answer from before
-// the clear is then never shown again — in this tab or another, after a reload, in a new session — because it is
-// below the floor; a load asks through consensus instead. If the clear did not run, that read finds the canister one
-// behind and resets the floor, as for any floor that is ahead. The floor is all there is to remember about a clear
-// whose outcome is unknown.
+// A clear raises the floor before it is sent (raiseBeforeClear): to one past the conversation's revision as this tab
+// knows it. Whether its answer arrives or not, an answer at that revision or below is then refused — in this tab or
+// another, after a reload, in a new session — and a load asks through consensus instead. If the clear did not run,
+// that read finds the canister behind and resets the floor, as for any floor that is ahead. This is a lower bound,
+// not the clear's own revision: when the tab that sent the clear never gets its answer, a conversation from just
+// before the clear can still pass (README, "Known gaps").
 //
 // Floors are kept in memory for the page's lifetime, so a failing storage or a sign-out cannot lose them, and in
 // localStorage across reloads and tabs. Only writers holding a cross-tab Web Lock store them (read, then write the
