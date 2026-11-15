@@ -416,9 +416,10 @@ describe('what to show after a clear', () => {
 describe('the floor raised before a clear', () => {
   it('goes one past the revision shown (or the floor, if that is higher), and is the snapshot for the answer', () => {
     floors.raiseFloorByUpdate(ALICE, 10);
-    expect(floors.raiseBeforeClear(ALICE, 10)).toEqual({ epoch: 0, revision: 11 });
-    expect(store.data.get(KEY)).toBe('0:11');
-    expect(floors.raiseBeforeClear('canister:bob', 4)).toEqual({ epoch: 0, revision: 5 });
+    // Only expected (review round 7): the canister has not confirmed it.
+    expect(floors.raiseBeforeClear(ALICE, 10)).toEqual({ epoch: 0, revision: 11, expected: true });
+    expect(store.data.get(KEY)).toBe('0:11:x');
+    expect(floors.raiseBeforeClear('canister:bob', 4)).toEqual({ epoch: 0, revision: 5, expected: true });
   });
 
   it("keeps every answer from before the clear off the screen, whoever asks: a load's and a re-sync's checks", async () => {
@@ -431,7 +432,7 @@ describe('the floor raised before a clear', () => {
     expect(floors.isCurrent(ALICE, 10, queryStarted.epoch)).toBe(false);
     // … and it does not lower anything.
     floors.raiseFloorByQuery(ALICE, 10, queryStarted.epoch);
-    expect(floors.readFloor(ALICE)).toEqual({ epoch: 0, revision: 11 });
+    expect(floors.readFloor(ALICE)).toEqual({ epoch: 0, revision: 11, expected: true });
     // Another tab, or this one after a reload, finds the same floor in storage.
     vi.resetModules();
     const otherTab = await import('./floors');
@@ -462,5 +463,83 @@ describe('the floor raised before a clear', () => {
     const before = floors.raiseBeforeClear(ALICE, 10);
     expect(await floors.settleClear(ALICE, 11, before)).toEqual({ epoch: 0, revision: 11 });
     expect(floors.afterClear(ALICE, { epoch: 0, revision: 11 })).toBe('show-cleared');
+  });
+});
+
+// Review round 7: a floor raised before a clear is only expected; a confirmation at that very revision is a change.
+describe('an expected floor and a confirmed one', () => {
+  it("the reviewer's ordering, as a re-sync uses the reset: a snapshot of the expected floor no longer matches", async () => {
+    floors.raiseFloorByUpdate(ALICE, 10);
+    floors.raiseBeforeClear(ALICE, 10); // tab A, before its clear: 0:11, expected
+    // Tab B's re-sync takes its snapshot, its query says 10 (below), so it asks through consensus; that read runs
+    // before the clear, and its answer (10) is on its way …
+    const start = floors.readFloor(ALICE);
+    expect(start).toEqual({ epoch: 0, revision: 11, expected: true });
+    // … while A's clear is confirmed at 11 (the same revision) …
+    expect(await floors.settleClear(ALICE, 11, start)).toEqual({ epoch: 0, revision: 11 });
+    // … so B's reset, planned against the expected floor, is refused, and the floor stays 0:11, confirmed.
+    expect(await floors.resetFloor(ALICE, 10, start)).toBe(false);
+    expect(floors.readFloor(ALICE)).toEqual({ epoch: 0, revision: 11 });
+    expect(store.data.get(KEY)).toBe('0:11');
+  });
+
+  it('the same, as a load uses the reset (snapshot before its queries), with the confirmation from another tab', async () => {
+    floors.raiseFloorByUpdate(ALICE, 10);
+    floors.raiseBeforeClear(ALICE, 10);
+    const start = floors.readFloor(ALICE); // the load's round begins
+    // Another tab confirmed the clear at 11 and stored it.
+    store.data.set(KEY, '0:11');
+    floors.onStorage(KEY, '0:11');
+    expect(await floors.resetFloor(ALICE, 10, start)).toBe(false);
+    expect(floors.readFloor(ALICE)).toEqual({ epoch: 0, revision: 11 });
+  });
+
+  it('is still reset when it really is only expected and the canister is behind (the clear never ran)', async () => {
+    floors.raiseFloorByUpdate(ALICE, 10);
+    floors.raiseBeforeClear(ALICE, 10);
+    const start = floors.readFloor(ALICE);
+    expect(await floors.resetFloor(ALICE, 10, start)).toBe(true);
+    expect(floors.readFloor(ALICE)).toEqual({ epoch: 1, revision: 10 });
+  });
+
+  it('merges confirmed over expected at the same revision, in memory, in storage and across tabs', async () => {
+    // This tab is confirmed at 0:11; another tab stores its own expected 0:11: this tab keeps confirmed, and puts it back.
+    floors.raiseFloorByUpdate(ALICE, 11);
+    store.data.set(KEY, '0:11:x');
+    floors.onStorage(KEY, '0:11:x');
+    expect(floors.readFloor(ALICE)).toEqual({ epoch: 0, revision: 11 });
+    expect(store.data.get(KEY)).toBe('0:11');
+    // The other way round: expected here, confirmed from another tab: confirmed wins.
+    floors.raiseBeforeClear('canister:bob', 4);
+    store.data.set('coo:floor:canister:bob', '0:5');
+    floors.onStorage('coo:floor:canister:bob', '0:5');
+    expect(floors.readFloor('canister:bob')).toEqual({ epoch: 0, revision: 5 });
+    // A higher revision beats either.
+    store.data.set('coo:floor:canister:bob', '0:6:x');
+    expect(floors.readFloor('canister:bob')).toEqual({ epoch: 0, revision: 6, expected: true });
+  });
+
+  it('a confirmation below an expected floor leaves it expected; one at or above it confirms it', () => {
+    floors.raiseFloorByUpdate(ALICE, 10);
+    floors.raiseBeforeClear(ALICE, 10);
+    floors.raiseFloorByUpdate(ALICE, 10);
+    expect(floors.readFloor(ALICE)).toEqual({ epoch: 0, revision: 11, expected: true });
+    floors.raiseFloorByQuery(ALICE, 11, 0);
+    expect(floors.readFloor(ALICE)).toEqual({ epoch: 0, revision: 11 });
+  });
+
+  it('reads the stored forms: two parts confirmed (as earlier versions wrote them), ":x" expected, nothing else', async () => {
+    store.data.set(KEY, '3:7');
+    expect(floors.readFloor(ALICE)).toEqual({ epoch: 3, revision: 7 });
+    vi.resetModules();
+    floors = await import('./floors');
+    store.data.set(KEY, '3:8:x');
+    expect(floors.readFloor(ALICE)).toEqual({ epoch: 3, revision: 8, expected: true });
+    vi.resetModules();
+    floors = await import('./floors');
+    for (const bad of ['3:8:y', '3:8:', 'x:1', '1']) {
+      store.data.set(KEY, bad);
+      expect(floors.readFloor(ALICE), bad).toEqual({ epoch: 0, revision: 0 });
+    }
   });
 });

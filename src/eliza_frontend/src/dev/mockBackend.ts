@@ -14,6 +14,9 @@
 //            floorahead (the canister starts at revision 10; before the first send, another tab's exchange is saved
 //            (11), and a clear of that tab that never ran left the floor at 12) |
 //            clearthrows (the clear call throws instead of returning a promise; nothing is cleared) |
+//            confirmedmeanwhile (this tab shows revision 9; before its first send, another tab saves a message (10) and
+//            starts a clear (floor 11, expected); this tab's read through consensus runs before that clear and answers
+//            (10) only after the clear was confirmed at 11) |
 //            historyerror | expiring | badsession |
 //            racyclear (this device has seen revision 5, replicas still say 4, and while the certified read — which
 //            reads 5 — is on its way, another tab clears the conversation: revision 6) |
@@ -40,7 +43,7 @@ import {
 } from '../backend';
 // What the canister accepts (UTF-8 bytes); a unit test checks it against the canister's own constant.
 import { MAX_MESSAGE_BYTES } from '../lib/limits';
-import { floorOwner } from '../lib/floors';
+import { floorOwner, raiseBeforeClear, raiseFloorByUpdate } from '../lib/floors';
 import { network } from '../network';
 
 const PRINCIPAL = 'h7xqe-2mlpn-aaaab-qbm3a-cai4f-ufp5q-tdqbv-wv6jf-3pgv3-zkm4p-aqe';
@@ -158,6 +161,10 @@ export function createMockBackend(scenario: string): Backend {
     localStorage.setItem(floorKey, '0:5');
   }
   if (scenario === 'floorahead') conv().revision = 10;
+  if (scenario === 'confirmedmeanwhile') conv().revision = 9;
+  let otherTabConfirmed = false;
+  // What another tab does to this device's floors, done with the app's own functions (lib/floors).
+  const ownerOf = (who: string) => floorOwner(network.backendCanisterId ?? 'local', who);
   let otherTabReset = false;
   if (scenario === 'racyreset') {
     conv().revision = 4;
@@ -280,6 +287,17 @@ export function createMockBackend(scenario: string): Backend {
         await sleep(300);
         return read;
       }
+      if (scenario === 'confirmedmeanwhile' && !otherTabConfirmed && c.revision === 10) {
+        // Read now, answered late: meanwhile the other tab's clear runs and is confirmed at 11.
+        const read = copy(c);
+        await sleep(300);
+        otherTabConfirmed = true;
+        c.messages = [];
+        c.revision += 1;
+        raiseFloorByUpdate(ownerOf(principal), c.revision);
+        await sleep(300);
+        return read;
+      }
       if (scenario === 'racyreset' && !otherTabReset) {
         // Read now, answered late: meanwhile another tab resets the floor to 1:3.
         const read = copy(c);
@@ -307,6 +325,10 @@ export function createMockBackend(scenario: string): Backend {
       // Before the first send, another tab changes the conversation: visibly, or (stale) only its revision.
       if (attempt === 1 && scenario === 'conflict') otherTab(c);
       if (attempt === 1 && scenario === 'stale') c.revision += 1;
+      if (attempt === 1 && scenario === 'confirmedmeanwhile') {
+        otherTab(c);
+        raiseBeforeClear(ownerOf(principal), c.revision);
+      }
       if (attempt === 1 && scenario === 'floorahead') {
         otherTab(c);
         localStorage.setItem(floorKeyOf(principal), `0:${c.revision + 1}`);

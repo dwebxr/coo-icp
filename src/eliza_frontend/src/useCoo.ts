@@ -306,6 +306,8 @@ export function useCoo(backend: Backend) {
           certified = true;
           if (!unchanged()) return null;
           if (conversation.revision < floorOf(who)) {
+            // The wait for the floor's Web Lock is not bounded by the timeout above. Accepted: the lock's section is
+            // synchronous, so a long wait needs another tab frozen while it holds the lock.
             if (!(await resetFloor(who, conversation.revision, start)) || !unchanged()) return null;
             epoch = start.epoch + 1;
           }

@@ -664,6 +664,30 @@ await test('A tab behind a floor that is ahead of the canister catches up after 
   expect((await p.locator('.msg-failed').count()) === 0, 'the next attempt goes through');
 });
 
+// Review round 7: this tab's re-sync after a Conflict reads through consensus before another tab's clear runs; the
+// answer (10) arrives after that clear was confirmed at 11, the very revision the floor was raised to before it. The
+// reset planned against the floor as it was (only expected) must be refused: the conversation from before the clear
+// is not shown, and the floor stays at the confirmed 11.
+await test("A late read through consensus does not undo another tab's clear confirmed at the raised floor", async (p) => {
+  await open(p, '?mock=confirmedmeanwhile&delay=200');
+  await p.locator('textarea').fill('hello');
+  await p.keyboard.press('Enter');
+  await p.waitForSelector('.msg-failed');
+  await p.waitForTimeout(500);
+  expect((await p.locator('text=Sent from another tab').count()) === 0, 'the conversation from before the clear is not shown');
+  const floor = await p.evaluate(() =>
+    localStorage.getItem(Object.keys(localStorage).find((name) => name.startsWith('coo:floor:'))),
+  );
+  expect(floor === '0:11', `the floor stays at the confirmed clear (${floor})`);
+  // The thread catches up with the cleared conversation, and the message goes through.
+  await p.getByRole('button', { name: 'Retry' }).click();
+  await p.waitForFunction(() => document.querySelectorAll('.msg-user .bubble').length === 1);
+  const before = await replies(p);
+  await p.getByRole('button', { name: 'Retry' }).click();
+  await p.waitForFunction((n) => document.querySelectorAll('.msg-assistant:not(.thinking)').length === n + 1, before);
+  expect((await p.locator('.msg-failed').count()) === 0, 'sent');
+});
+
 // Review round 6, Nit 2: a backend whose clear throws (instead of rejecting) gets the same handling.
 await test('A clear call that throws is handled like one that fails: checked, reported, floor put back', async (p) => {
   await open(p, '?mock=clearthrows');

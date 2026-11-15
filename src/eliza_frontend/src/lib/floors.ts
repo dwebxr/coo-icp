@@ -16,7 +16,7 @@
 //   Otherwise something was confirmed while the answer was on its way, and nothing is lowered.
 //
 // A clear raises the floor before it is sent (raiseBeforeClear): to one past the conversation's revision as this tab
-// knows it. Whether its answer arrives or not, an answer at that revision or below is then refused — in this tab or
+// knows it, marked as only expected — the canister has not confirmed it. Whether its answer arrives or not, an answer at that revision or below is then refused — in this tab or
 // another, after a reload, in a new session — and a load asks through consensus instead. If the clear did not run,
 // that read finds the canister behind and resets the floor, as for any floor that is ahead. This is a lower bound,
 // not the clear's own revision: when the tab that sent the clear never gets its answer, a conversation from just
@@ -33,20 +33,33 @@ const LEGACY_PREFIX = 'coo:revision:';
 export interface Floor {
   epoch: number;
   revision: number;
+  /**
+   * Only expected, not confirmed: raised before a clear was sent (raiseBeforeClear). Any confirmation of the canister
+   * — at this revision too — makes the floor confirmed, which counts as a change: a compare-and-set planned against
+   * the expected floor is refused once it has been confirmed.
+   */
+  expected?: true;
 }
 
 const ZERO: Floor = { epoch: 0, revision: 0 };
 const memory = new Map<string, Floor>();
 
-const newer = (a: Floor, b: Floor) => a.epoch > b.epoch || (a.epoch === b.epoch && a.revision > b.revision);
+// Newer: a higher epoch, then a higher revision, then — at the same epoch and revision — confirmed over expected.
+const newer = (a: Floor, b: Floor) =>
+  a.epoch > b.epoch ||
+  (a.epoch === b.epoch && (a.revision > b.revision || (a.revision === b.revision && !a.expected && !!b.expected)));
 const latest = (a: Floor, b: Floor) => (newer(b, a) ? b : a);
-const same = (a: Floor, b: Floor) => a.epoch === b.epoch && a.revision === b.revision;
-const encode = (floor: Floor) => `${floor.epoch}:${floor.revision}`;
+const same = (a: Floor, b: Floor) => a.epoch === b.epoch && a.revision === b.revision && !a.expected === !b.expected;
+// "<epoch>:<revision>" is confirmed (the form floors were always stored in); "<epoch>:<revision>:x" is expected.
+const encode = (floor: Floor) => `${floor.epoch}:${floor.revision}${floor.expected ? ':x' : ''}`;
 
 /** Null when the text is not a floor. */
 function decode(raw: string): Floor | null {
-  const match = /^(\d{1,15}):(\d{1,15})$/.exec(raw);
-  return match ? { epoch: Number(match[1]), revision: Number(match[2]) } : null;
+  const match = /^(\d{1,15}):(\d{1,15})(:x)?$/.exec(raw);
+  if (!match) return null;
+  const floor: Floor = { epoch: Number(match[1]), revision: Number(match[2]) };
+  if (match[3]) floor.expected = true;
+  return floor;
 }
 
 /** Whose floor: a principal's conversation in one canister. */
@@ -119,8 +132,13 @@ export function isCurrent(owner: string, revision: number, epoch: number): boole
   return now.epoch === epoch && revision >= now.revision;
 }
 
+/**
+ * The canister confirmed `revision`: the floor rises to it, confirmed. A confirmation at the floor's own revision
+ * turns an expected floor into a confirmed one; one below it changes nothing (a higher expected floor stays expected).
+ */
 function raise(owner: string, base: Floor, revision: number) {
-  const floor = { epoch: base.epoch, revision: Math.max(base.revision, revision) };
+  if (revision < base.revision || (revision === base.revision && !base.expected)) return;
+  const floor = { epoch: base.epoch, revision };
   memory.set(owner, floor);
   // write() only stores it over an older value, so a reset another tab stored meanwhile wins.
   persist(owner, floor);
@@ -211,8 +229,9 @@ export async function settleClear(owner: string, cleared: number, before: Floor)
  */
 export function raiseBeforeClear(owner: string, revision: number): Floor {
   const base = current(owner);
-  const floor = { epoch: base.epoch, revision: Math.max(base.revision, revision) + 1 };
-  raise(owner, base, floor.revision);
+  const floor: Floor = { epoch: base.epoch, revision: Math.max(base.revision, revision) + 1, expected: true };
+  memory.set(owner, floor);
+  persist(owner, floor);
   return floor;
 }
 

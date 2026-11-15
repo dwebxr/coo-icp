@@ -87,9 +87,11 @@ Every limit is enforced by the canister (`src/eliza_backend/src/limits.rs`).
   stored), this device may not know that revision. For the few seconds a replica can lag, another tab or a reload
   can then show the conversation as it was just before the clear: when another tab of the same user saved a message
   between the clear being sent and running (that conversation sits exactly at the raised floor), or finished a load
-  in that moment (its read through consensus found the old revision and put the floor back). The next action
-  corrects it: a message sent then meets a `Conflict`, and the thread is loaded again. Closing this completely would
-  need the clear to carry a request id and a status, as `send_message` does — a change to the canister's interface.
+  in that moment (its read through consensus found the old revision and put the floor back). It is put right once a
+  read reaches a replica that has caught up — normally within seconds — or by any read through consensus. A message
+  sent meanwhile meets a `Conflict` and the thread is read again, but if that read too comes from a replica still
+  behind, it can show the same conversation once more. Closing this completely would need the clear to carry a
+  request id and a status, as `send_message` does — a change to the canister's interface.
 - **Not tested: a real Internet Identity sign-in racing a sign-out in another tab.** Both tabs share the auth
   client's IndexedDB; whether a sign-out whose deletion of the stored key lands after a new sign-in in another tab
   leaves that new session's key or delegation inconsistent on the next reload has only been reasoned about (the
