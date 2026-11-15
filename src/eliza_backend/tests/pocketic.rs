@@ -348,6 +348,11 @@ fn deployed_wasm() -> Vec<u8> {
     older_wasm("ELIZA_DEPLOYED_WASM", "the deployed version")
 }
 
+/// The deployed version built with `small-limits`, so that it can be made to evict before the upgrade.
+fn deployed_small_wasm() -> Vec<u8> {
+    older_wasm("ELIZA_DEPLOYED_SMALL_WASM", "the deployed version with small limits")
+}
+
 /// 0.6.0: the last version with the old state layout (schema 2), no limits, and the methods removed in 0.7.0.
 fn v060_wasm() -> Vec<u8> {
     older_wasm("ELIZA_V060_WASM", "0.6.0")
@@ -375,18 +380,22 @@ fn send_raw(
 #[ignore]
 fn upgrade_from_the_deployed_version_keeps_everything() {
     let (pic, id) = setup(deployed_wasm());
-    set_provider(&pic, id, LlmProvider::Fallback);
     let zoe = Character { name: "Zoe".into(), system_prompt: "You are Zoe.".into(), bio: vec![], style: vec![] };
     let set: Result<(), String> = update(&pic, id, admin(), "update_character", encode_one(&zoe).unwrap());
     set.unwrap();
+    // Answered by the model (the mock): "Hi there!".
     let first = send(&pic, id, alice(), "a-1", 0, "hello").unwrap();
     let second = send(&pic, id, alice(), "a-2", 1, "tell me about icp").unwrap();
+    assert_eq!(first.reply, "Hi there!");
     send(&pic, id, bob(), "b-1", 0, "who are you").unwrap();
     send(&pic, id, carol(), "c-1", 0, "hello").unwrap();
     assert_eq!(clear(&pic, id, carol()), 2);
+    // From here on a reply could only come from the fallback, whose text is different.
+    set_provider(&pic, id, LlmProvider::Fallback);
     let (alice_before, bob_before) = (chat_messages(&pic, id, alice()), chat_messages(&pic, id, bob()));
     assert_eq!((alice_before.len(), bob_before.len()), (4, 2));
     let before = metrics(&pic, id);
+    let asked = llm_seen(&pic).len();
 
     upgrade(&pic, id, read(NEW_WASM));
 
@@ -397,21 +406,60 @@ fn upgrade_from_the_deployed_version_keeps_everything() {
     assert_eq!(conversation(&pic, id, bob()).revision, 1);
     let after = metrics(&pic, id);
     assert_eq!(
-        (after.entries, after.conversations, after.stored_bytes, after.revision_floor),
-        (before.entries, before.conversations, before.stored_bytes, before.revision_floor)
+        (after.entries, after.conversations, after.stored_bytes),
+        (before.entries, before.conversations, before.stored_bytes)
     );
     assert_eq!(after.version, env!("CARGO_PKG_VERSION"));
-    // Saved requests replay instead of running again, and a request from before a clear stays refused.
-    assert_eq!(status(&pic, id, alice(), "a-2"), MessageStatus::Done(second.clone()));
-    assert_eq!(send(&pic, id, alice(), "a-1", 0, "hello"), Ok(Sent { reply: first.reply.clone(), revision: 2 }));
-    assert_eq!(send(&pic, id, carol(), "c-1", 0, "hello"), Err(ChatError::Conflict));
-    assert_eq!(llm_seen(&pic).len(), 0, "nothing was run again");
     // What the operator set is kept.
     assert_eq!(character(&pic, id), zoe);
     let config: Config = query(&pic, id, admin(), "get_config", encode_args(()).unwrap());
     assert_eq!(config.llm_provider, LlmProvider::Fallback);
-    // And the conversation goes on.
-    assert_eq!(send(&pic, id, alice(), "a-3", 2, "hi").map(|s| s.revision), Ok(3));
+    // Saved requests replay: the reply is the model's saved one — answering again would give the fallback's text
+    // now — and the model was not asked. A request from before a clear stays refused.
+    assert_eq!(status(&pic, id, alice(), "a-2"), MessageStatus::Done(second.clone()));
+    assert_eq!(send(&pic, id, alice(), "a-1", 0, "hello"), Ok(Sent { reply: "Hi there!".into(), revision: 2 }));
+    assert_eq!(send(&pic, id, carol(), "c-1", 0, "hello"), Err(ChatError::Conflict));
+    assert_eq!(llm_seen(&pic).len(), asked, "nothing was run again");
+    // And the conversation goes on, now with the fallback.
+    let third = send(&pic, id, alice(), "a-3", 2, "hi").unwrap();
+    assert_eq!(third.revision, 3);
+    assert!(third.reply.starts_with("[Local fallback"), "{}", third.reply);
+}
+
+/// A canister that has already evicted conversations carries a revision floor above zero. If an upgrade lost it,
+/// requests made for revisions from before the eviction could match again.
+#[test]
+#[ignore]
+fn upgrade_from_the_deployed_version_keeps_the_revision_floor() {
+    let (pic, id) = setup(deployed_small_wasm());
+    set_provider(&pic, id, LlmProvider::Fallback);
+    // Eight entries is the limit of the small build; user 0 has two exchanges and is the least recently used.
+    send(&pic, id, user(0), "first", 0, "hello").unwrap();
+    send(&pic, id, user(0), "second", 1, "again").unwrap();
+    for n in 1..8u32 {
+        pic.advance_time(Duration::from_secs(1));
+        send(&pic, id, user(n), "first", 0, "hello").unwrap();
+    }
+    // A ninth caller makes user 0's conversation go, which raises the floor above its revision (2).
+    pic.advance_time(Duration::from_secs(1));
+    send(&pic, id, user(8), "first", 0, "hello").unwrap();
+    let before = metrics(&pic, id);
+    assert_eq!((before.entries, before.revision_floor), (8, 3));
+    assert_eq!(conversation(&pic, id, user(0)), Conversation { messages: vec![], revision: 3 });
+
+    upgrade(&pic, id, read(SMALL_WASM));
+
+    let after = metrics(&pic, id);
+    assert_eq!((after.entries, after.revision_floor), (8, 3));
+    // The evicted caller is still past everything it had seen: none of its old requests can match.
+    assert_eq!(conversation(&pic, id, user(0)), Conversation { messages: vec![], revision: 3 });
+    for base in 0..3u64 {
+        assert_eq!(send(&pic, id, user(0), "first", base, "hello"), Err(ChatError::Conflict), "base {base}");
+    }
+    assert_eq!(send(&pic, id, user(0), "third", 3, "back").map(|s| s.revision), Ok(4));
+    // A caller that never had an entry starts at the floor as well.
+    assert_eq!(conversation(&pic, id, user(99)).revision, 3);
+    assert_eq!(chat_messages(&pic, id, user(8)).len(), 2);
 }
 
 #[test]

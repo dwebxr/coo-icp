@@ -154,30 +154,39 @@ test:
 # The commit is part of the file name, so changing one of them rebuilds it.
 DEPLOYED_COMMIT := 5879071ef912e9df391805dccd7c6d4dbf9ac2b1
 V060_COMMIT := 5e9c5a29587dc75553d37d43bf1ce4add6aeabd5
+DEPLOYED_PATHS := Cargo.toml Cargo.lock rust-toolchain.toml src/eliza_backend src/mock_llm
 DEPLOYED_WASM := target/older/deployed-$(DEPLOYED_COMMIT).wasm
+# The deployed version built with tiny limits, so a test can make it evict (raising its revision floor) first.
+DEPLOYED_SMALL_WASM := target/older/deployed-small-$(DEPLOYED_COMMIT).wasm
 V060_WASM := target/older/v060-$(V060_COMMIT).wasm
 
-# $(call build-older,<commit>,<paths to take from it>,<output>)
+# $(call build-older,<commit>,<paths to take from it>,<output>,<cargo flags>)
+# The result is copied under a temporary name and renamed, so an interrupted copy is never taken for a build.
 define build-older
 	rm -rf target/older/src-$(1) && mkdir -p target/older/src-$(1)
 	git archive $(1) $(2) | tar -x -C target/older/src-$(1)
-	cd target/older/src-$(1) && $(WASM_BUILD) -p eliza_backend
-	cp target/older/src-$(1)/target/wasm32-unknown-unknown/release/eliza_backend.wasm $(3)
+	cd target/older/src-$(1) && $(WASM_BUILD) -p eliza_backend $(4)
+	cp target/older/src-$(1)/target/wasm32-unknown-unknown/release/eliza_backend.wasm $(3).tmp
+	mv $(3).tmp $(3)
 endef
 
 $(DEPLOYED_WASM):
-	$(call build-older,$(DEPLOYED_COMMIT),Cargo.toml Cargo.lock rust-toolchain.toml src/eliza_backend src/mock_llm,$@)
+	$(call build-older,$(DEPLOYED_COMMIT),$(DEPLOYED_PATHS),$@,)
+
+$(DEPLOYED_SMALL_WASM):
+	$(call build-older,$(DEPLOYED_COMMIT),$(DEPLOYED_PATHS),$@,--features small-limits)
 
 # 0.6.0 was one file, in a workspace without the mock canister and without a pinned toolchain.
 $(V060_WASM):
-	$(call build-older,$(V060_COMMIT),Cargo.toml Cargo.lock src/eliza_backend/Cargo.toml src/eliza_backend/src/lib.rs,$@)
+	$(call build-older,$(V060_COMMIT),Cargo.toml Cargo.lock src/eliza_backend/Cargo.toml src/eliza_backend/src/lib.rs,$@,)
 
-test-canister: $(DEPLOYED_WASM) $(V060_WASM)
+test-canister: $(DEPLOYED_WASM) $(DEPLOYED_SMALL_WASM) $(V060_WASM)
 	$(WASM_BUILD) -p eliza_backend -p mock_llm
 	$(WASM_BUILD) -p eliza_backend --features test-hooks --target-dir target/test-hooks
 	$(WASM_BUILD) -p eliza_backend --features small-limits,test-hooks --target-dir target/small-limits
 	POCKET_IC_BIN="$${POCKET_IC_BIN:-$$(dfx cache show)/pocket-ic}" \
-		ELIZA_DEPLOYED_WASM="$(CURDIR)/$(DEPLOYED_WASM)" ELIZA_V060_WASM="$(CURDIR)/$(V060_WASM)" \
+		ELIZA_DEPLOYED_WASM="$(CURDIR)/$(DEPLOYED_WASM)" ELIZA_DEPLOYED_SMALL_WASM="$(CURDIR)/$(DEPLOYED_SMALL_WASM)" \
+		ELIZA_V060_WASM="$(CURDIR)/$(V060_WASM)" \
 		$(CARGO) test --locked -p eliza_backend -- --include-ignored --test-threads=1
 
 # Against the mock backend of a running dev server (cd src/eliza_frontend && npm run dev).
