@@ -1,23 +1,16 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
-import environment from 'vite-plugin-environment';
 import { fileURLToPath, URL } from 'url';
 
 export default defineConfig({
-  plugins: [
-    react(),
-    environment('all', { prefix: 'CANISTER_' }),
-    environment('all', { prefix: 'DFX_' }),
-  ],
-  resolve: {
-    alias: {
-      '@': fileURLToPath(new URL('./src', import.meta.url)),
-      'declarations': fileURLToPath(new URL('./src/declarations', import.meta.url)),
-    },
-  },
-  define: {
-    'process.env.DFX_NETWORK': JSON.stringify(process.env.DFX_NETWORK ?? 'local'),
-  },
+  plugins: [react()],
+  // dfx writes the ids of the locally deployed canisters to .env at the repository root. Only CANISTER_ID_* is
+  // exposed (that file also holds absolute local paths), and only what the source references is inlined; the
+  // app uses these ids on a local host only (src/network.ts).
+  envDir: fileURLToPath(new URL('../..', import.meta.url)),
+  envPrefix: ['VITE_', 'CANISTER_ID_'],
+  // The agent's CBOR decoder refers to Node's `global`.
+  define: { global: 'globalThis' },
   server: {
     proxy: {
       '/api': {

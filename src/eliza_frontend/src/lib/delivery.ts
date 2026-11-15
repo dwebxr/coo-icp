@@ -4,7 +4,8 @@ import { NO_REPLY, SessionInvalid, type ReplyStatus, type SendOutcome } from '..
 // at most once: a repeated id replays the saved reply, and a request whose revision is out of date is a conflict.
 // So after a lost response the message can simply be sent again with the same id and revision.
 
-// Another message (perhaps from another tab) is still being answered.
+// Another message (perhaps from another tab) is still being answered, or the canister is at one of its limits
+// (chats in progress, model calls per minute, storage). Nothing was saved; the same request may be sent again.
 export const BUSY_REASON = 'Coo is busy.';
 
 // Replies usually take 10-30 s. A request that takes longer is treated as lost and sent again.

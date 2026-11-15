@@ -1,0 +1,14 @@
+[package]
+name = "mock_llm"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Test double for the LLM canister. Installed at its canister id in PocketIC tests; never deployed."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+ic-cdk = "0.20"
+candid = "0.10"
+serde = { version = "1", features = ["derive"] }

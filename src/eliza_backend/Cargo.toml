@@ -1,6 +1,6 @@
 [package]
 name = "eliza_backend"
-version = "0.1.0"
+version = "0.7.0"
 edition = "2021"
 
 [lib]
@@ -8,20 +8,23 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 # IC CDK
-ic-cdk = "0.17"
-ic-cdk-macros = "0.17"
+ic-cdk = "0.20"
 candid = "0.10"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-
-# IC LLM Canister
-ic-llm = "1.1"
 
 [dev-dependencies]
 # Must match the PocketIC server version (dfx 0.30.2 ships pocket-ic-server 10.0.0)
 pocket-ic = "=10.0.0"
+# Checks eliza_backend.did against the code
+candid_parser = "0.4"
+# CanisterSettings as pocket-ic 10 takes them
+ic-management-canister-types = "0.3"
 
 [features]
 default = []
-# Test-only: send_message traps after the reply arrives when the message is "trap after reply" (PocketIC tests).
-trap-after-reply = []
+# Test only, never deployed (make test-canister builds these variants):
+# test-hooks: a controller-only method that fills the store; send_message logs the instructions it took up to the
+# model call, and traps after the model replied when the message is "trap after reply".
+test-hooks = []
+# small-limits: tiny storage, concurrency and rate limits, so tests can reach them.
+small-limits = []

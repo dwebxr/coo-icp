@@ -9,22 +9,27 @@
         {
           "name": "candid:service"
         }
-      ]
+      ],
+      "declarations": {
+        "output": "src/eliza_frontend/src/declarations/generated",
+        "bindings": [
+          "js",
+          "ts"
+        ]
+      }
     },
     "eliza_frontend": {
       "type": "assets",
-      "source": ["src/eliza_frontend/dist"],
-      "dependencies": ["eliza_backend"]
+      "source": [
+        "src/eliza_frontend/dist"
+      ],
+      "dependencies": [
+        "eliza_backend"
+      ]
     },
     "internet_identity": {
       "type": "pull",
       "id": "rdmx6-jaaaa-aaaaa-aaadq-cai"
-    }
-  },
-  "defaults": {
-    "build": {
-      "packtool": "",
-      "args": ""
     }
   },
   "output_env_file": ".env",
@@ -34,8 +39,11 @@
       "type": "ephemeral"
     },
     "ic": {
-      "providers": ["https://ic0.app"],
+      "providers": [
+        "https://ic0.app"
+      ],
       "type": "persistent"
     }
-  }
+  },
+  "dfx": "0.30.2"
 }

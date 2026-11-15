@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
-import type { Coo } from '../useCoo';
+import type { ClearSettled, Coo } from '../useCoo';
 import { SUPPORT_URL } from '../links';
 import { AccountMenu } from './AccountMenu';
 import { Composer } from './Composer';
-import { ConfirmDialog } from './ConfirmDialog';
+import { ConfirmDialog, type ConfirmOutcome, type ConfirmSettled } from './ConfirmDialog';
 import { AlertIcon, ArrowDownIcon, RetryIcon } from './icons';
 import { CooAvatar } from './CooAvatar';
 import { MessageItem, Thinking } from './MessageItem';
@@ -11,7 +11,7 @@ import { MessageItem, Thinking } from './MessageItem';
 const SUGGESTIONS = [
   'What is the Internet Computer?',
   'How do you run on-chain?',
-  'Explain elizaOS in simple terms',
+  'What can you help me with?',
   'Give me a Web3 project idea',
 ];
 
@@ -83,6 +83,13 @@ export function Chat({ coo }: { coo: Coo }) {
 
   const showEmpty = history === 'loaded' && messages.length === 0 && !pending;
 
+  const clearConversation = async (): Promise<ConfirmOutcome> => {
+    const toDialog = (outcome: ClearSettled): ConfirmSettled =>
+      outcome === 'cleared' ? 'done' : outcome === 'failed' ? 'failed' : 'unknown';
+    const outcome = await coo.clear();
+    return typeof outcome === 'string' ? toDialog(outcome) : { pending: outcome.pending.then(toDialog) };
+  };
+
   // Ids that arrived with the history load; only later messages animate in.
   const initialIds = useRef<Set<string> | null>(null);
   if (history !== 'loaded') initialIds.current = null;
@@ -119,10 +126,16 @@ export function Chat({ coo }: { coo: Coo }) {
             <div className="state-card" role="alert">
               <AlertIcon size={20} />
               <p>Couldn't load your conversation.</p>
-              <button type="button" className="btn btn-ghost btn-sm" onClick={() => void coo.reloadHistory()}>
-                <RetryIcon size={15} />
-                Retry
-              </button>
+              <div className="state-actions">
+                <button type="button" className="btn btn-ghost btn-sm" onClick={() => void coo.reloadHistory()}>
+                  <RetryIcon size={15} />
+                  Retry
+                </button>
+                {/* A conversation that cannot be loaded can still be cleared, which also makes it loadable. */}
+                <button type="button" className="btn btn-ghost btn-sm" onClick={() => setConfirmClear(true)} disabled={busy}>
+                  Clear conversation
+                </button>
+              </div>
             </div>
           )}
 
@@ -132,7 +145,7 @@ export function Chat({ coo }: { coo: Coo }) {
               <h2>How can I help?</h2>
               <div className="suggestions">
                 {SUGGESTIONS.map((text) => (
-                  <button key={text} type="button" className="chip" onClick={() => coo.send(text)} disabled={!coo.canSend}>
+                  <button key={text} type="button" className="chip" onClick={() => coo.send(text, false)} disabled={!coo.canSend}>
                     {text}
                   </button>
                 ))}
@@ -181,10 +194,12 @@ export function Chat({ coo }: { coo: Coo }) {
       <ConfirmDialog
         open={confirmClear}
         title="Clear conversation?"
-        body="This permanently deletes your messages with Coo."
+        body="This deletes your conversation with Coo. It cannot be undone."
         confirmLabel="Clear"
-        errorText="Couldn't clear the conversation. Try again."
-        onConfirm={coo.clear}
+        failedText="Couldn't clear the conversation. Try again."
+        pendingText="Coo hasn't confirmed this yet. The conversation may already be cleared; nothing can be sent until it is confirmed. You can close this window."
+        canConfirm={!busy}
+        onConfirm={clearConversation}
         onClose={() => setConfirmClear(false)}
       />
     </div>
