@@ -115,7 +115,7 @@ Rules that keep it safe:
   canisters never pass through it.
 - Anything a caller can make the canister store must be bounded and counted in `store.rs`.
 - Run `make test-canister` before every mainnet upgrade. It upgrades from the version that is deployed
-  (`DEPLOYED_COMMIT` in the Makefile — set it to the commit you deployed) and at the full storage budget.
+  (`DEPLOYED_COMMIT` in the Makefile — set it to the commit you deployed, after every release) and at the full storage budget.
 - The model's output is untrusted text. Do not let it trigger anything: the canister passes no tools to the model,
   and the frontend renders replies without interpreting HTML.
 

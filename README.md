@@ -132,7 +132,7 @@ either.
 | Command | What it runs |
 |---------|--------------|
 | `make test` | canister unit tests, frontend type check and unit tests |
-| `make test-canister` | the above for the canister plus PocketIC integration tests, including the upgrade from the version deployed on mainnet (built from its commit) and an upgrade at the full storage budget |
+| `make test-canister` | the above for the canister plus PocketIC integration tests, including the upgrade from the version deployed on mainnet and from 0.6.0 (each built from its commit) and an upgrade at the full storage budget |
 | `make e2e` | browser tests against the mock (Chromium and WebKit) and the accessibility check; needs `npm run dev` running |
 | `make e2e-local` | the real client, served by the local asset canister under the security headers it sends in production: sign-in (with a locally made identity), queries, update calls and the certified read, failing on any Content-Security-Policy violation or console error; and the headers themselves. `scripts/e2e-local.sh` puts the normal bundle back afterwards, also when it is interrupted |
 | `make check` | formatting, clippy, and that the Candid file and the generated bindings match the code |
