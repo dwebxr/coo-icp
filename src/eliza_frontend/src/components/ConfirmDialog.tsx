@@ -1,10 +1,12 @@
 import { useEffect, useRef, useState } from 'react';
 
 /**
- * done: closes the dialog. failed: it did not happen. pending: no answer yet, so it may still happen; the promise
- * resolves with what happened in the end, and the dialog follows (closes, or says it failed) if it is still open.
+ * done: closes the dialog. failed: it did not happen. unknown: not confirmed, so it may have happened. pending: not
+ * settled yet; the promise resolves with one of the other three, and the dialog follows (closes, says it failed, or
+ * keeps saying it is not confirmed) if it is still open.
  */
-export type ConfirmOutcome = 'done' | 'failed' | { pending: Promise<'done' | 'failed'> };
+export type ConfirmSettled = 'done' | 'failed' | 'unknown';
+export type ConfirmOutcome = ConfirmSettled | { pending: Promise<ConfirmSettled> };
 
 interface Props {
   open: boolean;
@@ -13,7 +15,7 @@ interface Props {
   confirmLabel: string;
   /** Shown inside the dialog when it did not happen. */
   failedText: string;
-  /** Shown inside the dialog while there is no answer yet. */
+  /** Shown inside the dialog while it is not settled or not confirmed. */
   pendingText: string;
   /** False while confirming cannot be tried again (an earlier attempt is still out). */
   canConfirm?: boolean;
@@ -56,14 +58,15 @@ export function ConfirmDialog({
     setOutcome(null);
     try {
       const result = await onConfirm();
-      if (result === 'done') onClose();
-      else if (result === 'failed') setOutcome('failed');
+      const show = (settled: ConfirmSettled) => {
+        if (settled === 'done') onClose();
+        else setOutcome(settled === 'failed' ? 'failed' : 'pending');
+      };
+      if (typeof result === 'string') show(result);
       else {
         setOutcome('pending');
         void result.pending.then((final) => {
-          if (mine !== attempt.current || !ref.current?.open) return;
-          if (final === 'done') onClose();
-          else setOutcome('failed');
+          if (mine === attempt.current && ref.current?.open) show(final);
         });
       }
     } finally {

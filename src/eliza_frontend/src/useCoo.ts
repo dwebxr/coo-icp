@@ -5,15 +5,18 @@ import { mergeHistory, nextId, reconcile, turnsKey, type ChatMessage } from './l
 import { BUSY_REASON, DELIVERY_WINDOW_MS, deliver } from './lib/delivery';
 import {
   adoptLegacyFloor,
-  floorIs,
+  afterClear,
+  confirmMark,
   floorOf,
   floorOwner,
   isCurrent,
+  markUnconfirmed,
   raiseFloorByQuery,
   raiseFloorByUpdate,
   readFloor,
   resetFloor,
   settleClear,
+  unconfirmedMark,
 } from './lib/floors';
 import { isCanisterReject } from './lib/callErrors';
 import { MAX_MESSAGE_BYTES, byteLength } from './lib/limits';
@@ -30,11 +33,12 @@ import { network } from './network';
 export type Status = 'checking' | 'signedOut' | 'signingIn' | 'ready';
 export type HistoryState = 'loading' | 'loaded' | 'error';
 /**
- * What became of a clear: done; not done (refused, or the conversation is still there); or no answer yet — the call
- * is still out, so the conversation may still be cleared, nothing can be sent until the canister answers, and
- * `pending` resolves with what became of it in the end.
+ * What became of a clear: done; not done (refused, or the conversation is still there); not confirmed (its answer
+ * was lost and the conversation could not be read either: it may already be cleared, and nothing can be sent until
+ * a load has confirmed it); or not settled yet — `pending` resolves with one of the other three.
  */
-export type ClearOutcome = 'cleared' | 'failed' | { pending: Promise<'cleared' | 'failed'> };
+export type ClearSettled = 'cleared' | 'failed' | 'unconfirmed';
+export type ClearOutcome = ClearSettled | { pending: Promise<ClearSettled> };
 
 export type { ChatMessage };
 
@@ -211,15 +215,19 @@ export function useCoo(backend: Backend) {
    * it applied nothing (another session by then, an error).
    *
    * 'certified' asks through consensus straight away, never a query: for when a query's answer could be taken for
-   * the truth while it is stale (after a clear whose outcome or timing is not known). Once a load has asked through
-   * consensus — in that mode, or because the queries were behind — every later round of it does too.
+   * the truth while it is stale (after a clear whose outcome or timing is not known). So does every load of a
+   * conversation marked unconfirmed (lib/floors), whoever asks for it: signing in, Retry, a resync. Once a load has
+   * asked through consensus — for either reason, or because the queries were behind — every later round of it does
+   * too.
    */
   const loadHistory = useCallback(async (how: 'any' | 'certified' = 'any'): Promise<Conversation | null> => {
     const myGen = gen.current;
     const who = principalRef.current;
     if (!who) return null;
     setHistory('loading');
-    let certified = how === 'certified';
+    let certified = how === 'certified' || unconfirmedMark(who) !== null;
+    // The mark seen when the read through consensus was sent: shown, that read confirms the clear behind it.
+    let markAtRead: string | null = null;
     try {
       for (let round = 1; round <= LOAD_ROUNDS; round++) {
         // Taken before asking: an answer is judged against what was known when it was asked for (lib/floors).
@@ -242,6 +250,7 @@ export function useCoo(backend: Backend) {
           // canister really went back (restored from a snapshot, reinstalled). Its own answer, through consensus,
           // settles it.
           certified = true;
+          markAtRead = unconfirmedMark(who);
           conversation = await within(backend.certifiedHistory(), CERTIFIED_READ_TIMEOUT_MS);
           if (myGen !== gen.current) return null;
           if (conversation.revision < floorOf(who)) {
@@ -256,11 +265,17 @@ export function useCoo(backend: Backend) {
         // The last check before it is shown, on every path: the floor as it is NOW. Something confirmed while the
         // answer was on its way (or while the reset waited for its lock) makes it stale; so does a reset.
         if (!isCurrent(who, conversation.revision, epoch)) continue;
+        // Marked unconfirmed while a query was on its way (a clear was sent meanwhile): through consensus instead.
+        if (!certified && unconfirmedMark(who) !== null) {
+          certified = true;
+          continue;
+        }
         const loaded = conversation;
         update((prev) => mergeHistory(prev, loaded.messages));
         revision.current = loaded.revision;
         if (certified) raiseFloorByUpdate(who, loaded.revision);
         else raiseFloorByQuery(who, loaded.revision, epoch);
+        if (certified && markAtRead !== null) void confirmMark(who, markAtRead);
         setHistory('loaded');
         return loaded;
       }
@@ -289,8 +304,9 @@ export function useCoo(backend: Backend) {
       try {
         const conversation = await within(backend.history(), timeoutMs);
         if (myGen !== gen.current || myRev !== rev.current || historyRef.current !== 'loaded') return null;
-        // Behind what was confirmed, or from before a reset: not applied.
-        if (!isCurrent(who, conversation.revision, start.epoch)) return null;
+        // Behind what was confirmed, or from before a reset: not applied. Nor while a clear of this conversation is
+        // unconfirmed: a query's answer may then be from before it (lib/floors).
+        if (!isCurrent(who, conversation.revision, start.epoch) || unconfirmedMark(who) !== null) return null;
         update((prev) => reconcile(prev, conversation.messages, activeId));
         revision.current = conversation.revision;
         raiseFloorByQuery(who, conversation.revision, start.epoch);
@@ -664,34 +680,43 @@ export function useCoo(backend: Backend) {
    */
   const clear = useCallback(async (): Promise<ClearOutcome> => {
     if (inflight.current > 0) return 'failed';
+    inflight.current += 1;
+    setBusy(true);
     const myGen = gen.current;
     const who = principalRef.current;
     // Taken before the call: its answer is judged against what was known when it was made (lib/floors).
     const before = who ? readFloor(who) : null;
     const startRevision = revision.current;
+    // Marked unconfirmed before the call is sent, so that until its outcome is known every load of this conversation
+    // reads through consensus — also in a new session, after a reload, or in another tab (lib/floors).
+    const mark = who ? await markUnconfirmed(who) : null;
+    const confirmed = () => {
+      if (who && mark) void confirmMark(who, mark);
+    };
     const call = backend.clear();
-    inflight.current += 1;
-    setBusy(true);
     // Once the call has settled, the thread shows either the clear's own result — and only while the floor is still
     // where the clear left it — or the conversation as the canister reports it through consensus. Never a query's
     // answer: right after a clear, a replica that is behind still has the conversation from before it. The load
     // happens in the session that is current then, and nothing can be sent until it is done.
     const resync = () => loadHistory('certified');
-    const applied: Promise<boolean> = call.then(
-      async (cleared) => {
+    type Settled = 'cleared' | 'failed' | 'unconfirmed';
+    const applied: Promise<Settled> = call.then(
+      async (cleared): Promise<Settled> => {
         // An update call's answer is the canister's own: history older than the clear must never be applied again
         // (even if the session has ended meanwhile), and if the canister is behind this device's floor — it was
         // restored or reinstalled — the floor follows it, unless something newer was confirmed during the call.
         const left = who && before ? await settleClear(who, cleared, before) : null;
-        if (!alive.current) return false;
+        // The outcome is known: the floor is at or above the cleared revision now.
+        confirmed();
+        if (!alive.current) return 'cleared';
         if (myGen !== gen.current) {
           // The session the clear was made in has ended. If one is active again (the same user signed back in, say),
           // what it shows may be from before the clear.
           if (statusRef.current === 'ready') await resync();
-          return false;
+          return 'cleared';
         }
-        // Checked now, after the await: another tab may have confirmed something newer in between.
-        if (who && left && floorIs(who, left)) {
+        // Decided now, after the await: another tab may have confirmed something newer in between.
+        if (who && afterClear(who, left) === 'show-cleared') {
           update(() => []);
           revision.current = cleared;
           setHistory('loaded');
@@ -699,33 +724,37 @@ export function useCoo(backend: Backend) {
           // The canister holds something newer than this clear: the thread shows that.
           await resync();
         }
-        return true;
+        return 'cleared';
       },
-      async (err) => {
-        if (!alive.current) return false;
+      async (err): Promise<Settled> => {
+        // Refused by the canister: certainly not cleared, and nothing else to do.
+        if (isCanisterReject(err)) {
+          confirmed();
+          return 'failed';
+        }
+        if (!alive.current) return 'unconfirmed';
         const sameSession = myGen === gen.current;
         if (sameSession) console.error('Clear error:', err);
-        // Refused by the canister: certainly not cleared, and nothing else to do.
-        if (isCanisterReject(err)) return false;
-        // The session is over: the same. (An earlier session's is that session's business, not the current one's.)
+        // The session is over: not run. (An earlier session's is that session's business, not the current one's.)
         if (err instanceof SessionInvalid) {
           if (sameSession) handleSessionError(err);
-          return false;
+          return 'failed';
         }
-        // Lost in transit: it may have run. The conversation is loaded through consensus in the session that is
-        // current now — also when the clear was made in an earlier one.
-        if (statusRef.current !== 'ready') return false;
+        // Lost in transit: it may have run. It stays marked — marked again, in case a read through consensus took the
+        // mark away before the clear ran — and the conversation is loaded through consensus in the session that is
+        // current now, also when the clear was made in an earlier one.
+        if (who) await markUnconfirmed(who);
+        if (statusRef.current !== 'ready') return 'unconfirmed';
         const loaded = await resync();
+        // Nothing could be read (the network is still down, the session changed): still unconfirmed. The mark stays,
+        // so the next load of this conversation, whoever makes it, reads through consensus.
+        if (!loaded || principalRef.current !== who) return 'unconfirmed';
         // Empty, at a revision after the one the clear was made from: the conversation is cleared now — by this
         // clear or by something else — which is what was asked for.
-        const empty = !!loaded && loaded.messages.length === 0 && loaded.revision > startRevision;
-        return empty && principalRef.current === who;
+        return loaded.messages.length === 0 && loaded.revision > startRevision ? 'cleared' : 'failed';
       },
     );
-    const outcome = applied.then(
-      (cleared): 'cleared' | 'failed' => (cleared ? 'cleared' : 'failed'),
-      (): 'failed' => 'failed',
-    );
+    const outcome = applied.catch((): Settled => 'unconfirmed');
     void outcome.finally(() => {
       inflight.current -= 1;
       if (alive.current && inflight.current === 0) setBusy(false);

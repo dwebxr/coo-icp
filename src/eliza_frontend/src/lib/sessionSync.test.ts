@@ -260,6 +260,16 @@ describe('idle time and the clocks', () => {
     expect(data.get('coo:last-active')).toMatch(/^15500\|/);
   });
 
+  // Review round 4: a lock that cannot be had must not lose the write.
+  it('writes directly when the lock request is refused', async () => {
+    vi.stubGlobal('navigator', { locks: { request: () => Promise.reject(new Error('SecurityError')) } });
+    at(1_000);
+    sync.noteActivity(true);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(storedTime()).toBe('1000');
+  });
+
   it('a write still waiting for the lock when the tab signs out is dropped', () => {
     const waiting: (() => unknown)[] = [];
     vi.stubGlobal('navigator', {

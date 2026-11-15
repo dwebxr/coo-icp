@@ -18,7 +18,9 @@
 //               clear=<ms> (the clear call answers, and clears, only after this long)
 //               stale=<n> (the next n queries after a clear return the conversation from before it; laggy is stale=1)
 //               certified=<ms> (how long a read through consensus takes; 600 by default)
-//               relogin=<principal> (who signs in after the first session has ended: someone else at the same tab)
+//               certifiedfail=<n> (the first n reads through consensus fail as if the network were down)
+//               relogin=<principal> (who signs in after the first session has ended: someone else at the same tab;
+//               every principal has a conversation of its own, starting as the scenario's)
 import {
   SessionInvalid,
   SignInCancelled,
@@ -101,34 +103,57 @@ export function createMockBackend(scenario: string): Backend {
   const clearMs = params.get('clear') === null ? null : Number(params.get('clear'));
   const staleReads = scenario === 'laggy' ? 1 : Number(params.get('stale') ?? 0);
   const certifiedMs = Number(params.get('certified') ?? 600);
+  let certifiedFailures = Number(params.get('certifiedfail') ?? 0);
 
   let signedIn = scenario !== 'signedout' && scenario !== '';
   let expiresAt = Date.now() + (scenario === 'expiring' ? 4000 : 8 * 3600 * 1000);
-  let messages: Message[] =
-    scenario === 'empty' || scenario === 'signedout'
-      ? []
-      : scenario === 'long'
-        ? Array.from({ length: 6 }, () => SAMPLE).flat()
-        : scenario === 'rich'
-          ? [...RICH]
-          : [...SAMPLE];
-  let revision = 0;
-  // racyclear: the floor this device stored, and whether the other tab has cleared yet.
+  let principal = PRINCIPAL;
+  const session = (): Session => ({ principal });
+  const guard = () => {
+    if (!signedIn || Date.now() >= expiresAt) throw new SessionInvalid('mock session invalid');
+  };
+
+  /** One caller's conversation, as the canister keeps it. */
+  interface Conversation {
+    messages: Message[];
+    revision: number;
+    // laggy, stale=<n>: what a replica that is behind would still return after a clear, and how many more times.
+    beforeClear: { messages: Message[]; revision: number } | null;
+    staleLeft: number;
+    inFlight: { id: string; cleared: boolean } | null;
+  }
+  const conversations = new Map<string, Conversation>();
+  /** The conversation of `who` (by default whoever is signed in now); every caller starts with the scenario's. */
+  const conv = (who = principal): Conversation => {
+    let found = conversations.get(who);
+    if (!found) {
+      const messages =
+        scenario === 'empty' || scenario === 'signedout'
+          ? []
+          : scenario === 'long'
+            ? Array.from({ length: 6 }, () => SAMPLE).flat()
+            : scenario === 'rich'
+              ? [...RICH]
+              : [...SAMPLE];
+      found = { messages, revision: 0, beforeClear: null, staleLeft: 0, inFlight: null };
+      conversations.set(who, found);
+    }
+    return found;
+  };
+  const copy = (c: Conversation) => ({ messages: c.messages.map((m) => ({ ...m })), revision: c.revision });
+
+  // racyclear, racyreset: the floor this device stored, and whether the other tab has acted yet.
   const floorKey = `coo:floor:${floorOwner(network.backendCanisterId ?? 'local', PRINCIPAL)}`;
   let otherTabCleared = false;
   if (scenario === 'racyclear') {
-    revision = 5;
+    conv().revision = 5;
     localStorage.setItem(floorKey, '0:5');
   }
   let otherTabReset = false;
   if (scenario === 'racyreset') {
-    revision = 4;
+    conv().revision = 4;
     localStorage.setItem(floorKey, '0:9');
   }
-  // laggy, stale=<n>: what a replica that is behind would still return after a clear, and how many more times.
-  let beforeClear: { messages: Message[]; revision: number } | null = null;
-  let staleLeft = 0;
-  let inFlight: { id: string; cleared: boolean } | null = null;
   // Tests read how many requests were sent and how many were answered, and whether a delegation is held (what a
   // reload would restore).
   const stats = {
@@ -136,59 +161,58 @@ export function createMockBackend(scenario: string): Backend {
     answered: 0,
     ids: [] as string[],
     historyReads: 0,
+    clears: 0,
     get session() {
       return signedIn;
     },
   };
   (window as unknown as { __mock: typeof stats }).__mock = stats;
 
-  let principal = PRINCIPAL;
-  const session = (): Session => ({ principal });
-  const guard = () => {
-    if (!signedIn || Date.now() >= expiresAt) throw new SessionInvalid('mock session invalid');
-  };
-
   /** The saved exchange for a request id: the user message and the reply right after it. */
-  const saved = (id: string): { text: string; sent: Sent } | null => {
-    const i = messages.findIndex((m) => m.role === 'user' && m.requestId === id);
-    const reply = messages[i + 1];
-    return i >= 0 && reply?.role === 'assistant' ? { text: messages[i].content, sent: { reply: reply.content, revision } } : null;
+  const saved = (c: Conversation, id: string): { text: string; sent: Sent } | null => {
+    const i = c.messages.findIndex((m) => m.role === 'user' && m.requestId === id);
+    const reply = c.messages[i + 1];
+    return i >= 0 && reply?.role === 'assistant'
+      ? { text: c.messages[i].content, sent: { reply: reply.content, revision: c.revision } }
+      : null;
   };
 
   /** Another tab saves an exchange. */
-  const otherTab = () => {
-    messages = [...messages, { role: 'user', content: 'Sent from another tab' }, { role: 'assistant', content: REPLY }];
-    revision += 1;
+  const otherTab = (c: Conversation) => {
+    c.messages = [...c.messages, { role: 'user', content: 'Sent from another tab' }, { role: 'assistant', content: REPLY }];
+    c.revision += 1;
   };
 
   /** The canister's checks before it runs a request: replay, one chat at a time, revision. */
-  function check(id: string, base: number, text: string): SendOutcome | null {
-    const exchange = saved(id);
+  function check(c: Conversation, id: string, base: number, text: string): SendOutcome | null {
+    const exchange = saved(c, id);
     if (exchange) return exchange.text === text ? { ok: exchange.sent } : { err: 'This request id was used for another message.' };
     const bytes = new TextEncoder().encode(text).length;
     if (bytes > MAX_MESSAGE_BYTES) return { err: `Message is too long (${bytes} bytes; the limit is ${MAX_MESSAGE_BYTES}).` };
-    if (inFlight) return inFlight.id === id ? { inProgress: true } : { busy: true };
-    if (base !== revision) return { conflict: true };
+    if (c.inFlight) return c.inFlight.id === id ? { inProgress: true } : { busy: true };
+    if (base !== c.revision) return { conflict: true };
     return null;
   }
 
   /** What the canister does with a request: generate a reply, then save the exchange. */
-  async function answer(id: string, text: string, ms = delay): Promise<SendOutcome> {
+  async function answer(c: Conversation, id: string, text: string, ms = delay): Promise<SendOutcome> {
     const flight = { id, cleared: false };
-    inFlight = flight;
+    c.inFlight = flight;
     await sleep(ms);
-    inFlight = null;
+    c.inFlight = null;
     if (flight.cleared) return { err: 'Conversation cleared.' };
     if (scenario === 'error') return { failed: true };
     // Trim like the canister: the newest turns, never starting with a reply.
-    const next = [...messages, { role: 'user', content: text, requestId: id }, { role: 'assistant', content: REPLY }];
+    const next = [...c.messages, { role: 'user', content: text, requestId: id }, { role: 'assistant', content: REPLY }];
     const kept = next.slice(Math.max(next.length - MAX_TURNS, 0));
-    messages = kept.slice(kept.findIndex((m) => m.role === 'user'));
-    revision += 1;
+    c.messages = kept.slice(kept.findIndex((m) => m.role === 'user'));
+    c.revision += 1;
     stats.answered += 1;
-    return { ok: { reply: REPLY, revision } };
+    return { ok: { reply: REPLY, revision: c.revision } };
   }
 
+  // Every call works on the conversation of whoever was signed in when it was made, as the canister does (the
+  // caller is part of the call).
   return {
     async restore() {
       await sleep(restoreMs);
@@ -213,39 +237,41 @@ export function createMockBackend(scenario: string): Backend {
     },
 
     async history() {
+      const c = conv();
       stats.historyReads += 1;
       await sleep(scenario === 'historyerror' ? 600 : 300);
       if (scenario === 'badsession') throw new SessionInvalid('mock orphan delegation');
       guard();
       if (scenario === 'historyerror') throw new Error('mock history failure');
-      if (beforeClear && staleLeft > 0) {
-        staleLeft -= 1;
-        return { messages: beforeClear.messages.map((m) => ({ ...m })), revision: beforeClear.revision };
+      if (c.beforeClear && c.staleLeft > 0) {
+        c.staleLeft -= 1;
+        return { messages: c.beforeClear.messages.map((m) => ({ ...m })), revision: c.beforeClear.revision };
       }
       // Replicas that have not caught up with revision 5 yet.
-      if (scenario === 'racyclear' && !otherTabCleared) return { messages: messages.map((m) => ({ ...m })), revision: 4 };
+      if (scenario === 'racyclear' && !otherTabCleared) return { ...copy(c), revision: 4 };
       // Replicas still one exchange behind the restored state.
-      if (scenario === 'racyreset') return { messages: messages.slice(0, -2).map((m) => ({ ...m })), revision: 3 };
-      return { messages: messages.map((m) => ({ ...m })), revision };
+      if (scenario === 'racyreset') return { messages: c.messages.slice(0, -2).map((m) => ({ ...m })), revision: 3 };
+      return copy(c);
     },
 
     async certifiedHistory() {
+      const c = conv();
       stats.historyReads += 1;
       // Through consensus: slower, and never the stale copy a lagging replica returns.
       if (scenario === 'racyclear' && !otherTabCleared) {
         // Read now, answered late: meanwhile another tab clears, and stores the floor it was confirmed.
-        const read = { messages: messages.map((m) => ({ ...m })), revision };
+        const read = copy(c);
         await sleep(300);
-        messages = [];
-        revision += 1;
+        c.messages = [];
+        c.revision += 1;
         otherTabCleared = true;
-        localStorage.setItem(floorKey, `0:${revision}`);
+        localStorage.setItem(floorKey, `0:${c.revision}`);
         await sleep(300);
         return read;
       }
       if (scenario === 'racyreset' && !otherTabReset) {
         // Read now, answered late: meanwhile another tab resets the floor to 1:3.
-        const read = { messages: messages.map((m) => ({ ...m })), revision };
+        const read = copy(c);
         await sleep(300);
         otherTabReset = true;
         localStorage.setItem(floorKey, '1:3');
@@ -253,18 +279,24 @@ export function createMockBackend(scenario: string): Backend {
         return read;
       }
       await sleep(certifiedMs);
+      // certifiedfail=<n>: the first n reads through consensus are lost too.
+      if (certifiedFailures > 0) {
+        certifiedFailures -= 1;
+        throw new Error('Failed to fetch');
+      }
       guard();
-      return { messages: messages.map((m) => ({ ...m })), revision };
+      return copy(c);
     },
 
     async send(id: string, base: number, text: string): Promise<SendOutcome> {
       guard();
+      const c = conv();
       const attempt = ++stats.sends;
       stats.ids.push(id);
       // Before the first send, another tab changes the conversation: visibly, or (stale) only its revision.
-      if (attempt === 1 && scenario === 'conflict') otherTab();
-      if (attempt === 1 && scenario === 'stale') revision += 1;
-      const refused = check(id, base, text);
+      if (attempt === 1 && scenario === 'conflict') otherTab(c);
+      if (attempt === 1 && scenario === 'stale') c.revision += 1;
+      const refused = check(c, id, base, text);
       if (refused) return refused;
       switch (scenario) {
         case 'busy':
@@ -278,14 +310,14 @@ export function createMockBackend(scenario: string): Backend {
         case 'lostreply':
           // Answered and saved, but the response is lost.
           if (attempt === 1) {
-            await answer(id, text);
+            await answer(c, id, text);
             throw new Error('Request timed out');
           }
           break;
         case 'inprogress':
           // The response is lost while the reply is still being generated.
           if (attempt === 1) {
-            void answer(id, text, 8000);
+            void answer(c, id, text, 8000);
             await sleep(200);
             throw new Error('Failed to fetch');
           }
@@ -297,39 +329,42 @@ export function createMockBackend(scenario: string): Backend {
         case 'latesave':
           // Both attempts fail in transit; the first one is executed 8 s later anyway.
           if (attempt <= 2) {
-            if (attempt === 1) void sleep(8000).then(() => check(id, base, text) ?? answer(id, text, 0));
+            if (attempt === 1) void sleep(8000).then(() => check(c, id, base, text) ?? answer(c, id, text, 0));
             await sleep(200);
             throw new Error('Failed to fetch');
           }
           break;
       }
-      return answer(id, text);
+      return answer(c, id, text);
     },
 
     async status(id: string): Promise<ReplyStatus> {
       guard();
+      const c = conv();
       await sleep(100);
-      const exchange = saved(id);
+      const exchange = saved(c, id);
       if (exchange) return { done: exchange.sent };
-      return inFlight?.id === id && !inFlight.cleared ? 'pending' : 'unknown';
+      return c.inFlight?.id === id && !c.inFlight.cleared ? 'pending' : 'unknown';
     },
 
     async clear() {
+      stats.clears += 1;
       guard();
+      const c = conv();
       await sleep(clearMs ?? 300);
       // What the agent reports when the canister rejects a call: certainly not run.
       if (scenario === 'clearerror') throw new Error('Call was rejected: mock clear refused');
       if (scenario === 'clearhang') return new Promise<number>(() => {});
       if (scenario === 'clearfail') throw new Error('Failed to fetch');
       if (staleReads > 0) {
-        beforeClear = { messages: messages.map((m) => ({ ...m })), revision };
-        staleLeft = staleReads;
+        c.beforeClear = copy(c);
+        c.staleLeft = staleReads;
       }
-      revision += 1;
-      messages = [];
-      if (inFlight) inFlight.cleared = true;
+      c.revision += 1;
+      c.messages = [];
+      if (c.inFlight) c.inFlight.cleared = true;
       if (scenario === 'clearlost') throw new Error('Failed to fetch');
-      return revision;
+      return c.revision;
     },
 
     sessionExpiresAt() {

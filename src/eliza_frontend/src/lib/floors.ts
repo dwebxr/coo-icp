@@ -197,6 +197,85 @@ export async function settleClear(owner: string, cleared: number, before: Floor)
   return null;
 }
 
+/**
+ * What to show once a clear has been answered and settled (`left`: what settleClear resolved with): the cleared,
+ * empty conversation only while the floor is still exactly where the clear left it; otherwise the conversation has
+ * to be loaded, because something newer was confirmed (or the canister holds something newer than the clear).
+ */
+export function afterClear(owner: string, left: Floor | null): 'show-cleared' | 'load' {
+  return left && floorIs(owner, left) ? 'show-cleared' : 'load';
+}
+
+// "Unconfirmed": a clear of this conversation was sent and its outcome is not known yet, so the floor may be below
+// the conversation's revision, and a lagging replica's answer from before the clear could pass for the truth. While
+// an owner is marked, the conversation is only ever loaded through consensus (and quick query re-syncs are not
+// applied).
+//
+// The mark is set before the clear is sent (so a page that dies during the call leaves it behind) and removed only by
+// the clear's own definite answer (it ran, or the canister refused it) or by a read through consensus that started
+// after it was set and whose result was shown. Each mark is a token, set and removed under a cross-tab Web Lock, so
+// a removal never takes away a newer mark. It is stored in localStorage (it survives a reload; other tabs see it);
+// where it cannot be stored, it is kept in this tab's memory.
+const MARK_PREFIX = 'coo:unconfirmed:';
+/** Marks that could not be stored. */
+const unstoredMarks = new Map<string, string>();
+
+async function underMarkLock(owner: string, section: () => void) {
+  const locks = webLocks();
+  if (locks) {
+    try {
+      await locks.request(MARK_PREFIX + owner, section);
+      return;
+    } catch {
+      // The lock could not be had: the section runs without it (best effort, as without Web Locks).
+    }
+  }
+  section();
+}
+
+const newMark = () =>
+  typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+    ? crypto.randomUUID()
+    : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+
+/** Marks `owner` unconfirmed (see above). Resolves with the mark once it is stored, or kept in memory. */
+export async function markUnconfirmed(owner: string): Promise<string> {
+  const mark = newMark();
+  unstoredMarks.set(owner, mark);
+  await underMarkLock(owner, () => {
+    try {
+      localStorage.setItem(MARK_PREFIX + owner, mark);
+      unstoredMarks.delete(owner);
+    } catch {
+      // Not stored: this tab keeps it in memory.
+    }
+  });
+  return mark;
+}
+
+/** The mark `owner` has (set by this tab or another), or null when its conversation is not unconfirmed. */
+export function unconfirmedMark(owner: string): string | null {
+  let stored: string | null = null;
+  try {
+    stored = localStorage.getItem(MARK_PREFIX + owner);
+  } catch {
+    // Unreadable: only this tab's memory counts.
+  }
+  return stored ?? unstoredMarks.get(owner) ?? null;
+}
+
+/** Removes `mark` from `owner` — not a newer mark that has replaced it. */
+export async function confirmMark(owner: string, mark: string) {
+  if (unstoredMarks.get(owner) === mark) unstoredMarks.delete(owner);
+  await underMarkLock(owner, () => {
+    try {
+      if (localStorage.getItem(MARK_PREFIX + owner) === mark) localStorage.removeItem(MARK_PREFIX + owner);
+    } catch {
+      // Nothing stored, or nothing that can be removed.
+    }
+  });
+}
+
 /** Takes over the floor an earlier version of the app stored for this principal (it knew one canister only). */
 export function adoptLegacyFloor(owner: string, principal: string) {
   try {

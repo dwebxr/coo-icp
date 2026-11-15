@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
-import type { Coo } from '../useCoo';
+import type { ClearSettled, Coo } from '../useCoo';
 import { SUPPORT_URL } from '../links';
 import { AccountMenu } from './AccountMenu';
 import { Composer } from './Composer';
-import { ConfirmDialog, type ConfirmOutcome } from './ConfirmDialog';
+import { ConfirmDialog, type ConfirmOutcome, type ConfirmSettled } from './ConfirmDialog';
 import { AlertIcon, ArrowDownIcon, RetryIcon } from './icons';
 import { CooAvatar } from './CooAvatar';
 import { MessageItem, Thinking } from './MessageItem';
@@ -84,7 +84,8 @@ export function Chat({ coo }: { coo: Coo }) {
   const showEmpty = history === 'loaded' && messages.length === 0 && !pending;
 
   const clearConversation = async (): Promise<ConfirmOutcome> => {
-    const toDialog = (outcome: 'cleared' | 'failed') => (outcome === 'cleared' ? 'done' : 'failed');
+    const toDialog = (outcome: ClearSettled): ConfirmSettled =>
+      outcome === 'cleared' ? 'done' : outcome === 'failed' ? 'failed' : 'unknown';
     const outcome = await coo.clear();
     return typeof outcome === 'string' ? toDialog(outcome) : { pending: outcome.pending.then(toDialog) };
   };
@@ -196,7 +197,7 @@ export function Chat({ coo }: { coo: Coo }) {
         body="This deletes your conversation with Coo. It cannot be undone."
         confirmLabel="Clear"
         failedText="Couldn't clear the conversation. Try again."
-        pendingText="No answer from Coo yet. The conversation may still be cleared; nothing can be sent until Coo answers. You can close this window."
+        pendingText="Coo hasn't confirmed this yet. The conversation may already be cleared; nothing can be sent until it is confirmed. You can close this window."
         canConfirm={!busy}
         onConfirm={clearConversation}
         onClose={() => setConfirmClear(false)}

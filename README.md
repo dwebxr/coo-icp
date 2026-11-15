@@ -78,7 +78,10 @@ Every limit is enforced by the canister (`src/eliza_backend/src/limits.rs`).
   (`coo:floor:<canister>:<principal>`, and `coo:revision:<principal>` from versions before 0.7.0). They show which
   principals used this browser; they are kept on purpose, so that a conversation older than one this browser has
   seen is never shown, and are not removed by signing out. Also a random marker that changes on every sign-out
-  (`coo:signed-out`). Internet Identity's client keeps a fresh, unused session key in IndexedDB.
+  (`coo:signed-out`), and, while the outcome of a clear is not known (its answer was lost), a mark for that
+  conversation (`coo:unconfirmed:<canister>:<principal>`): until a read through consensus has shown the
+  conversation, every load of it, in any tab or session, reads through consensus. Internet Identity's client keeps a
+  fresh, unused session key in IndexedDB.
 - **Not tested: a real Internet Identity sign-in racing a sign-out in another tab.** Both tabs share the auth
   client's IndexedDB; whether a sign-out whose deletion of the stored key lands after a new sign-in in another tab
   leaves that new session's key or delegation inconsistent on the next reload has only been reasoned about (the

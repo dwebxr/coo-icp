@@ -38,6 +38,13 @@ async function open(p, q) {
 const userBubbles = (p) => p.locator('.msg-user .bubble').count();
 const stats = (p) => p.evaluate(() => window.__mock);
 const replies = (p) => p.locator('.msg-assistant:not(.thinking)').count();
+// Confirms the clear dialog and waits until the clear call has gone out: the app first marks the conversation
+// unconfirmed (an awaited Web Lock), and a test that then moves the installed clock on must not get ahead of the call.
+async function confirmClear(p) {
+  const before = (await stats(p)).clears;
+  await p.locator('dialog').getByRole('button', { name: 'Clear' }).click();
+  await p.waitForFunction((n) => window.__mock.clears > n, before);
+}
 
 // Dispatch synthetic IME-related events directly on the textarea.
 async function imeEnter(page, mode) {
@@ -540,7 +547,7 @@ await test('A clear from an earlier session whose answer is lost still brings th
   await p.waitForSelector('.thread[aria-busy="false"]');
   await p.getByRole('button', { name: 'Account' }).click();
   await p.getByRole('menuitem', { name: /clear/i }).click();
-  await p.locator('dialog').getByRole('button', { name: 'Clear' }).click();
+  await confirmClear(p);
   await p.clock.runFor(31_000);
   await p.waitForSelector('.dialog-note');
   await p.locator('dialog').getByRole('button', { name: 'Close' }).click();
@@ -556,6 +563,43 @@ await test('A clear from an earlier session whose answer is lost still brings th
   await p.waitForSelector('.empty', { timeout: 5000 });
   await p.locator('textarea').fill('after');
   expect(!(await p.locator('.send-btn').isDisabled()), 'sending is possible again');
+});
+
+// Review round 4, Important 1: the session ends while the unconfirmed clear is being confirmed.
+await test('An unconfirmed clear is confirmed through consensus in the next session too', async (p) => {
+  // The clear runs, its answer is lost; queries return the conversation from before it; consensus takes 6 s.
+  await open(p, '?mock=clearlost&stale=3&certified=6000');
+  await p.getByRole('button', { name: 'Account' }).click();
+  await p.getByRole('menuitem', { name: /clear/i }).click();
+  await p.getByRole('button', { name: 'Clear', exact: true }).click();
+  await p.waitForTimeout(1500); // the answer was lost; the read through consensus is on its way
+  // Another tab signs out (its generation, and the event for it), so this session ends; the same user signs in again.
+  await p.evaluate(() => {
+    localStorage.setItem('coo:signed-out', 'signed-out-elsewhere');
+    window.dispatchEvent(new StorageEvent('storage', { key: 'coo:signed-out', newValue: 'signed-out-elsewhere' }));
+  });
+  await p.waitForSelector('.signin', { timeout: 5000 });
+  await p.getByRole('button', { name: /sign in/i }).click();
+  await p.waitForSelector('.chat');
+  await p.waitForSelector('.thread[aria-busy="false"]', { timeout: 15000 });
+  expect((await userBubbles(p)) === 0, 'the conversation from before the clear is not shown');
+  await p.waitForSelector('.empty');
+});
+
+// Review round 4, Important 2: the read that should confirm the clear fails too; later, Retry.
+await test('A clear that could not be confirmed says so, and Retry reads through consensus', async (p) => {
+  await open(p, '?mock=clearlost&stale=3&certifiedfail=1');
+  await p.getByRole('button', { name: 'Account' }).click();
+  await p.getByRole('menuitem', { name: /clear/i }).click();
+  await p.getByRole('button', { name: 'Clear', exact: true }).click();
+  await p.waitForSelector('dialog[open] .dialog-note', { timeout: 8000 });
+  expect((await p.locator('.dialog-error').count()) === 0, 'not reported as a failure: it may have run');
+  await p.locator('dialog').getByRole('button', { name: 'Close' }).click();
+  await p.waitForSelector("text=Couldn't load your conversation");
+  await p.locator('.state-card').getByRole('button', { name: 'Retry' }).click();
+  await p.waitForSelector('.thread[aria-busy="false"]', { timeout: 8000 });
+  expect((await userBubbles(p)) === 0, 'the conversation from before the clear is not shown');
+  await p.waitForSelector('.empty');
 });
 
 await test('A clear lost before it ran is reported as failed, after the conversation was checked', async (p) => {
@@ -745,12 +789,13 @@ await test('A clear that gets no answer can be left, blocks sending, and is repo
   await p.waitForSelector('.thread[aria-busy="false"]');
   await p.getByRole('button', { name: 'Account' }).click();
   await p.getByRole('menuitem', { name: /clear/i }).click();
-  await p.locator('dialog').getByRole('button', { name: 'Clear' }).click();
+  await confirmClear(p);
   await p.clock.runFor(31_000);
-  // No answer is not a failure: the conversation may still be cleared.
+  // No answer is not a failure: the conversation may already be cleared.
   await p.waitForSelector('.dialog-note');
   const note = await p.locator('.dialog-note').innerText();
-  expect(/may still be cleared/.test(note) && /nothing can be sent/i.test(note) && /close/i.test(note), note);
+  expect(/not confirmed this yet|hasn't confirmed this yet/.test(note) && /may already be cleared/.test(note), note);
+  expect(/nothing can be sent until it is confirmed/i.test(note) && /close/i.test(note), note);
   expect((await p.locator('.dialog-error').count()) === 0, 'not reported as a failure');
   expect(await p.locator('dialog').getByRole('button', { name: 'Clear' }).isDisabled(), 'not offered again while it is out');
   await p.locator('dialog').getByRole('button', { name: 'Close' }).click();
@@ -768,7 +813,7 @@ await test('A late clear closes the dialog that still says "no answer yet", and 
   await p.waitForSelector('.thread[aria-busy="false"]');
   await p.getByRole('button', { name: 'Account' }).click();
   await p.getByRole('menuitem', { name: /clear/i }).click();
-  await p.locator('dialog').getByRole('button', { name: 'Clear' }).click();
+  await confirmClear(p);
   await p.clock.runFor(31_000);
   await p.waitForSelector('.dialog-note');
   await p.clock.runFor(10_000);
@@ -783,7 +828,7 @@ await test('A late refusal replaces "no answer yet" in the dialog with the failu
   await p.waitForSelector('.thread[aria-busy="false"]');
   await p.getByRole('button', { name: 'Account' }).click();
   await p.getByRole('menuitem', { name: /clear/i }).click();
-  await p.locator('dialog').getByRole('button', { name: 'Clear' }).click();
+  await confirmClear(p);
   await p.clock.runFor(31_000);
   await p.waitForSelector('.dialog-note');
   await p.clock.runFor(10_000);
@@ -801,7 +846,7 @@ await test('After a late clear from an earlier session, a stale read is not the 
   await p.waitForSelector('.thread[aria-busy="false"]');
   await p.getByRole('button', { name: 'Account' }).click();
   await p.getByRole('menuitem', { name: /clear/i }).click();
-  await p.locator('dialog').getByRole('button', { name: 'Clear' }).click();
+  await confirmClear(p);
   await p.clock.runFor(31_000);
   await p.waitForSelector('.dialog-note');
   await p.locator('dialog').getByRole('button', { name: 'Close' }).click();
@@ -821,6 +866,39 @@ await test('After a late clear from an earlier session, a stale read is not the 
   expect(!(await p.locator('.send-btn').isDisabled()), 'sending is possible once the thread matches');
 });
 
+// Review round 4, Nit 2: every principal has its own conversation in the mock, as in the canister.
+await test("A late clear of one user does not touch the next user's conversation", async (p) => {
+  await p.clock.install();
+  await p.goto(`${BASE}/?mock=chat&clear=40000&relogin=aaaaa-aa`);
+  await p.clock.runFor(1500);
+  await p.waitForSelector('.thread[aria-busy="false"]');
+  await p.getByRole('button', { name: 'Account' }).click();
+  await p.getByRole('menuitem', { name: /clear/i }).click();
+  await confirmClear(p);
+  await p.clock.runFor(31_000);
+  await p.waitForSelector('.dialog-note');
+  await p.locator('dialog').getByRole('button', { name: 'Close' }).click();
+  // Someone else signs in at this tab.
+  await p.getByRole('button', { name: 'Account' }).click();
+  await p.getByRole('menuitem', { name: /sign out/i }).click();
+  await p.clock.runFor(500);
+  await p.getByRole('button', { name: /sign in/i }).click();
+  await p.clock.runFor(2000);
+  await p.waitForSelector('.thread[aria-busy="false"]');
+  const theirs = await userBubbles(p);
+  expect(theirs > 0, 'the other user has a conversation of their own');
+  // The first user's clear lands (at about 41.5 s).
+  await p.clock.runFor(10_000);
+  await p.waitForSelector('.thread[aria-busy="false"]');
+  expect((await userBubbles(p)) === theirs, "the other user's conversation is unchanged");
+  const before = await replies(p);
+  await p.locator('textarea').fill('mine');
+  expect(!(await p.locator('.send-btn').isDisabled()), 'and they can send');
+  await p.keyboard.press('Enter');
+  await p.clock.runFor(3000);
+  await p.waitForFunction((n) => document.querySelectorAll('.msg-assistant:not(.thinking)').length === n + 1, before);
+});
+
 await test('A clear from an earlier session that succeeds late brings the thread up to date after signing back in', async (p) => {
   await p.clock.install();
   // The clear answers (and clears) 40 s after it is sent.
@@ -829,7 +907,7 @@ await test('A clear from an earlier session that succeeds late brings the thread
   await p.waitForSelector('.thread[aria-busy="false"]');
   await p.getByRole('button', { name: 'Account' }).click();
   await p.getByRole('menuitem', { name: /clear/i }).click();
-  await p.locator('dialog').getByRole('button', { name: 'Clear' }).click();
+  await confirmClear(p);
   await p.clock.runFor(31_000);
   await p.waitForSelector('.dialog-note');
   await p.locator('dialog').getByRole('button', { name: 'Close' }).click();
@@ -899,7 +977,7 @@ await test('A conversation that cannot be loaded can still be cleared', async (p
   await open(p, '?mock=historyerror');
   await p.waitForSelector('text=Couldn\'t load your conversation');
   await p.getByRole('button', { name: 'Clear conversation' }).click();
-  await p.locator('dialog').getByRole('button', { name: 'Clear' }).click();
+  await confirmClear(p);
   await p.waitForSelector('.empty');
   expect((await p.locator('.state-card').count()) === 0, 'error gone');
   await p.locator('textarea').fill('hello again');

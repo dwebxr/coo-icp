@@ -75,9 +75,10 @@ function writeActivity() {
     if (generation === cleared) compareAndWrite(time);
   };
   // Read, compare and write inside a cross-tab Web Lock, so no other tab can write between this tab's read and its
-  // write. Without Web Locks it is best effort: two tabs writing at the same moment can leave the earlier time.
+  // write. Without Web Locks — or when the lock cannot be had — it is best effort: two tabs writing at the same
+  // moment can leave the earlier time. (Dropping the write instead would let other tabs see this one as idle.)
   const locks = webLocks();
-  if (locks) locks.request(ACTIVITY_KEY, write).catch(() => {});
+  if (locks) locks.request(ACTIVITY_KEY, write).catch(write);
   else write();
 }
 

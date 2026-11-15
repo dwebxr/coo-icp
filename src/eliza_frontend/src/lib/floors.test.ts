@@ -17,6 +17,7 @@ function storage() {
       if (store.failing) throw new Error('QuotaExceededError');
       data.set(key, value);
     },
+    removeItem: (key: string) => data.delete(key),
     data,
   };
   return store;
@@ -396,5 +397,73 @@ describe('the last check before a conversation is shown', () => {
     expect(floors.isCurrent(ALICE, 4, 1)).toBe(true);
     // An answer judged against another epoch is never current.
     expect(floors.isCurrent(ALICE, 9, 0)).toBe(false);
+  });
+});
+
+// Review round 4, Nit 1: the hook's decision after a clear, as a function of its own.
+describe('what to show after a clear', () => {
+  it('the cleared conversation only while the floor is where the clear left it', async () => {
+    floors.raiseFloorByUpdate(ALICE, 1);
+    const left = await floors.settleClear(ALICE, 2, floors.readFloor(ALICE));
+    expect(floors.afterClear(ALICE, left)).toBe('show-cleared');
+    store.data.set(KEY, '0:3'); // another tab confirmed a reply after the clear
+    expect(floors.afterClear(ALICE, left)).toBe('load');
+    // The canister holds something newer than the clear (settleClear says so with null): load.
+    expect(floors.afterClear(ALICE, null)).toBe('load');
+  });
+});
+
+// Review round 4, Important 1 and 2: "this conversation's clear is unconfirmed" outlives the call that noticed it.
+describe('the unconfirmed mark', () => {
+  const MARK = 'coo:unconfirmed:canister:alice';
+
+  it('is set (and stored) before the clear is sent, and only its own removal takes it away', async () => {
+    expect(floors.unconfirmedMark(ALICE)).toBeNull();
+    const first = await floors.markUnconfirmed(ALICE);
+    expect(store.data.get(MARK)).toBe(first);
+    expect(floors.unconfirmedMark(ALICE)).toBe(first);
+    // A second clear marks it again; confirming the first one's mark does not remove the newer one.
+    const second = await floors.markUnconfirmed(ALICE);
+    await floors.confirmMark(ALICE, first);
+    expect(floors.unconfirmedMark(ALICE)).toBe(second);
+    await floors.confirmMark(ALICE, second);
+    expect(floors.unconfirmedMark(ALICE)).toBeNull();
+    expect(store.data.has(MARK)).toBe(false);
+    // Per owner: Bob's conversation is not Alice's.
+    await floors.markUnconfirmed('canister:bob');
+    expect(floors.unconfirmedMark(ALICE)).toBeNull();
+  });
+
+  it("is seen in another tab's mark through storage (and after a reload)", () => {
+    store.data.set(MARK, 'set-by-another-tab');
+    expect(floors.unconfirmedMark(ALICE)).toBe('set-by-another-tab');
+  });
+
+  it('stays in memory when it cannot be stored', async () => {
+    store.failing = true;
+    const mark = await floors.markUnconfirmed(ALICE);
+    expect(store.data.has(MARK)).toBe(false);
+    expect(floors.unconfirmedMark(ALICE)).toBe(mark);
+    await floors.confirmMark(ALICE, mark);
+    expect(floors.unconfirmedMark(ALICE)).toBeNull();
+  });
+
+  it('is set and removed under a lock, so a removal that waited cannot take away a newer mark', async () => {
+    const queue: (() => void)[] = [];
+    vi.stubGlobal('navigator', {
+      locks: {
+        request: (_name: string, run: () => void) =>
+          new Promise<void>((resolve) => queue.push(() => (run(), resolve()))),
+      },
+    });
+    vi.resetModules();
+    floors = await import('./floors');
+    store.data.set(MARK, 'old');
+    const removal = floors.confirmMark(ALICE, 'old'); // waits for the lock …
+    const marking = floors.markUnconfirmed(ALICE); // … and so does a new clear's mark, after it
+    for (const run of queue) run();
+    await removal;
+    const fresh = await marking;
+    expect(floors.unconfirmedMark(ALICE)).toBe(fresh);
   });
 });
